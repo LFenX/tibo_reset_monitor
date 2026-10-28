@@ -109,7 +109,7 @@ def calendar_model(history: dict[str, Any] | None, recent: dict[str, Any] | None
                 owners[str(post["id"])] = (event, post)
 
     days: dict[str, list[dict[str, str]]] = {}
-    totals = {"额度重置": 0, "发重置卡": 0, "重置确认": 0, "补充确认": 0}
+    totals = {"额度重置": 0, "发重置卡": 0, "补充确认": 0}
     for event in events.values():
         placed = _place_event(event, owners)
         if placed is None:
@@ -146,14 +146,12 @@ def _place_event(
         day = date.fromisoformat(str(raw_day)[:10]).isoformat()
     except (ValueError, TypeError):
         return None
+    event_type = event.get("type")
+    label = "发重置卡" if event_type == "reset_credit" else "额度重置"
+    # 补充确认 stays limited to events that were not an explicit reset or credit grant.
     explicit = presentation.get("kindExplicit") is True
-    if event.get("type") == "reset_credit" and explicit:
-        label = "发重置卡"
-    elif event.get("type") == "direct_reset" and explicit:
-        label = "额度重置"
-    else:
-        label = "重置确认"
-    if label == "重置确认" and _quotes_amendment(event, owners):
+    unspecified_form = not (explicit and event_type in ("reset_credit", "direct_reset"))
+    if unspecified_form and _quotes_amendment(event, owners):
         label = "补充确认"
     return day, label, state
 
@@ -218,7 +216,7 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
         draw.rounded_rectangle((1, 1, image.width - 2, image.height - 2), radius=20, outline="#dbe3e5", width=2)
         draw.text((margin, 25), f'{model["year"]} 年 {model["month"]} 月', font=face(30, True), fill="#20333f")
         totals = model["totals"]
-        summary = f'额度重置 {totals["额度重置"]} · 发卡 {totals["发重置卡"]} · 重置确认 {totals["重置确认"]}'
+        summary = f'额度重置 {totals["额度重置"]} · 发卡 {totals["发重置卡"]}'
         if totals["补充确认"]:
             summary += f' · 补充确认 {totals["补充确认"]}'
         draw.text((margin, 76), summary, font=face(21), fill="#546b79")

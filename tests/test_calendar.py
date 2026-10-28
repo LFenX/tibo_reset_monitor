@@ -94,12 +94,14 @@ class CalendarModelTest(unittest.TestCase):
         self.assertEqual(labels["card"]["label"], "发重置卡")
         self.assertEqual(labels["card"]["state"], "confirmed")
         self.assertEqual(labels["waiting"]["state"], "waiting")
-        self.assertEqual(labels["waiting"]["label"], "重置确认")
+        self.assertEqual(labels["waiting"]["label"], "额度重置")
+        self.assertEqual(labels["expected"]["label"], "额度重置")
         self.assertEqual(labels["expected"]["state"], "expected")
         self.assertEqual(model["days"]["2026-10-28"][0]["id"], "waiting")
         self.assertEqual(model["totals"]["发重置卡"], 1)
         self.assertEqual(model["totals"]["额度重置"], 0)
-        self.assertEqual(model["totals"]["重置确认"], 0)
+        self.assertNotIn("重置确认", model["totals"])
+        self.assertNotIn("重置确认", {item["label"] for item in labels.values()})
 
     def test_amendment_context_is_its_own_total(self):
         recent = {
@@ -125,7 +127,7 @@ class CalendarModelTest(unittest.TestCase):
         follow = next(item for items in model["days"].values() for item in items if item["id"] == "follow")
         self.assertEqual(follow["label"], "补充确认")
         self.assertEqual(model["totals"]["补充确认"], 1)
-        self.assertEqual(model["totals"]["重置确认"], 0)
+        self.assertNotIn("重置确认", {item["label"] for items in model["days"].values() for item in items})
 
     def test_explicit_direct_reset_is_not_an_estimate(self):
         recent = {
@@ -146,6 +148,53 @@ class CalendarModelTest(unittest.TestCase):
         self.assertEqual(model["days"]["2026-10-05"][0]["label"], "额度重置")
         self.assertEqual(model["days"]["2026-10-05"][0]["state"], "confirmed")
         self.assertNotIn("2026-10-01", model["days"])
+
+    def test_unspecified_form_is_still_a_reset_or_credit_label(self):
+        recent = {
+            "historyFrom": "2026-10-01T00:00:00.000+08:00",
+            "events": [
+                _event(
+                    "plain",
+                    confirmationBasis="source_post",
+                    confirmedAt="2026-10-08T00:00:00.000+08:00",
+                    occurredOn="2026-10-08",
+                    presentation={"kindExplicit": False, "status": "confirmed"},
+                ),
+                _event(
+                    "quiet-card",
+                    type="reset_credit",
+                    confirmationBasis="source_post",
+                    confirmedAt="2026-10-11T00:00:00.000+08:00",
+                    occurredOn="2026-10-11",
+                    presentation={"kindExplicit": False, "status": "confirmed"},
+                ),
+            ],
+        }
+        model = calendar_model(None, recent, NOW)
+        labels = {item["id"]: item["label"] for items in model["days"].values() for item in items}
+        self.assertEqual(labels["plain"], "额度重置")
+        self.assertEqual(labels["quiet-card"], "发重置卡")
+        self.assertEqual(model["totals"]["额度重置"], 1)
+        self.assertEqual(model["totals"]["发重置卡"], 1)
+
+    def test_explicit_reset_that_quotes_an_amendment_stays_a_reset(self):
+        recent = {
+            "historyFrom": "2026-10-01T00:00:00.000+08:00",
+            "events": [
+                _event("base", posts=[{"id": "amend-post", "stage": "补充说明"}]),
+                _event(
+                    "explicit",
+                    confirmationBasis="source_post",
+                    confirmedAt="2026-10-04T00:00:00.000+08:00",
+                    occurredOn="2026-10-04",
+                    presentation={"kindExplicit": True, "status": "confirmed"},
+                    posts=[{"id": "follow", "stage": "确认完成", "context": [{"id": "amend-post"}]}],
+                ),
+            ],
+        }
+        model = calendar_model(None, recent, NOW)
+        explicit = next(item for items in model["days"].values() for item in items if item["id"] == "explicit")
+        self.assertEqual(explicit["label"], "额度重置")
 
     def test_history_url_strips_recent(self):
         self.assertEqual(
