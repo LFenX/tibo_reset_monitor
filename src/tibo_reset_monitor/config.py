@@ -36,7 +36,7 @@ _CHANNEL_KEYS = {
 _FEISHU_TARGET_KEYS = {"name", "kind", "receive_id", "receive_id_type", "language", "timezone"}
 _TELEGRAM_TARGET_KEYS = {"name", "kind", "chat_id", "language", "timezone"}
 _LANGUAGES = {"zh", "en"}
-_WEBHOOK_TARGET_KEYS = {"name", "kind", "url_env", "language", "timezone"}
+_WEBHOOK_TARGET_KEYS = {"name", "kind", "url_env", "secret_env", "language", "timezone"}
 _FORBIDDEN_KEYS = {"app_secret", "bot_token", "token", "secret", "password", "access_token", "webhook_url"}
 _PERSONAL_ID_TYPES = {"open_id", "user_id", "email"}
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
@@ -324,7 +324,13 @@ def _target_address(
         return chat_id, {}
     url_env = item.get("url_env")
     _env_name(url_env, f"{path}.url_env", errors)
-    return "", {"url_env": str(url_env or "")}
+    options = {"url_env": str(url_env or "")}
+    if "secret_env" in item:
+        secret_env = item.get("secret_env")
+        _env_name(secret_env, f"{path}.secret_env", errors)
+        if isinstance(secret_env, str):
+            options["secret_env"] = secret_env
+    return "", options
 
 
 def _reject_secrets(value: Any, path: str, errors: list[str]) -> None:

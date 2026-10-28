@@ -237,7 +237,47 @@ The Feishu channel in this repository sends one interactive card (Card JSON 2.0)
 
 ### Webhook
 
-Optional. `enabled` defaults to false. Each target URL comes from the environment variable named by `url_env` and must be https. The request is JSON and sends `Idempotency-Key`. The body includes `idempotency_key`, the target `name` and `kind`, and the original `notice` object (`stage`, `url`, `published_at`, `text`, and the other raw fields stay as they were). It also adds localized `language`, `title`, `tags`, `scope`, and `text`. 2xx is success. 429 and 5xx are retried. Other 4xx results are permanent failures.
+Optional. `enabled` defaults to false. Each target URL comes from the environment variable named by `url_env` and must be https. Omitting `secret_env` leaves the request exactly as before: no signature headers. Field details and receiver checks are in [docs/webhook.md](docs/webhook.md).
+
+The request is a `POST` with these headers:
+
+| Header | Meaning |
+| --- | --- |
+| `Content-Type` | `application/json; charset=utf-8` |
+| `Idempotency-Key` | Dedup key for this delivery. After success the same notice is not sent to that target again under a new key. Receivers should store this value |
+| `X-Tibo-Timestamp` | Present only when signing is configured. Unix seconds |
+| `X-Tibo-Signature` | Present only when signing is configured. `v1=` plus the hex HMAC-SHA256 |
+
+The JSON body has `idempotency_key` (the same value as the header), `language`, `target.name` / `target.kind`, localized `title`, `tags`, `scope`, `text`, and `posted`, plus the original `notice` object. `notice.stage`, `notice.url`, `notice.published_at`, and `notice.text` stay raw. 2xx is success. 429 and 5xx are retried. Other 4xx results are permanent failures.
+
+Signing is optional. `secret_env` is an environment variable name; the config file never holds the secret. If the field is set and the variable is empty, the delivery is retryable and is not sent unsigned. The signed bytes are `<timestamp>.<raw request body>`, and the secret is UTF-8. Receivers should reject timestamps outside a window and compare signatures in constant time.
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: str, body: bytes, timestamp: str, signature: str, window: int = 300) -> bool:
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False
+    if abs(time.time() - ts) > window:
+        return False
+    expected = "v1=" + hmac.new(secret.encode("utf-8"), f"{ts}.".encode("ascii") + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+```javascript
+const crypto = require("crypto");
+
+function verify(secret, body, timestamp, signature, windowSec = 300) {
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > windowSec) return false;
+  const expected = "v1=" + crypto.createHmac("sha256", secret).update(`${ts}.`).update(body).digest("hex");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(String(signature));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+```
 
 ## Docker and background runs
 

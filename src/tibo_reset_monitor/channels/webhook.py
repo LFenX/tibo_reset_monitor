@@ -1,9 +1,17 @@
-"""Generic JSON webhook. The URL comes from an environment variable."""
+"""Generic JSON webhook. The URL comes from an environment variable.
+
+Signing is optional. A target that sets ``secret_env`` signs the exact request
+body with HMAC-SHA256. A target that omits it sends the same request as before.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
+import time
+from datetime import timezone
 from typing import Any
 
 from tibo_reset_monitor.channels.base import receipt_from_transport
@@ -18,9 +26,9 @@ class WebhookChannel:
     name = "webhook"
 
     def __init__(self, spec: ChannelSpec, transport: Any, clock: Any) -> None:
-        del clock
         self.targets = list(spec.targets)
         self._transport = transport
+        self._clock = clock
         self._language = normalize_language(spec.settings.get("language"))
         self._timezone = spec.settings.get("timezone") or "UTC"
         self._timeout = 20.0
@@ -52,15 +60,25 @@ class WebhookChannel:
             return Receipt("permanent", detail=f"{env_name} must be an https URL")
         payload = dict(message)
         payload["idempotency_key"] = idempotency_key
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Idempotency-Key": idempotency_key,
+        }
+        secret_env = (target.options.get("secret_env") or "").strip()
+        if secret_env:
+            secret = os.environ.get(secret_env, "").strip()
+            if not secret:
+                return Receipt("retryable", detail=f"{secret_env} is not set")
+            timestamp = str(self._unix_seconds())
+            headers["X-Tibo-Timestamp"] = timestamp
+            headers["X-Tibo-Signature"] = sign_body(secret, timestamp, body)
         try:
             response = self._transport.send(
                 "POST",
                 url,
-                {
-                    "Content-Type": "application/json; charset=utf-8",
-                    "Idempotency-Key": idempotency_key,
-                },
-                json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                headers,
+                body,
                 self._timeout,
             )
         except TransportError as exc:
@@ -78,6 +96,21 @@ class WebhookChannel:
         if 400 <= response.status < 500:
             return Receipt("permanent", detail=f"webhook HTTP {response.status} from {env_name}")
         return Receipt("retryable", detail=f"webhook HTTP {response.status} from {env_name}")
+
+    def _unix_seconds(self) -> int:
+        if self._clock is not None:
+            now = self._clock.now()
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            return int(now.timestamp())
+        return int(time.time())
+
+
+def sign_body(secret: str, timestamp: str, body: bytes) -> str:
+    """HMAC-SHA256 of ``<timestamp>.<raw body bytes>``, labeled ``v1=<hex>``."""
+    signed = timestamp.encode("ascii") + b"." + body
+    digest = hmac.new(secret.encode("utf-8"), signed, hashlib.sha256).hexdigest()
+    return f"v1={digest}"
 
 
 def _json_object(body: bytes) -> dict[str, Any]:

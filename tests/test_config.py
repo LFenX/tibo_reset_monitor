@@ -272,6 +272,56 @@ class ConfigTest(unittest.TestCase):
                     )
                 )
 
+    def test_webhook_secret_env_must_be_an_environment_name(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(ConfigError) as raised:
+                load_config(
+                    _write(
+                        root,
+                        {
+                            "channels": {
+                                "webhook": {
+                                    "enabled": False,
+                                    "targets": [
+                                        {
+                                            "name": "hook",
+                                            "kind": "group",
+                                            "url_env": "TIBO_WEBHOOK_EXAMPLE_URL",
+                                            "secret_env": "not-a-name",
+                                        }
+                                    ],
+                                }
+                            }
+                        },
+                    )
+                )
+            self.assertIn("$.channels.webhook.targets[0].secret_env", str(raised.exception))
+            config = load_config(
+                _write(
+                    root,
+                    {
+                        "channels": {
+                            "webhook": {
+                                "enabled": False,
+                                "targets": [
+                                    {
+                                        "name": "hook",
+                                        "kind": "group",
+                                        "url_env": "TIBO_WEBHOOK_EXAMPLE_URL",
+                                        "secret_env": "TIBO_WEBHOOK_EXAMPLE_SECRET",
+                                    }
+                                ],
+                            }
+                        }
+                    },
+                )
+            )
+            webhook = next(channel for channel in config.channels if channel.name == "webhook")
+            self.assertEqual(webhook.targets[0].options["secret_env"], "TIBO_WEBHOOK_EXAMPLE_SECRET")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -237,7 +237,47 @@ PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
 
 ### Webhook
 
-可选。`enabled` 默认为 false。每个目标的 URL 来自 `url_env` 指向的环境变量，必须是 https。请求是 JSON，并带 `Idempotency-Key`。正文包含 `idempotency_key`、目标的 `name` / `kind`，以及原来的 `notice` 对象（`stage`、`url`、`published_at`、`text` 等原始字段保持不变）。另外增加按语言填写的 `language`、`title`、`tags`、`scope`、`text`。2xx 视为成功，429 和 5xx 会重试，其他 4xx 记为永久失败。
+可选。`enabled` 默认为 false。每个目标的 URL 来自 `url_env` 指向的环境变量，必须是 https。不写 `secret_env` 时，请求和以前一样，没有签名头。完整字段和接收端校验见 [docs/webhook.md](docs/webhook.md)。
+
+请求是 `POST`，头为：
+
+| 头 | 含义 |
+| --- | --- |
+| `Content-Type` | `application/json; charset=utf-8` |
+| `Idempotency-Key` | 这一次投递的幂等键。同一条通知对同一个目标成功之后不会再用新键重发。接收方用它去重 |
+| `X-Tibo-Timestamp` | 仅在配置了签名时出现。Unix 秒 |
+| `X-Tibo-Signature` | 仅在配置了签名时出现。`v1=` 加 HMAC-SHA256 的十六进制 |
+
+JSON 里有 `idempotency_key`（和头里的值相同）、`language`、`target.name` / `target.kind`、按语言填写的 `title`、`tags`、`scope`、`text`、`posted`，以及原来的 `notice` 对象。`notice.stage`、`notice.url`、`notice.published_at`、`notice.text` 仍是原始字段。2xx 视为成功，429 和 5xx 会重试，其他 4xx 记为永久失败。
+
+签名是可选的。`secret_env` 只写环境变量名，配置文件里不放密钥。配了这个字段但环境变量为空时，这次投递记为可重试失败，不会不签名就发出去。签名内容是 `<timestamp>.<原始请求体字节>`，密钥按 UTF-8。接收方应拒绝超出时间窗口的时间戳，并用常量时间比较签名。
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: str, body: bytes, timestamp: str, signature: str, window: int = 300) -> bool:
+    try:
+        ts = int(timestamp)
+    except ValueError:
+        return False
+    if abs(time.time() - ts) > window:
+        return False
+    expected = "v1=" + hmac.new(secret.encode("utf-8"), f"{ts}.".encode("ascii") + body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+```
+
+```javascript
+const crypto = require("crypto");
+
+function verify(secret, body, timestamp, signature, windowSec = 300) {
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > windowSec) return false;
+  const expected = "v1=" + crypto.createHmac("sha256", secret).update(`${ts}.`).update(body).digest("hex");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(String(signature));
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+```
 
 ## Docker 与后台运行
 

@@ -31,6 +31,8 @@ Omitted values inherit. The default is `zh`. The loader rejects anything other t
 
 Read secrets from environment variables named in the config. Do not log tokens or put them in exception text. Use `tibo_reset_monitor.core.http.UrllibTransport`, which refuses cross-host redirects and strips bot tokens from errors.
 
+The built-in webhook documents its body, `Idempotency-Key`, and optional HMAC in [webhook.md](webhook.md). A new channel that signs requests should sign the bytes it actually sends and keep the secret out of logs, the state database, and error text.
+
 ## Steps
 
 1. Add `src/tibo_reset_monitor/channels/your_channel.py`.

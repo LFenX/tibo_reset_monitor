@@ -69,6 +69,12 @@
           "name": "example-hook",
           "kind": "group",
           "url_env": "TIBO_WEBHOOK_EXAMPLE_URL"
+        },
+        {
+          "name": "example-hook-signed",
+          "kind": "group",
+          "url_env": "TIBO_WEBHOOK_EXAMPLE_SIGNED_URL",
+          "secret_env": "TIBO_WEBHOOK_EXAMPLE_SECRET"
         }
       ]
     }
