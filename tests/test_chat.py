@@ -196,6 +196,36 @@ class ChatFlowTest(TempStoreTest):
         assert replay is not None
         self.assertIn("无效", replay.text)
 
+    def test_a_group_message_does_not_answer_a_direct_picker(self):
+        self.controller.handle(_inbound(event_id="e2", text="#添加群聊"))
+        reply = self.controller.handle(
+            _inbound(event_id="e3", scope="group", chat_id="-100", user_id="42", chat_title="Ops", text="1")
+        )
+        self.assertIsNone(reply)
+        self.assertIsNotNone(self.store.load_session("telegram", "42"))
+        self.assertEqual(
+            [item for item in self.store.subscriptions("telegram") if item["status"] == "active"],
+            [],
+        )
+        picked = self.controller.handle(_inbound(event_id="e4", text="3"))
+        assert picked is not None
+        self.assertIn("Quiet", picked.text)
+
+    def test_a_failed_refresh_drops_the_previous_list(self):
+        self.controller.handle(_inbound(event_id="e2", text="#添加群聊"))
+
+        def boom():
+            raise RuntimeError("down")
+
+        self.controller.group_catalog = boom
+        failed = self.controller.handle(_inbound(event_id="e3", text="/addgroup"))
+        assert failed is not None
+        self.assertIn("暂时", failed.text)
+        self.assertIsNone(self.store.load_session("telegram", "42"))
+        leftover = self.controller.handle(_inbound(event_id="e4", text="1"))
+        assert leftover is not None
+        self.assertNotIn("已订阅", leftover.text)
+
     def test_unicode_digit_does_not_crash_the_picker(self):
         self.controller.handle(_inbound(event_id="e2", text="#添加群聊"))
         reply = self.controller.handle(_inbound(event_id="e3", text="²"))

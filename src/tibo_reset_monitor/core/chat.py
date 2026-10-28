@@ -158,7 +158,7 @@ class ChatController:
         if self._limited(inbound.user_id, now):
             return Reply(inbound.chat_id, self._t("slow"))
         command, argument = _split_command(inbound.text)
-        if command is None and self.store.load_session(self.channel, inbound.user_id):
+        if command is None and inbound.scope == "personal" and self.store.load_session(self.channel, inbound.user_id):
             return self._select(inbound, inbound.text.strip(), now)
         if command is None:
             if inbound.scope == "personal":
@@ -254,6 +254,7 @@ class ChatController:
         else:
             groups = self._groups()
             if groups is None:
+                self.store.clear_session(self.channel, inbound.user_id)
                 return Reply(inbound.chat_id, self._t("list_failed"))
             choices = [(chat_id, title) for chat_id, title in groups if chat_id not in active]
             empty = "empty_add"
