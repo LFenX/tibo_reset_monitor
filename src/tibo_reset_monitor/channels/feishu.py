@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import uuid
 from datetime import timedelta
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 
 from tibo_reset_monitor.channels.base import receipt_from_transport
 from tibo_reset_monitor.config import ChannelSpec
 from tibo_reset_monitor.core.http import TransportError
-from tibo_reset_monitor.core.model import Notice, Receipt, Target, notice_lines
+from tibo_reset_monitor.core.i18n import compose, normalize_language
+from tibo_reset_monitor.core.model import Notice, Receipt, Target
 from tibo_reset_monitor.core.source import parse_retry_after
+
+log = logging.getLogger("tibo_reset_monitor")
 
 _TEMPLATES = {
     "announcement": "blue",
@@ -37,33 +42,45 @@ class FeishuChannel:
         self._app_id = spec.settings.get("app_id", "")
         self._app_id_env = spec.settings.get("app_id_env", "")
         self._secret_env = spec.settings.get("app_secret_env", "TIBO_FEISHU_APP_SECRET")
+        self._language = normalize_language(spec.settings.get("language"))
         self._timeout = 20.0
         self._token: str | None = None
         self._token_until = None
+        self._calendar_png: Callable[..., bytes | None] | None = None
+        self._calendar_month: Callable[[], tuple[int, int]] | None = None
+
+    def bind_calendar(
+        self,
+        provider: Callable[..., bytes | None],
+        month: Callable[[], tuple[int, int]] | None = None,
+    ) -> None:
+        self._calendar_png = provider
+        self._calendar_month = month
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
-        card = {
-            "schema": "2.0",
-            "config": {"update_multi": True},
-            "header": {
-                "title": {"tag": "plain_text", "content": notice.headline()[:200]},
-                "subtitle": {"tag": "plain_text", "content": _subtitle(notice)[:200]},
-                "template": _TEMPLATES.get(notice.stage, "blue"),
-            },
-            "body": {
-                "direction": "vertical",
-                "elements": _elements(notice),
-            },
-        }
+        language = normalize_language(target.options.get("language"), self._language)
+        year_month = self._calendar_month() if self._calendar_month else None
+        message = compose(notice, language, year_month)
+        card = _card(message)
         return {
             "receive_id": target.address,
             "receive_id_type": target.options.get("receive_id_type", "chat_id"),
             "msg_type": "interactive",
             "content": json.dumps(card, ensure_ascii=False, separators=(",", ":")),
+            "photo": self._load_photo(language),
+            "photo_alt": message.calendar_line,
         }
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
         del target
+        content = message.get("content")
+        photo = message.get("photo")
+        if isinstance(photo, (bytes, bytearray)) and photo and isinstance(content, str):
+            image_key = self._upload_image(bytes(photo))
+            if image_key:
+                content = _with_image(content, image_key, str(message.get("photo_alt") or ""))
+                message = dict(message)
+                message["content"] = content
         return self._post_message(message, idempotency_key, refreshed=False)
 
     def _post_message(self, message: dict[str, Any], idempotency_key: str, *, refreshed: bool) -> Receipt:
@@ -147,30 +164,105 @@ class FeishuChannel:
         self._token_until = now + timedelta(seconds=max(30, expire - skew))
         return token
 
+    def _load_photo(self, language: str) -> bytes | None:
+        if self._calendar_png is None:
+            return None
+        try:
+            try:
+                photo = self._calendar_png(language)
+            except TypeError as exc:
+                if "argument" not in str(exc):
+                    raise
+                photo = self._calendar_png()
+        except Exception as exc:
+            log.warning("calendar image unavailable: %s", exc)
+            return None
+        return photo or None
 
-def _elements(notice: Notice) -> list[dict[str, Any]]:
-    body = "\n\n".join(notice_lines(notice))
+    def _upload_image(self, photo: bytes) -> str | None:
+        token = self._access_token(force=False)
+        if isinstance(token, Receipt):
+            log.warning("calendar image skipped: %s", token.detail)
+            return None
+        body, content_type = _image_form(photo)
+        try:
+            response = self._transport.send(
+                "POST",
+                f"{self._api_base}/open-apis/im/v1/images",
+                {"Authorization": f"Bearer {token}", "Content-Type": content_type},
+                body,
+                self._timeout,
+            )
+        except TransportError as exc:
+            log.warning("calendar image upload failed: %s", exc)
+            return None
+        payload = _json_object(response.body)
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        image_key = data.get("image_key") if payload.get("code") == 0 else None
+        if response.status == 200 and isinstance(image_key, str) and image_key:
+            return image_key
+        log.warning("calendar image upload failed: %s", payload.get("msg") or response.status)
+        return None
+
+
+def _card(message: Any) -> dict[str, Any]:
     elements: list[dict[str, Any]] = [
-        {"tag": "markdown", "content": body, "text_align": "left", "text_size": "normal"}
+        {"tag": "markdown", "content": message.card_body, "text_align": "left", "text_size": "normal"}
     ]
-    if notice.url:
+    if message.link_url:
         elements.append(
             {
                 "tag": "button",
-                "text": {"tag": "plain_text", "content": "查看原帖"},
+                "text": {"tag": "plain_text", "content": message.link_label},
                 "type": "primary",
                 "width": "default",
-                "behaviors": [{"type": "open_url", "default_url": notice.url}],
+                "behaviors": [{"type": "open_url", "default_url": message.link_url}],
             }
         )
-    return elements
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": message.title[:200]},
+            "subtitle": {"tag": "plain_text", "content": message.subtitle[:200]},
+            "template": _TEMPLATES.get(message.stage, "blue"),
+        },
+        "body": {"direction": "vertical", "elements": elements},
+    }
 
 
-def _subtitle(notice: Notice) -> str:
-    author = f"@{notice.author}" if notice.author else "@thsottiaux"
-    if notice.published_at:
-        return f"{author} · {notice.published_at}"
-    return author
+def _with_image(content: str, image_key: str, alt: str) -> str:
+    card = json.loads(content)
+    card["body"]["elements"].append(
+        {
+            "tag": "img",
+            "img_key": image_key,
+            "alt": {"tag": "plain_text", "content": alt[:200] or "calendar"},
+            "mode": "fit_horizontal",
+            "preview": True,
+        }
+    )
+    return json.dumps(card, ensure_ascii=False, separators=(",", ":"))
+
+
+def _image_form(photo: bytes) -> tuple[bytes, str]:
+    boundary = "tibo" + uuid.uuid4().hex
+    chunks = [
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="image_type"\r\n\r\n'
+            "message\r\n"
+        ).encode("utf-8"),
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="image"; filename="calendar.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+        + photo
+        + b"\r\n",
+        f"--{boundary}--\r\n".encode("utf-8"),
+    ]
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
 def _json_object(body: bytes) -> dict[str, Any]:

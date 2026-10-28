@@ -9,6 +9,7 @@ from typing import Any
 from tibo_reset_monitor.channels.base import receipt_from_transport
 from tibo_reset_monitor.config import ChannelSpec
 from tibo_reset_monitor.core.http import TransportError
+from tibo_reset_monitor.core.i18n import compose, normalize_language
 from tibo_reset_monitor.core.model import Notice, Receipt, Target
 from tibo_reset_monitor.core.source import parse_retry_after
 
@@ -20,12 +21,23 @@ class WebhookChannel:
         del clock
         self.targets = list(spec.targets)
         self._transport = transport
+        self._language = normalize_language(spec.settings.get("language"))
         self._timeout = 20.0
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
+        language = normalize_language(target.options.get("language"), self._language)
+        message = compose(notice, language)
+        text = message.text
+        if message.quote_line:
+            text = f"{text}\n\n{message.quote_line}" if text else message.quote_line
         return {
+            "language": message.language,
             "target": {"name": target.key, "kind": target.kind},
             "notice": notice.to_json(),
+            "title": message.title,
+            "tags": list(message.tags),
+            "scope": message.scope,
+            "text": text,
         }
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:

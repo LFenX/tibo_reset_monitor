@@ -22,19 +22,20 @@ TELEGRAM_PERSONAL = re.compile(r"^[1-9]\d{0,18}$")
 TELEGRAM_GROUP_ID = re.compile(r"^-[1-9]\d{0,18}$")
 TELEGRAM_GROUP_NAME = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
 
-_ROOT_KEYS = {"source", "state", "logging", "channels", "calendar"}
+_ROOT_KEYS = {"language", "source", "state", "logging", "channels", "calendar"}
 _SOURCE_KEYS = {"url", "poll_interval_seconds", "timeout_seconds", "user_agent", "history_url"}
 _CALENDAR_KEYS = {"font_path", "font_bold_path", "font_index", "history_refresh_seconds"}
 _STATE_KEYS = {"path"}
 _LOGGING_KEYS = {"level", "file"}
 _CHANNEL_KEYS = {
-    "feishu": {"enabled", "api_base", "app_id", "app_id_env", "app_secret_env", "targets"},
-    "telegram": {"enabled", "api_base", "bot_token_env", "targets"},
-    "webhook": {"enabled", "targets"},
+    "feishu": {"enabled", "api_base", "app_id", "app_id_env", "app_secret_env", "language", "targets"},
+    "telegram": {"enabled", "api_base", "bot_token_env", "language", "targets"},
+    "webhook": {"enabled", "language", "targets"},
 }
-_FEISHU_TARGET_KEYS = {"name", "kind", "receive_id", "receive_id_type"}
-_TELEGRAM_TARGET_KEYS = {"name", "kind", "chat_id"}
-_WEBHOOK_TARGET_KEYS = {"name", "kind", "url_env"}
+_FEISHU_TARGET_KEYS = {"name", "kind", "receive_id", "receive_id_type", "language"}
+_TELEGRAM_TARGET_KEYS = {"name", "kind", "chat_id", "language"}
+_LANGUAGES = {"zh", "en"}
+_WEBHOOK_TARGET_KEYS = {"name", "kind", "url_env", "language"}
 _FORBIDDEN_KEYS = {"app_secret", "bot_token", "token", "secret", "password", "access_token", "webhook_url"}
 _PERSONAL_ID_TYPES = {"open_id", "user_id", "email"}
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
@@ -69,6 +70,7 @@ class AppConfig:
     font_path: str = ""
     font_bold_path: str = ""
     font_index: int | None = None
+    language: str = "zh"
 
     @property
     def stale_lock_seconds(self) -> float:
@@ -88,6 +90,10 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
     errors: list[str] = []
     _reject_secrets(loaded, "$", errors)
     _unknown(loaded, _ROOT_KEYS, "$", errors)
+    if "language" in loaded:
+        global_language = _language(loaded.get("language"), "$.language", errors)
+    else:
+        global_language = "zh"
     source = _object(loaded.get("source", {}), "$.source", errors)
     state = _object(loaded.get("state", {}), "$.state", errors)
     logging_block = _object(loaded.get("logging", {}), "$.logging", errors)
@@ -165,7 +171,7 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         if not isinstance(enabled, bool):
             errors.append(f"{path_prefix}.enabled must be true or false")
             enabled = False
-        settings, targets = _channel(name, raw_channel, path_prefix, errors)
+        settings, targets = _channel(name, raw_channel, path_prefix, global_language, errors)
         channels.append(ChannelSpec(name=name, enabled=enabled, settings=settings, targets=targets))
 
     if errors:
@@ -184,10 +190,17 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         font_path=font_path,
         font_bold_path=font_bold_path,
         font_index=font_index,
+        language=global_language if global_language in _LANGUAGES else "zh",
     )
 
 
-def _channel(name: str, raw: dict[str, Any], prefix: str, errors: list[str]) -> tuple[dict[str, str], list[Target]]:
+def _channel(
+    name: str,
+    raw: dict[str, Any],
+    prefix: str,
+    inherited: str,
+    errors: list[str],
+) -> tuple[dict[str, str], list[Target]]:
     settings: dict[str, str] = {}
     if name == "feishu":
         settings["api_base"] = _https_base(raw.get("api_base") or "https://open.feishu.cn", f"{prefix}.api_base", errors)
@@ -212,6 +225,10 @@ def _channel(name: str, raw: dict[str, Any], prefix: str, errors: list[str]) -> 
         _env_name(token_env, f"{prefix}.bot_token_env", errors)
         if isinstance(token_env, str):
             settings["bot_token_env"] = token_env
+    if "language" in raw:
+        settings["language"] = _language(raw.get("language"), f"{prefix}.language", errors)
+    else:
+        settings["language"] = inherited if inherited in _LANGUAGES else "zh"
     targets_raw = raw.get("targets", [])
     if not isinstance(targets_raw, list):
         errors.append(f"{prefix}.targets must be an array")
@@ -237,6 +254,11 @@ def _channel(name: str, raw: dict[str, Any], prefix: str, errors: list[str]) -> 
             errors.append(f"{item_path}.kind must be 'group' or 'personal'")
             continue
         address, options = _target_address(name, kind, item, item_path, errors)
+        options = dict(options)
+        if "language" in item:
+            options["language"] = _language(item.get("language"), f"{item_path}.language", errors)
+        else:
+            options["language"] = settings.get("language", "zh")
         targets.append(Target(channel=name, key=target_name, kind=kind, address=address, options=options))
     return settings, targets
 
@@ -317,6 +339,13 @@ def _int(value: Any, path: str, errors: list[str]) -> int:
         errors.append(f"{path} must be an integer")
         return 0
     return value
+
+
+def _language(value: Any, path: str, errors: list[str]) -> str:
+    if value in _LANGUAGES:
+        return str(value)
+    errors.append(f'{path} must be "zh" or "en"')
+    return "zh"
 
 
 def _env_name(value: Any, path: str, errors: list[str]) -> None:

@@ -1,4 +1,5 @@
 {
+  "language": "zh",
   "source": {
     "url": "https://aihot.news/api/v1/codex-resets/recent",
     "poll_interval_seconds": 600,
@@ -20,6 +21,7 @@
   "channels": {
     "feishu": {
       "enabled": true,
+      "language": "zh",
       "api_base": "https://open.feishu.cn",
       "app_id": "cli_example_not_a_real_app_id",
       "app_secret_env": "TIBO_FEISHU_APP_SECRET",
@@ -40,6 +42,7 @@
     },
     "telegram": {
       "enabled": true,
+      "language": "zh",
       "api_base": "https://api.telegram.org",
       "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
       "targets": [
@@ -51,12 +54,14 @@
         {
           "name": "example-person",
           "kind": "personal",
-          "chat_id": "100000000"
+          "chat_id": "100000000",
+          "language": "en"
         }
       ]
     },
     "webhook": {
       "enabled": false,
+      "language": "zh",
       "targets": [
         {
           "name": "example-hook",

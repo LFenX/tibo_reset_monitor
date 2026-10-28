@@ -13,13 +13,12 @@ import logging
 import os
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 from tibo_reset_monitor.channels.base import receipt_from_transport
 from tibo_reset_monitor.config import ChannelSpec
 from tibo_reset_monitor.core.http import TransportError
+from tibo_reset_monitor.core.i18n import OutboundMessage, compose, normalize_language
 from tibo_reset_monitor.core.model import MANUAL, Notice, Receipt, Target
 
 log = logging.getLogger("tibo_reset_monitor")
@@ -27,8 +26,6 @@ log = logging.getLogger("tibo_reset_monitor")
 _PHOTO_CAPTION_LIMIT = 1024
 _TEXT_LIMIT = 4096
 _BODY_CAP = 6000
-_BEIJING = timezone(timedelta(hours=8))
-_X_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com", "www.x.com", "www.twitter.com"}
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -41,6 +38,7 @@ class TelegramChannel:
         self._transport = transport
         self._api_base = spec.settings.get("api_base", "https://api.telegram.org").rstrip("/")
         self._token_env = spec.settings.get("bot_token_env", "TIBO_TELEGRAM_BOT_TOKEN")
+        self._language = normalize_language(spec.settings.get("language"))
         self._timeout = 20.0
         self._calendar_png: Callable[[], bytes | None] | None = None
         self._calendar_month: Callable[[], tuple[int, int]] | None = None
@@ -54,13 +52,14 @@ class TelegramChannel:
         self._calendar_month = month
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
-        photo = self._load_photo()
+        language = _target_language(target, self._language)
+        photo = self._load_photo(language)
         year_month = self._calendar_month() if self._calendar_month else None
         return {
             "chat_id": target.address,
             "photo": photo,
-            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT, year_month),
-            "text": build_caption(notice, _TEXT_LIMIT, year_month),
+            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT, year_month, language),
+            "text": build_caption(notice, _TEXT_LIMIT, year_month, language),
             "parse_mode": "HTML",
         }
 
@@ -102,11 +101,11 @@ class TelegramChannel:
             return receipt_from_transport(exc, sent=True)
         return _receipt(response.status, response.body, response.headers)
 
-    def _load_photo(self) -> bytes | None:
+    def _load_photo(self, language: str) -> bytes | None:
         if self._calendar_png is None:
             return None
         try:
-            photo = self._calendar_png()
+            photo = _call_calendar(self._calendar_png, language)
         except Exception as exc:
             log.warning("calendar image unavailable: %s", exc)
             return None
@@ -116,24 +115,54 @@ class TelegramChannel:
         return photo
 
 
-def build_caption(notice: Notice, limit: int, year_month: tuple[int, int] | None = None) -> str:
+def _target_language(target: Target, default: str) -> str:
+    return normalize_language(target.options.get("language"), default)
+
+
+def _call_calendar(provider: Callable[..., bytes | None], language: str) -> bytes | None:
+    """Pass the language when the provider accepts it. Older callables take no argument."""
+    try:
+        return provider(language)
+    except TypeError as exc:
+        if "argument" not in str(exc):
+            raise
+        return provider()
+
+
+def build_caption(
+    notice: Notice,
+    limit: int,
+    year_month: tuple[int, int] | None = None,
+    language: str = "zh",
+) -> str:
     """HTML caption whose parsed text length is at most ``limit`` UTF-16 code units.
 
     When the caption is too long, the main body and the original-post preview are
-    shortened first. Tags, times, and the post link stay.
+    shortened first. Tags, times, and the post link stay. English messages use the
+    post's original text as the body and shorten the one-line quote the same way.
     """
-    main_src = _clip(notice.text, _BODY_CAP)
-    preview_src = _clip(notice.original_text, _BODY_CAP)
-    quote_srcs = tuple(_clip(_context_body(item), 2000) for item in notice.contexts)
+    language = "en" if language == "en" else "zh"
+    if language == "en" and notice.stage != MANUAL:
+        main_src = _clip(notice.original_text, _BODY_CAP)
+        preview_src = ""
+        contexts = notice.contexts[:1]
+        quote_srcs = tuple(_clip(item.get("original_text") or "", 2000) for item in contexts)
+    else:
+        main_src = _clip(notice.text, _BODY_CAP)
+        preview_src = _clip(notice.original_text, _BODY_CAP)
+        contexts = notice.contexts
+        quote_srcs = tuple(_clip(_context_body(item), 2000) for item in contexts)
 
     def render(main_n: int, preview_n: int, quote_ns: tuple[int, ...]) -> str:
-        return _assemble(
+        message = compose(
             notice,
-            _cut(main_src, main_n),
-            _cut(preview_src, preview_n),
-            tuple(_cut(source, size) for source, size in zip(quote_srcs, quote_ns)),
+            language,
             year_month,
+            body=_cut(main_src, main_n),
+            preview=_cut(preview_src, preview_n),
+            quote_bodies=tuple(_cut(source, size) for source, size in zip(quote_srcs, quote_ns)),
         )
+        return _html(message)
 
     full_quotes = tuple(len(source) for source in quote_srcs)
     if parsed_length(render(len(main_src), len(preview_src), full_quotes)) <= limit:
@@ -200,148 +229,50 @@ def escape_attr(value: str) -> str:
     return escape_html(value).replace('"', "&quot;")
 
 
-def _assemble(
-    notice: Notice,
-    body: str,
-    preview: str,
-    quote_bodies: tuple[str, ...],
-    year_month: tuple[int, int] | None,
-) -> str:
-    if notice.stage == MANUAL:
-        lines = ["<b>手动提醒</b>", "<i>手动发送</i>", ""]
-        if body:
-            lines.append(escape_html(body))
-        lines.append("")
-        lines.append(escape_html(_calendar_line(year_month)))
-        return "\n".join(lines).strip()
-    name, caption = _author_lines(notice)
-    lines = [f"<b>{escape_html(name)}</b>", f"<i>{escape_html(caption)}</i>", ""]
-    tag = _caption_tag(notice.tag_label or "重置（形式未明确）")
-    stage = notice.stage_label or notice.stage
-    lines.append(f"<code>{escape_html(tag)}</code> <code>{escape_html(stage)}</code>")
-    lines.append("")
-    if body:
-        lines.append(escape_html(body))
-        lines.append("")
-    for detail in _detail_lines(notice):
-        lines.append(f"<i>{escape_html(detail)}</i>")
-    preview_html = _preview_html(notice, preview, quote_bodies)
-    if preview_html:
-        lines.append("")
-        lines.append(preview_html)
-    link = notice.url if notice.url.startswith(("https://", "http://")) else ""
-    if link:
-        lines.append(f'<a href="{escape_attr(link)}">查看原帖</a>')
-    lines.append("")
-    lines.append(escape_html(_calendar_line(year_month)))
-    return "\n".join(lines).strip()
-
-
-def _caption_tag(tag: str) -> str:
-    """Telegram-only display tweak. Other tag strings are left as stored."""
-    if tag == "重置（形式未明确）":
-        return "重置（形式未明确，默认额度重置）"
-    return tag
-
-
-def _calendar_line(year_month: tuple[int, int] | None) -> str:
-    if year_month is None:
-        local = datetime.now(_BEIJING)
-        year_month = (local.year, local.month)
-    year, month = year_month
-    return f"重置日历 · {year} 年 {month} 月"
-
-
-def _preview_html(notice: Notice, preview: str, quote_bodies: tuple[str, ...]) -> str:
-    """Original-post quote card. Omitted when the feed has no original text and no context."""
-    contexts = notice.contexts
-    if not preview and not any(quote_bodies):
-        return ""
-    name, _caption = _author_lines(notice)
-    _host, handle = _identity(notice.url)
-    if not handle:
-        handle = (notice.author or "").strip().lstrip("@")
-    header = f"原帖 · {name}"
-    if handle:
-        header += f" @{handle}"
-    lines = [header]
-    if preview:
-        lines.append(preview)
-    for item, body in zip(contexts, quote_bodies):
-        relation = item.get("relation") or ""
-        author = item.get("author") or ""
-        if relation == "quote":
-            lines.append(f"引用 @{author}" if author else "引用")
-        elif relation == "reply":
-            lines.append(f"回复 @{author}" if author else "回复")
-        elif author:
-            lines.append(f"@{author}")
-        if body:
-            lines.append(body)
-    stamp = _beijing_stamp(notice.published_at)
-    if stamp:
-        lines.append(f"{stamp} · 北京时间")
-    inner = "\n".join(escape_html(line) for line in lines)
-    return f"<blockquote>{inner}</blockquote>"
-
-
 def _context_body(item: dict[str, str]) -> str:
     return item.get("original_text") or item.get("text") or ""
 
 
-def _author_lines(notice: Notice) -> tuple[str, str]:
-    host, handle = _identity(notice.url)
-    if host in _X_HOSTS and handle:
-        if handle.lower() == "thsottiaux":
-            return "Tibo", "@thsottiaux · X"
-        return f"@{handle}", "X"
-    if host:
-        return host, host
-    author = (notice.author or "").strip()
-    if author.lower() == "thsottiaux":
-        return "Tibo", "@thsottiaux · X"
-    if author:
-        return f"@{author.lstrip('@')}", "X"
-    return "Tibo", "@thsottiaux · X"
-
-
-def _detail_lines(notice: Notice) -> list[str]:
-    lines: list[str] = []
-    if notice.type_name != "activity":
-        audience = notice.audience_zh or notice.qualified_scope or "帖子未明确适用范围"
-        lines.append(audience)
-    if notice.products_zh:
-        lines.append(notice.products_zh)
-    stamp = _beijing_stamp(notice.published_at)
-    if stamp:
-        lines.append(f"帖子发布 · {stamp}（北京时间）")
-    return lines
-
-
-def _beijing_stamp(value: str) -> str:
-    text = (value or "").strip()
-    if not text:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_BEIJING)
-    return parsed.astimezone(_BEIJING).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _identity(url: str) -> tuple[str, str]:
-    if not url:
-        return "", ""
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    handle = ""
-    if host in _X_HOSTS:
-        parts = [part for part in parsed.path.split("/") if part]
-        if parts and parts[0].lower() != "i":
-            handle = parts[0]
-    return host, handle
+def _html(message: OutboundMessage) -> str:
+    if message.stage == MANUAL:
+        lines = [
+            f"<b>{escape_html(message.manual_heading)}</b>",
+            f"<i>{escape_html(message.manual_note)}</i>",
+            "",
+        ]
+        if message.text:
+            lines.append(escape_html(message.text))
+        lines.append("")
+        lines.append(escape_html(message.calendar_line))
+        return "\n".join(lines).strip()
+    lines = [
+        f"<b>{escape_html(message.author_name)}</b>",
+        f"<i>{escape_html(message.author_caption)}</i>",
+        "",
+    ]
+    if len(message.tags) >= 2:
+        tag, stage = message.tags[0], message.tags[1]
+        lines.append(f"<code>{escape_html(tag)}</code> <code>{escape_html(stage)}</code>")
+    elif message.tags:
+        lines.append(f"<code>{escape_html(message.tags[0])}</code>")
+    lines.append("")
+    if message.text:
+        lines.append(escape_html(message.text))
+        lines.append("")
+    for detail in message.detail_lines:
+        lines.append(f"<i>{escape_html(detail)}</i>")
+    if message.preview_lines:
+        inner = "\n".join(escape_html(line) for line in message.preview_lines)
+        lines.append("")
+        lines.append(f"<blockquote>{inner}</blockquote>")
+    if message.quote_line:
+        lines.append("")
+        lines.append(escape_html(message.quote_line))
+    if message.link_url and message.stage != MANUAL:
+        lines.append(f'<a href="{escape_attr(message.link_url)}">{escape_html(message.link_label)}</a>')
+    lines.append("")
+    lines.append(escape_html(message.calendar_line))
+    return "\n".join(lines).strip()
 
 
 def _href_from_html(html: str) -> str:

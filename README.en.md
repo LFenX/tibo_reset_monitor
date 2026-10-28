@@ -70,7 +70,26 @@ Lands by midnight PST.
 重置日历 · 2026 年 10 月
 ```
 
-When the stored tag is 「重置（形式未明确）」, Telegram shows 「重置（形式未明确，默认额度重置）」. Other tags, such as 「重置（额度重置）」 and 「发重置卡」, stay as they are. The English original comes from `fullOriginalText`, or `originalText` when that field is absent. A `context` item with `relation: quote` is shown as `引用 @author`; `reply` is `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The blockquote is omitted when both the original text and `context` are empty.
+When the stored tag is 「重置（形式未明确）」, the Chinese message shows 「重置（形式未明确，默认额度重置）」. Other tags, such as 「重置（额度重置）」 and 「发重置卡」, stay as they are. The English original comes from `fullOriginalText`, or `originalText` when that field is absent. A `context` item with `relation: quote` is shown as `引用 @author`; `reply` is `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The blockquote is omitted when both the original text and `context` are empty.
+
+With `language` set to `en`, the same notice is English. The body is the original post, not the Chinese translation, and there is no original-post card. A quoted post is one line, `Quoting @handle: …`. A reply is `Replying to @handle: …`. The link says View original post.
+
+```html
+<b>Tibo</b>
+<i>@thsottiaux · X</i>
+
+<code>Reset (form unspecified, defaults to quota reset)</code> <code>Preview</code>
+
+And it's done. See you tomorrow for some good news.
+
+<i>Scope not specified in the post</i>
+<i>Posted · 2026-10-28 14:29:38 (Beijing time)</i>
+
+Quoting @thsottiaux: Lands by midnight PST.
+<a href="https://x.com/thsottiaux/status/123">View original post</a>
+
+Reset calendar · October 2026
+```
 
 The calendar month is Beijing time. A `reset_credit` cell says 发重置卡; every other event says 额度重置. 补充确认 is still used when the form was not explicit and the post quotes another event's 补充说明. The header counts only confirmed events in that month. Grey cells at the edges belong to the neighboring month. November 2026 below is six week rows. December 2026 and February 2027 are in `docs/` as well.
 
@@ -83,8 +102,15 @@ The calendar month is Beijing time. A `reset_credit` cell says 发重置卡; eve
 | [November 2026](docs/calendar-sample-2026-11.png) | 6 |
 | [December 2026](docs/calendar-sample-2026-12.png) | 5 |
 | [February 2027](docs/calendar-sample-2027-02.png) | 4, not a leap year |
+| [November 2026, English](docs/calendar-sample-en-2026-11.png) | 6 |
+| [December 2026, English](docs/calendar-sample-en-2026-12.png) | 5 |
+| [February 2027, English](docs/calendar-sample-en-2027-02.png) | 4, not a leap year |
 
-These images are drawn from fake events. They are not a screenshot of a live notification.
+These images are drawn from fake events. They are not a screenshot of a live notification. The English grid uses DejaVu, Liberation, Arial, or Noto Sans and does not need a CJK font.
+
+<p align="center">
+  <img src="docs/calendar-sample-en-2026-11.png" alt="English November 2026 calendar" width="100%">
+</p>
 
 ## Quick start
 
@@ -161,10 +187,17 @@ The full example is [`config.example.json`](config.example.json).
 | `calendar.font_bold_path` | Optional bold font. The regular face is used when it is absent |
 | `calendar.font_index` | Optional. Noto / Source Han CJK collections default to index 2 (Simplified Chinese) |
 | `calendar.history_refresh_seconds` | Full-history refresh interval. Default 21600 (6 hours), minimum 600 |
+| `language` | Global default, `zh` or `en`. Omitted means `zh` |
+| `channels.<name>.language` | Default for that channel. Overrides the global value. Feishu, Telegram, and Webhook share this meaning |
+| `channels.<name>.targets[].language` | One target. Overrides the channel and the global value |
 | `channels.<name>.enabled` | Disabled channels are not contacted |
 | `channels.<name>.targets[]` | `name` plus `kind`: `group` or `personal` |
 
 Secrets are environment variable names such as `app_secret_env`, `bot_token_env`, and `url_env`. A field named `app_secret` or `bot_token` is rejected.
+
+`language` is `zh` or `en`. It may be set on the root, on a channel, or on a target. The later value wins. Every channel uses the same cascade: the target, then the channel, then the global value, then `zh`. An unknown value fails at startup with the field path, for example `$.channels.telegram.targets[0].language must be "zh" or "en"`.
+
+`zh` is the current Chinese wording. `en` uses the original post (`fullOriginalText`, otherwise `originalText`). Stage names, tags, scope, the timestamp, and the calendar are English, and the original-post card is omitted. A quote or reply is one line: `Quoting @handle: …` or `Replying to @handle: …`.
 
 ## Channels
 
@@ -189,7 +222,7 @@ One message per target. `sendPhoto` puts the caption above the calendar when the
 
 ### Feishu
 
-The Feishu channel in this repository sends one interactive card (Card JSON 2.0). It calls the Feishu Open API directly, does not use `lark-cli`, and does not attach the calendar image. The outbox idempotency key is the `uuid` field.
+The Feishu channel in this repository sends one interactive card (Card JSON 2.0). It calls the Feishu Open API directly and does not use `lark-cli`. The outbox idempotency key is the `uuid` field. The default Chinese card keeps the previous title, body, and View-post button. `en` switches the title, body, and button to English, uses the original post as the body, and omits the original-post card. When a calendar PNG can be drawn it is uploaded and attached after the button. A failed upload is only a warning; the text card is still sent. The app needs permission to upload images (`im:resource`). Without Pillow or a usable font, the card has no image.
 
 1. Create a custom app on the [Feishu open platform](https://open.feishu.cn/app). For Lark, set `api_base` to `https://open.larksuite.com`.
 2. Enable the bot and grant permission to send messages as the bot (`im:message:send_as_bot`). Email personal targets also need the app to resolve a user in the tenant by email.
@@ -199,11 +232,11 @@ The Feishu channel in this repository sends one interactive card (Card JSON 2.0)
 
 ### Webhook
 
-Optional. `enabled` defaults to false. Each target URL comes from the environment variable named by `url_env` and must be https. The request is JSON and sends `Idempotency-Key`. The body includes `idempotency_key`, the target `name` and `kind`, and the notice fields. 2xx is success. 429 and 5xx are retried. Other 4xx results are permanent failures.
+Optional. `enabled` defaults to false. Each target URL comes from the environment variable named by `url_env` and must be https. The request is JSON and sends `Idempotency-Key`. The body includes `idempotency_key`, the target `name` and `kind`, and the original `notice` object (`stage`, `url`, `published_at`, `text`, and the other raw fields stay as they were). It also adds localized `language`, `title`, `tags`, `scope`, and `text`. 2xx is success. 429 and 5xx are retried. Other 4xx results are permanent failures.
 
 ## Docker and background runs
 
-The image is Python 3.12 and installs Pillow plus WenQuanYi Micro Hei, so the calendar can be drawn. The database is `/data`.
+The image is Python 3.12 and installs Pillow, WenQuanYi Micro Hei, and DejaVu Sans. Chinese calendars use the CJK font. English calendars use DejaVu. The database is `/data`.
 
 ```bash
 docker build -t tibo-reset-monitor .
@@ -273,7 +306,7 @@ After a timeout the program cannot tell whether the provider accepted the messag
 No. The time shown is the source post's publish time. When credit appears on an account is whatever the product shows.
 
 **There is no calendar image.**  
-Install `pip install -e '.[calendar]'` and provide a CJK font, or set `calendar.font_path`. If the font or Pillow is missing, Telegram still sends one text message.
+Install `pip install -e '.[calendar]'`. Chinese images need a CJK font, or `calendar.font_path`. English images use a common Latin face (DejaVu, Liberation, Arial, or Noto Sans) and still render when no CJK font is installed. If Pillow is missing, or neither face can be found, Telegram still sends one text message and the Feishu card has no image.
 
 ## Development
 
@@ -281,7 +314,7 @@ Install `pip install -e '.[calendar]'` and provide a CJK font, or set `calendar.
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs Python 3.10, 3.11, 3.12, and 3.13 twice: once without Pillow, and once with Pillow and WenQuanYi Micro Hei. Tests use a fake HTTP transport. They do not call Feishu or Telegram.
+GitHub Actions runs Python 3.10, 3.11, 3.12, and 3.13 twice: once without Pillow, and once with Pillow, WenQuanYi Micro Hei, and DejaVu Sans. Tests use a fake HTTP transport. They do not call Feishu or Telegram. Every registered channel is rendered in both `zh` and `en`, so a new channel that skips a language fails CI.
 
 To add a channel, see [docs/adding-a-channel.md](docs/adding-a-channel.md). `src/tibo_reset_monitor/core/` does not import any channel.
 

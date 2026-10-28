@@ -6,6 +6,18 @@ The core turns an AIHOT snapshot into neutral `Notice` values and stores one out
 2. `send(message, target, idempotency_key) -> Receipt` performs the HTTP call.
 3. Validates its own config shape via the loader in `config.py` (kind is `group` or `personal`).
 
+Language is not channel-specific. `zh` and `en` are required for every channel, including ones added later. Copy lives in `tibo_reset_monitor.core.i18n`: `compose(notice, language)` returns an `OutboundMessage` whose title, tags, scope, body, quote line, link label, and calendar caption are already in that language. A channel only formats that model (Telegram HTML, a Feishu card, webhook JSON, or whatever the new API wants).
+
+`language` is configured in three places, and the later one wins:
+
+1. The root `language` field.
+2. `channels.<name>.language`.
+3. `channels.<name>.targets[].language`.
+
+Omitted values inherit. The default is `zh`. The loader rejects anything other than `zh` or `en` with the field path. Resolved values are stored on `target.options["language"]` and `ChannelSpec.settings["language"]`, so a channel reads the target and does not reimplement the cascade.
+
+`en` uses the post's original text (`fullOriginalText`, otherwise `originalText`), not the Chinese translation, and does not include the original-post quote card. A quoted or replied-to post is one line on `OutboundMessage.quote_line` (`Quoting @handle: …` or `Replying to @handle: …`). `zh` keeps the existing Chinese wording. Raw ids, the canonical `stage`, timestamps, and URLs stay on the `Notice` and must not be translated.
+
 `Receipt.outcome` is one of:
 
 | Outcome | Meaning |
@@ -22,21 +34,37 @@ Read secrets from environment variables named in the config. Do not log tokens o
 1. Add `src/tibo_reset_monitor/channels/your_channel.py`.
 2. Register the class in `REGISTRY` inside `src/tibo_reset_monitor/channels/__init__.py`.
 3. Teach `config.py` the channel's allowed keys and how a group target differs from a personal target.
-4. Add a mocked HTTP test that asserts the request for both kinds.
+4. Add a mocked HTTP test that asserts the request for both kinds, in `zh` and in `en`.
 5. Document the setup in `README.md` and `README.en.md`.
+6. Allow `language` on the channel object and on each target in `config.py`. Do not invent a second language key.
+
+`tests/test_i18n.py` constructs every class in `REGISTRY` and renders one notice in both languages. A new channel that still emits Chinese copy when `target.options["language"]` is `en` fails that test. Keep localized strings out of the raw `notice` object so the test can tell them apart.
 
 Skeleton:
 
 ```python
+from tibo_reset_monitor.core.i18n import compose, normalize_language
+
 class ExampleChannel:
     name = "example"
 
     def __init__(self, spec, transport, clock):
         self.targets = list(spec.targets)
         self._transport = transport
+        self._language = normalize_language(spec.settings.get("language"))
 
     def render(self, notice, target):
-        return {"text": notice.headline(), "audience": target.kind}
+        language = normalize_language(target.options.get("language"), self._language)
+        message = compose(notice, language)
+        return {
+            "language": message.language,
+            "title": message.title,
+            "tags": list(message.tags),
+            "scope": message.scope,
+            "text": message.text,
+            "link_label": message.link_label,
+            "audience": target.kind,
+        }
 
     def send(self, message, target, idempotency_key):
         # POST message. Put idempotency_key in the provider's dedupe field
@@ -46,6 +74,6 @@ class ExampleChannel:
 
 Group and personal targets both go through this class. Put the difference in the request (chat id versus user id), not in a second code path in the core.
 
-`notice_lines(notice)` in `core/model.py` is the shared wording, including the note that the timestamp is the source post time. Reuse it so every channel says the same thing.
+Chinese Feishu cards still use `notice_lines(notice)` inside `compose` for `zh`, including the note that the timestamp is the source post time. English cards use `OutboundMessage.card_body`. New channels should prefer `compose` over calling `notice_lines` directly, so `en` does not leak Chinese labels.
 
-The month grid lives in `core/calendar.py` (`calendar_model`, `render_calendar_png`). It is not part of the Telegram module, so another channel can attach the same PNG later. Rendering needs the optional `calendar` extra (`Pillow`) and a CJK font; if either is missing the function raises `CalendarImageUnavailable` and the channel should send text instead of failing the delivery.
+The month grid lives in `core/calendar.py` (`calendar_model`, `render_calendar_png`). Pass `language="en"` for the English grid. Chinese images need the optional `calendar` extra (`Pillow`) and a CJK font. English images use a Latin face (DejaVu, Liberation, Arial, or Noto Sans) and still render when no CJK font is installed. If Pillow or the face is missing, `render_calendar_png` raises `CalendarImageUnavailable` and the channel should send the text without failing the delivery. Bind `HistoryCalendar.png` with `bind_calendar` if the channel wants the image; `png(language)` selects the face.

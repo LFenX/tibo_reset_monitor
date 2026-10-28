@@ -115,6 +115,73 @@ class FeishuRequestTest(unittest.TestCase):
         self.assertNotIn(self._secret, logged)
         self.assertNotIn("t-test-token", logged)
 
+    def test_english_card_uses_the_original_post(self):
+        target = Target("feishu", "ops", "group", "oc_group", {"receive_id_type": "chat_id", "language": "en"})
+        rendered = self.channel.render(self.notice, target)
+        card = json.loads(rendered["content"])
+        title = card["header"]["title"]["content"]
+        body = card["body"]["elements"][0]["content"]
+        button = card["body"]["elements"][1]
+        self.assertIn("Preview", title)
+        self.assertIn("Reset (form unspecified, defaults to quota reset)", title)
+        self.assertNotIn("预告", title)
+        self.assertIn(self.notice.original_text, body)
+        self.assertNotIn("今天重置", body)
+        self.assertNotIn("原文", body)
+        self.assertIn("Scope not specified in the post", body)
+        self.assertIn("Posted ·", body)
+        self.assertIn("Data from the public AIHOT feed", body)
+        self.assertIn("Reset calendar ·", body)
+        self.assertEqual(button["text"]["content"], "View original post")
+        self.assertNotIn("查看原帖", rendered["content"])
+        self.assertIsNone(rendered["photo"])
+
+    def test_calendar_image_is_uploaded_and_attached(self):
+        class ImageTransport(FakeTransport):
+            def send(self, method, url, headers, body, timeout):
+                if url.endswith("/im/v1/images"):
+                    self.calls.append({"method": method, "url": url, "headers": dict(headers), "body": body})
+                    return HttpResponse(
+                        200,
+                        {},
+                        json.dumps({"code": 0, "msg": "ok", "data": {"image_key": "img_calendar"}}).encode(),
+                        url,
+                    )
+                return super().send(method, url, headers, body, timeout)
+
+        transport = ImageTransport()
+        channel = FeishuChannel(
+            ChannelSpec(
+                name="feishu",
+                enabled=True,
+                settings={
+                    "api_base": "https://open.feishu.cn",
+                    "app_id": "cli_example_not_a_real_app_id",
+                    "app_secret_env": "TIBO_FEISHU_APP_SECRET",
+                },
+                targets=[],
+            ),
+            transport,
+            self.clock,
+        )
+        channel.bind_calendar(lambda language="zh": b"\x89PNG\r\ncalendar")
+        target = Target("feishu", "ops", "group", "oc_group", {"receive_id_type": "chat_id", "language": "zh"})
+        message = channel.render(self.notice, target)
+        self.assertTrue(message["photo"].startswith(b"\x89PNG"))
+        receipt = channel.send(message, target, "trm" + "c" * 45)
+        self.assertEqual(receipt.outcome, "sent")
+        uploads = [call for call in transport.calls if call["url"].endswith("/im/v1/images")]
+        self.assertEqual(len(uploads), 1)
+        self.assertIn(b"calendar.png", uploads[0]["body"])
+        self.assertIn(b"\x89PNG", uploads[0]["body"])
+        sent = [call for call in transport.calls if "/im/v1/messages?" in call["url"]]
+        card = json.loads(json.loads(sent[0]["body"].decode())["content"])
+        image = card["body"]["elements"][-1]
+        self.assertEqual(image["tag"], "img")
+        self.assertEqual(image["img_key"], "img_calendar")
+        self.assertEqual(card["body"]["elements"][1]["tag"], "button")
+        self.assertIn("今天重置", card["body"]["elements"][0]["content"])
+
     def test_personal_open_id_permanent_failure_and_timeout(self):
         person = Target("feishu", "me", "personal", "ou_example", {"receive_id_type": "open_id"})
         message = self.channel.render(self.notice, person)

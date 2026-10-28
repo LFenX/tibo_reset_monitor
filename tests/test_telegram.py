@@ -278,6 +278,103 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertIn("<b>example.com</b>", host_text)
         self.assertIn("<i>example.com</i>", host_text)
 
+    def test_english_caption_uses_the_original_and_skips_the_quote_card(self):
+        from tibo_reset_monitor.channels.telegram import build_caption
+
+        post = make_post("p9", "预告", text="短译", original="short")
+        post["text"] = "搞定了。明天见，会有好消息。"
+        post["fullText"] = post["text"]
+        post["originalText"] = "And it's done."
+        post["fullOriginalText"] = "And it's done. See you tomorrow for some good news."
+        post["publishedAt"] = "2026-10-28T14:29:38.000+08:00"
+        post["context"] = [
+            {
+                "id": "quoted",
+                "author": "thsottiaux",
+                "relation": "quote",
+                "text": "太平洋时间午夜前落地。",
+                "originalText": "Lands by midnight PST.",
+                "url": "https://x.com/thsottiaux/status/quoted",
+            }
+        ]
+        event = make_event("reset-9", [post], title="预告")
+        event["presentation"]["productsZh"] = "Codex、ChatGPT"
+        notice = extract_notices(snapshot([event]))[0]
+        caption = build_caption(notice, 1024, (2026, 10), "en")
+        self.assertLessEqual(_parsed_len(caption), 1024)
+        self.assertIn("And it's done. See you tomorrow for some good news.", caption)
+        self.assertNotIn("搞定了", caption)
+        self.assertNotIn("<blockquote>", caption)
+        self.assertNotIn("原帖", caption)
+        self.assertIn("Quoting @thsottiaux: Lands by midnight PST.", caption)
+        self.assertNotIn("太平洋时间", caption)
+        self.assertIn("<code>Reset (form unspecified, defaults to quota reset)</code> <code>Preview</code>", caption)
+        self.assertIn("Scope not specified in the post", caption)
+        self.assertIn("Codex, ChatGPT", caption)
+        self.assertIn("Posted · 2026-10-28 14:29:38 (Beijing time)", caption)
+        self.assertIn(">View original post</a>", caption)
+        self.assertIn("Reset calendar · October 2026", caption)
+        self.assertNotIn("查看原帖", caption)
+        self.assertNotIn("重置日历", caption)
+
+    def test_english_other_tags_and_per_target_override(self):
+        from tibo_reset_monitor.channels.telegram import build_caption
+        from tibo_reset_monitor.core.model import Notice
+
+        card = Notice(
+            dedupe_key="c",
+            post_key="c",
+            stage="confirmation",
+            stage_label="确认",
+            title="",
+            display_label="发重置卡",
+            author="thsottiaux",
+            text="中文译文",
+            original_text="Reset cards are out.",
+            url="https://x.com/thsottiaux/status/5",
+            published_at="2026-10-28T01:02:03Z",
+            tag_label="发重置卡",
+        )
+        self.assertIn("<code>Reset card</code> <code>Confirmed</code>", build_caption(card, 1024, (2026, 10), "en"))
+        self.assertNotIn("中文译文", build_caption(card, 1024, (2026, 10), "en"))
+        quota = Notice(
+            dedupe_key="q",
+            post_key="q",
+            stage="revision",
+            stage_label="补充",
+            title="",
+            display_label="",
+            author="thsottiaux",
+            text="译",
+            original_text="Amended.",
+            url="https://x.com/thsottiaux/status/6",
+            published_at="",
+            tag_label="重置（额度重置）",
+        )
+        self.assertIn("<code>Quota reset</code> <code>Amendment</code>", build_caption(quota, 1024, language="en"))
+        withdrawn = Notice(
+            dedupe_key="w",
+            post_key="w",
+            stage="retraction",
+            stage_label="撤回",
+            title="",
+            display_label="",
+            author="thsottiaux",
+            text="译",
+            original_text="Withdrawn.",
+            url="https://x.com/thsottiaux/status/7",
+            published_at="",
+            tag_label="重置卡",
+        )
+        self.assertIn("<code>Reset card</code> <code>Withdrawn</code>", build_caption(withdrawn, 1024, language="en"))
+        channel = _channel(FakeTransport([]))
+        channel._language = "zh"
+        target = Target("telegram", "me", "personal", "424242", {"language": "en"})
+        rendered = channel.render(card, target)
+        self.assertIn("Reset cards are out.", rendered["caption"])
+        self.assertIn("View original post", rendered["text"])
+        self.assertNotIn("中文译文", rendered["text"])
+
     def test_error_codes(self):
         transport = FakeTransport(
             [

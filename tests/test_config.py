@@ -134,6 +134,79 @@ class ConfigTest(unittest.TestCase):
         feishu = next(channel for channel in config.channels if channel.name == "feishu")
         self.assertEqual([target.kind for target in feishu.targets], ["group", "personal"])
         self.assertEqual(feishu.targets[1].options["receive_id_type"], "email")
+        self.assertEqual(config.language, "zh")
+        self.assertTrue(all(target.options["language"] == "zh" for channel in config.channels for target in channel.targets))
+
+    def test_language_cascades_and_rejects_unknown_values(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = load_config(
+                _write(
+                    root,
+                    {
+                        "language": "en",
+                        "channels": {
+                            "feishu": {
+                                "enabled": True,
+                                "language": "zh",
+                                "app_id": "cli_example",
+                                "app_secret_env": "TIBO_FEISHU_APP_SECRET",
+                                "targets": [
+                                    {"name": "ops", "kind": "group", "receive_id": "oc_example", "receive_id_type": "chat_id"},
+                                    {"name": "me", "kind": "personal", "receive_id": "ou_example", "receive_id_type": "open_id", "language": "en"},
+                                ],
+                            },
+                            "telegram": {
+                                "enabled": True,
+                                "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                                "targets": [
+                                    {"name": "ops", "kind": "group", "chat_id": "-100123"},
+                                    {"name": "me", "kind": "personal", "chat_id": "424242", "language": "zh"},
+                                ],
+                            },
+                            "webhook": {
+                                "enabled": False,
+                                "targets": [{"name": "hook", "kind": "group", "url_env": "TIBO_WEBHOOK_EXAMPLE_URL"}],
+                            },
+                        },
+                    },
+                )
+            )
+            by_name = {channel.name: channel for channel in config.channels}
+            self.assertEqual(config.language, "en")
+            self.assertEqual(by_name["feishu"].settings["language"], "zh")
+            self.assertEqual(by_name["feishu"].targets[0].options["language"], "zh")
+            self.assertEqual(by_name["feishu"].targets[1].options["language"], "en")
+            self.assertEqual(by_name["telegram"].settings["language"], "en")
+            self.assertEqual(by_name["telegram"].targets[0].options["language"], "en")
+            self.assertEqual(by_name["telegram"].targets[1].options["language"], "zh")
+            self.assertEqual(by_name["webhook"].targets[0].options["language"], "en")
+
+            with self.assertRaises(ConfigError) as raised:
+                load_config(_write(root, {"language": "jp", "channels": {}}))
+            self.assertIn('$.language must be "zh" or "en"', str(raised.exception))
+
+            with self.assertRaises(ConfigError) as raised:
+                load_config(
+                    _write(
+                        root,
+                        {
+                            "channels": {
+                                "webhook": {"enabled": False, "language": "cn", "targets": []},
+                                "telegram": {
+                                    "enabled": True,
+                                    "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                                    "targets": [{"name": "me", "kind": "personal", "chat_id": "424242", "language": "english"}],
+                                },
+                            }
+                        },
+                    )
+                )
+            text = str(raised.exception)
+            self.assertIn('$.channels.webhook.language must be "zh" or "en"', text)
+            self.assertIn('$.channels.telegram.targets[0].language must be "zh" or "en"', text)
 
 
 if __name__ == "__main__":

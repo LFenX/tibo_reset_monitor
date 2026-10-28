@@ -72,7 +72,7 @@ def build_runtime(config: AppConfig, *, transport: Any = None, clock: Any = None
         font_index=config.font_index,
     )
     for channel in channels:
-        if getattr(channel, "name", "") == "telegram" and hasattr(channel, "bind_calendar"):
+        if hasattr(channel, "bind_calendar"):
             channel.bind_calendar(calendar.png, calendar.month)
     identity = owner or f"{os.getpid()}@{socket.gethostname()}"
     return Runtime(

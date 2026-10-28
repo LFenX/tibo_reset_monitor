@@ -222,6 +222,25 @@ class CalendarModelTest(unittest.TestCase):
         self.assertGreater(len(png), 1000)
         self._assert_legend_sits_at_the_bottom(png, model["year"], model["month"])
 
+    def test_english_calendar_renders_without_a_cjk_font(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        from unittest.mock import patch
+
+        from tibo_reset_monitor.core.calendar import find_latin_font
+
+        model = calendar_model({"events": []}, {"events": [], "historyFrom": "2026-10-01"}, NOW)
+        model["days"] = {"2026-10-28": [{"id": "x", "label": "额度重置", "state": "confirmed"}]}
+        with patch("tibo_reset_monitor.core.calendar.find_cjk_font", return_value=None):
+            with self.assertRaises(CalendarImageUnavailable):
+                render_calendar_png(model, language="zh")
+            self.assertIsNotNone(find_latin_font())
+            png = render_calendar_png(model, language="en")
+        self.assertTrue(png.startswith(b"\x89PNG"))
+        self.assertGreater(len(png), 1000)
+
     def _assert_legend_sits_at_the_bottom(self, png: bytes, year: int, month: int) -> None:
         import calendar as calendar_mod
         import io

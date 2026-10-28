@@ -17,6 +17,7 @@ from tibo_reset_monitor.core.calendar import (
     beijing_now,
     calendar_model,
     find_cjk_font,
+    find_latin_font,
     render_calendar_png,
 )
 from tibo_reset_monitor.core.model import parse_utc
@@ -74,8 +75,12 @@ class HistoryCalendar:
         local = beijing_now(self.clock.now())
         return local.year, local.month
 
-    def png(self) -> bytes | None:
-        """Render the current month. ``None`` means the caller should send text."""
+    def png(self, language: str = "zh") -> bytes | None:
+        """Render the current month. ``None`` means the caller should send text.
+
+        ``language="en"`` uses a Latin face, so a missing CJK font still yields an image.
+        """
+        language = "en" if language == "en" else "zh"
         try:
             recent = self.store.get_snapshot()
             history = self.store.get_history()
@@ -84,8 +89,11 @@ class HistoryCalendar:
                 recent["body"] if recent else None,
                 self.clock.now(),
             )
-            fonts = find_cjk_font(self.font_path, self.bold_path, self.font_index)
-            return render_calendar_png(model, fonts)
+            if language == "en":
+                fonts = find_latin_font(self.font_path, self.bold_path, self.font_index)
+            else:
+                fonts = find_cjk_font(self.font_path, self.bold_path, self.font_index)
+            return render_calendar_png(model, fonts, language=language)
         except CalendarImageUnavailable as exc:
             log.warning("calendar image unavailable: %s", exc)
             return None

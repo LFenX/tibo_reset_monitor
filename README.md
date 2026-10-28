@@ -70,7 +70,26 @@ Lands by midnight PST.
 重置日历 · 2026 年 10 月
 ```
 
-标签原文是「重置（形式未明确）」时，Telegram 显示为「重置（形式未明确，默认额度重置）」。「重置（额度重置）」「发重置卡」等其他标签保持原样。原帖英文来自 `fullOriginalText`（没有则用 `originalText`）。`context` 里 `relation` 为 `quote` 的写成「引用 @作者」，`reply` 写成「回复 @作者」。引用帖没有单独的发布时间，时间用主帖的 `publishedAt`。没有原文也没有 `context` 时，引用块省略。
+标签原文是「重置（形式未明确）」时，显示为「重置（形式未明确，默认额度重置）」。「重置（额度重置）」「发重置卡」等其他标签保持原样。原帖英文来自 `fullOriginalText`（没有则用 `originalText`）。`context` 里 `relation` 为 `quote` 的写成「引用 @作者」，`reply` 写成「回复 @作者」。引用帖没有单独的发布时间，时间用主帖的 `publishedAt`。没有原文也没有 `context` 时，引用块省略。
+
+`language` 为 `en` 时，同一条通知改用英文。正文是帖子原文，不再放中文翻译，也不再放「原帖」引用块。如果帖子引用了另一条，正文下面留一行 `Quoting @handle: …`（回复则是 `Replying to @handle: …`）。链接写成 View original post。
+
+```html
+<b>Tibo</b>
+<i>@thsottiaux · X</i>
+
+<code>Reset (form unspecified, defaults to quota reset)</code> <code>Preview</code>
+
+And it's done. See you tomorrow for some good news.
+
+<i>Scope not specified in the post</i>
+<i>Posted · 2026-10-28 14:29:38 (Beijing time)</i>
+
+Quoting @thsottiaux: Lands by midnight PST.
+<a href="https://x.com/thsottiaux/status/123">View original post</a>
+
+Reset calendar · October 2026
+```
 
 日历按北京时间取当前月。格子里 `reset_credit` 写成「发重置卡」，其余写成「额度重置」。形式不明确、且引用了其他事件「补充说明」的，仍标成「补充确认」。顶部数字只统计这个月已确认的事件。月初月末的灰色格子是相邻月份。下面是 2026 年 11 月的样图（6 行周）；12 月和 2027 年 2 月的样图也在 `docs/` 里。
 
@@ -83,8 +102,15 @@ Lands by midnight PST.
 | [2026 年 11 月](docs/calendar-sample-2026-11.png) | 6 行 |
 | [2026 年 12 月](docs/calendar-sample-2026-12.png) | 5 行 |
 | [2027 年 2 月](docs/calendar-sample-2027-02.png) | 4 行，非闰年 |
+| [November 2026，英文](docs/calendar-sample-en-2026-11.png) | 6 行 |
+| [December 2026，英文](docs/calendar-sample-en-2026-12.png) | 5 行 |
+| [February 2027，英文](docs/calendar-sample-en-2027-02.png) | 4 行，非闰年 |
 
-这些图用假数据绘制，不是某一次真实推送的截图。
+这些图用假数据绘制，不是某一次真实推送的截图。英文图不依赖中文字体，用 DejaVu、Liberation、Arial 或 Noto Sans。
+
+<p align="center">
+  <img src="docs/calendar-sample-en-2026-11.png" alt="English November 2026 calendar" width="100%">
+</p>
 
 ## 快速开始
 
@@ -161,10 +187,17 @@ PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
 | `calendar.font_bold_path` | 可选粗体字体。没有则用常规字体 |
 | `calendar.font_index` | 可选。Noto / 思源 CJK 合集默认用 index 2（简体） |
 | `calendar.history_refresh_seconds` | 全量历史的刷新间隔。默认 21600（6 小时），最小 600 |
+| `language` | 全局默认语言，`zh` 或 `en`。省略时是 `zh` |
+| `channels.<name>.language` | 该渠道的默认语言，覆盖全局。飞书、Telegram、Webhook 用同一套语义 |
+| `channels.<name>.targets[].language` | 单个目标的语言，覆盖渠道和全局 |
 | `channels.<name>.enabled` | `false` 的渠道不会发送 |
 | `channels.<name>.targets[]` | `name` 加 `kind`：`group` 或 `personal` |
 
 密钥只写环境变量名，例如 `app_secret_env`、`bot_token_env`、`url_env`。配置里出现 `app_secret`、`bot_token` 这类字段会被拒绝。
+
+`language` 只能是 `zh` 或 `en`。写在根上、渠道上或某个 target 上都可以，后者覆盖前者。三个渠道读的是同一套结果：目标自己的值，否则渠道的值，否则全局，否则 `zh`。非法值会在启动时报出字段路径，例如 `$.channels.telegram.targets[0].language must be "zh" or "en"`。
+
+`zh` 保持现在的中文。`en` 用帖子原文（`fullOriginalText`，没有则 `originalText`），阶段、标签、适用范围、时间和日历都换成英文，并且不展示「原帖」卡片。引用或回复只留一行 `Quoting @handle: …` / `Replying to @handle: …`。
 
 ## 渠道
 
@@ -189,7 +222,7 @@ PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
 
 ### 飞书
 
-本仓库的飞书渠道发送一张交互卡片（Card JSON 2.0），直接调用飞书 Open API，不依赖 `lark-cli`，也不附带日历图。幂等键放在发送接口的 `uuid` 字段。
+本仓库的飞书渠道发送一张交互卡片（Card JSON 2.0），直接调用飞书 Open API，不依赖 `lark-cli`。幂等键放在发送接口的 `uuid` 字段。默认中文卡片的标题、正文和「查看原帖」按钮与以前相同。`en` 时标题、正文和按钮改为英文，正文用帖子原文，不放原帖卡片。画得出日历时，会先把 PNG 上传到飞书，再把图片附在卡片按钮后面；上传失败只记一条警告，文字卡片照常发送。这需要应用具备上传图片的权限（`im:resource`）。没有 Pillow 或对应字体时，卡片里没有图片。
 
 1. 在 [飞书开放平台](https://open.feishu.cn/app) 创建企业自建应用。国际版 Lark 把 `api_base` 改成 `https://open.larksuite.com`。
 2. 启用机器人，开通「以应用的身份发消息」（`im:message:send_as_bot`）。用邮箱作为个人目标时，应用还要能按邮箱识别租户内用户。
@@ -199,11 +232,11 @@ PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
 
 ### Webhook
 
-可选。`enabled` 默认为 false。每个目标的 URL 来自 `url_env` 指向的环境变量，必须是 https。请求是 JSON，并带 `Idempotency-Key`。正文包含 `idempotency_key`、目标的 `name` / `kind`，以及通知字段。2xx 视为成功，429 和 5xx 会重试，其他 4xx 记为永久失败。
+可选。`enabled` 默认为 false。每个目标的 URL 来自 `url_env` 指向的环境变量，必须是 https。请求是 JSON，并带 `Idempotency-Key`。正文包含 `idempotency_key`、目标的 `name` / `kind`，以及原来的 `notice` 对象（`stage`、`url`、`published_at`、`text` 等原始字段保持不变）。另外增加按语言填写的 `language`、`title`、`tags`、`scope`、`text`。2xx 视为成功，429 和 5xx 会重试，其他 4xx 记为永久失败。
 
 ## Docker 与后台运行
 
-镜像基于 Python 3.12，并安装了 Pillow 和文泉驿微米黑，因此日历图可以绘制。状态库在 `/data`。
+镜像基于 Python 3.12，并安装了 Pillow、文泉驿微米黑和 DejaVu Sans。中文日历用中文字体，英文日历用 DejaVu。状态库在 `/data`。
 
 ```bash
 docker build -t tibo-reset-monitor .
@@ -273,7 +306,7 @@ schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_mo
 不是。展示的时间是来源帖子的发布时间。账户里额度何时出现，以产品内显示为准。
 
 **没有日历图。**  
-安装 `pip install -e '.[calendar]'`，并保证机器上有中文字体，或在 `calendar.font_path` 里指定。找不到字体或没装 Pillow 时，Telegram 仍会发出一条纯文本。
+安装 `pip install -e '.[calendar]'`。中文图需要中文字体，或在 `calendar.font_path` 里指定。英文图使用常见的 Latin 字体（DejaVu、Liberation、Arial、Noto Sans），没有中文字体也能画。没装 Pillow，或两种字体都找不到时，Telegram 仍会发出一条纯文本，飞书卡片也不附图片。
 
 ## 开发与测试
 
@@ -281,7 +314,7 @@ schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_mo
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions 在 Python 3.10、3.11、3.12、3.13 上各跑两遍：一遍不安装 Pillow，一遍安装 Pillow 和文泉驿微米黑。测试使用假的 HTTP，不访问飞书或 Telegram。
+GitHub Actions 在 Python 3.10、3.11、3.12、3.13 上各跑两遍：一遍不安装 Pillow，一遍安装 Pillow、文泉驿微米黑和 DejaVu Sans。测试使用假的 HTTP，不访问飞书或 Telegram。已注册的渠道都会在 `zh` 和 `en` 下渲染一次，新渠道漏掉语言时 CI 会失败。
 
 新增渠道见 [docs/adding-a-channel.md](docs/adding-a-channel.md)。`src/tibo_reset_monitor/core/` 不导入任何渠道。
 

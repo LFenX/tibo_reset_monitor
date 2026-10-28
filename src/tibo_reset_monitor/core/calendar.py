@@ -1,8 +1,10 @@
 """Month calendar shared by channels.
 
-The model follows AIHOT's public history plus the recent feed. Pillow and a CJK
-font are optional: when either is missing, ``render_calendar_png`` raises
-``CalendarImageUnavailable`` and the caller sends text instead.
+The model follows AIHOT's public history plus the recent feed. Pillow and a
+font are optional: Chinese images need a CJK face, English images use a common
+Latin face and still render when no CJK font is installed. When Pillow or the
+face is missing, ``render_calendar_png`` raises ``CalendarImageUnavailable``
+and the caller sends text instead.
 """
 
 from __future__ import annotations
@@ -56,6 +58,31 @@ _FONT_CANDIDATES: tuple[tuple[str, str | None], ...] = (
         "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
         "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Bold.otf",
     ),
+)
+# Latin faces for the English calendar. CJK fonts are not required.
+_LATIN_CANDIDATES: tuple[tuple[str, str | None], ...] = (
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    (
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    ),
+    (
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+    ),
+    ("/usr/share/fonts/truetype/freefont/FreeSans.ttf", "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+    ("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf", "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    (r"C:\Windows\Fonts\arial.ttf", r"C:\Windows\Fonts\arialbd.ttf"),
+    ("/Library/Fonts/Arial.ttf", "/Library/Fonts/Arial Bold.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    ("/System/Library/Fonts/Helvetica.ttc", None),
+)
+_LATIN_GLOBS = (
+    "/usr/share/fonts/**/DejaVuSans.ttf",
+    "/usr/share/fonts/**/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/**/FreeSans.ttf",
+    "/usr/share/fonts/**/NotoSans-Regular.ttf",
+    "/usr/share/fonts/**/NotoSans-Regular.otf",
 )
 _FONT_GLOBS = (
     "/usr/share/fonts/**/[Nn]otoSansCJK-Regular.ttc",
@@ -187,6 +214,12 @@ def _quotes_amendment(
     return False
 
 
+def month_title(year: int, month: int, language: str = "zh") -> str:
+    from tibo_reset_monitor.core.i18n import month_title as i18n_month_title
+
+    return i18n_month_title(year, month, language)
+
+
 def find_cjk_font(
     font_path: str | None = None,
     bold_path: str | None = None,
@@ -201,12 +234,41 @@ def find_cjk_font(
     return FontChoice(regular=regular, bold=bold or regular, index=index)
 
 
-def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) -> bytes:
+def find_latin_font(
+    font_path: str | None = None,
+    bold_path: str | None = None,
+    font_index: int | None = None,
+) -> FontChoice | None:
+    """DejaVu, Liberation, Arial, or Noto Sans. A CJK face is only the last resort."""
+    explicit = _existing(font_path)
+    if explicit and not _looks_cjk(explicit):
+        bold = _existing(bold_path) or _bold_sibling(explicit)
+        index = 0 if font_index is None else font_index
+        return FontChoice(regular=explicit, bold=bold or explicit, index=index)
+    found = _search_latin()
+    if found is not None:
+        regular, paired = found
+        bold = _existing(bold_path) or paired or _bold_sibling(regular)
+        return FontChoice(regular=regular, bold=bold or regular, index=0)
+    if explicit:
+        bold = _existing(bold_path) or _bold_sibling(explicit)
+        index = font_index if font_index is not None else _default_index(explicit)
+        return FontChoice(regular=explicit, bold=bold or explicit, index=index)
+    return find_cjk_font(font_path, bold_path, font_index)
+
+
+def render_calendar_png(
+    model: dict[str, Any],
+    fonts: FontChoice | None = None,
+    language: str = "zh",
+) -> bytes:
     """Draw the month grid. Raises ``CalendarImageUnavailable`` when it cannot."""
+    language = "en" if language == "en" else "zh"
     if fonts is None:
-        fonts = find_cjk_font()
+        fonts = find_latin_font() if language == "en" else find_cjk_font()
     if fonts is None:
-        raise CalendarImageUnavailable("no CJK font found")
+        missing = "no Latin font found" if language == "en" else "no CJK font found"
+        raise CalendarImageUnavailable(missing)
     try:
         from PIL import Image, ImageDraw, ImageFont
     except ImportError as exc:
@@ -227,15 +289,22 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
         image = Image.new("RGB", (width, canvas_height(len(weeks))), "white")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((1, 1, image.width - 2, image.height - 2), radius=20, outline="#dbe3e5", width=2)
-        draw.text((margin, 25), f'{model["year"]} 年 {model["month"]} 月', font=face(30, True), fill="#20333f")
+        from tibo_reset_monitor.core.i18n import cell_label, legend_labels, totals_summary, weekdays as weekday_labels
+
         totals = model["totals"]
-        summary = f'额度重置 {totals["额度重置"]} · 发卡 {totals["发重置卡"]}'
-        if totals["补充确认"]:
-            summary += f' · 补充确认 {totals["补充确认"]}'
+        title = month_title(model["year"], model["month"], language)
+        summary = totals_summary(totals, language)
+        names = weekday_labels(language)
+        draw.text((margin, 25), title, font=face(30, True), fill="#20333f")
         draw.text((margin, 76), summary, font=face(21), fill="#546b79")
-        for column, weekday in enumerate("一二三四五六日"):
+        weekday_face = face(18 if language == "en" else 21)
+        for column, weekday in enumerate(names):
             x = margin + column * (cell_width + gap)
-            draw.text((x + cell_width // 2 - 10, 121), weekday, font=face(21), fill="#6a7c87")
+            if language == "en":
+                text_width = _text_width(weekday_face, weekday)
+                draw.text((x + (cell_width - text_width) / 2, 121), weekday, font=weekday_face, fill="#6a7c87")
+            else:
+                draw.text((x + cell_width // 2 - 10, 121), weekday, font=weekday_face, fill="#6a7c87")
         for row, week in enumerate(weeks):
             for column, cell_date in enumerate(week):
                 x = margin + column * (cell_width + gap)
@@ -266,13 +335,25 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
                     fill="#223b47" if current else "#a0acb1",
                 )
                 ink = "#276c5b" if current else "#9aaea8"
+                label_face = face(15 if language == "en" else 17)
                 for index, record in enumerate(records[:2]):
-                    draw.text((x + 10, y + 40 + index * 23), record["label"], font=face(17), fill=ink)
+                    label = cell_label(record["label"], language)
+                    draw.text((x + 10, y + 40 + index * 23), label, font=label_face, fill=ink)
                 if len(records) > 2:
                     draw.text((x + cell_width - 35, y + 65), "+" + str(len(records) - 2), font=face(15), fill="#60767e")
-        for x, color, label in ((margin, "#9cc5b5", "已确认"), (230, "#c7dcd0", "预计已生效"), (485, "#dbc9a9", "等待确认")):
-            draw.ellipse((x, legend_y + 5, x + 13, legend_y + 18), fill=color)
-            draw.text((x + 24, legend_y), label, font=face(18), fill="#647b86")
+        legend_face = face(18)
+        colors = ("#9cc5b5", "#c7dcd0", "#dbc9a9")
+        labels = legend_labels(language)
+        if language == "en":
+            cursor = margin
+            for color, label in zip(colors, labels):
+                draw.ellipse((cursor, legend_y + 5, cursor + 13, legend_y + 18), fill=color)
+                draw.text((cursor + 24, legend_y), label, font=legend_face, fill="#647b86")
+                cursor += 24 + _text_width(legend_face, label) + 36
+        else:
+            for x, color, label in zip((margin, 230, 485), colors, labels):
+                draw.ellipse((x, legend_y + 5, x + 13, legend_y + 18), fill=color)
+                draw.text((x + 24, legend_y), label, font=legend_face, fill="#647b86")
         buffer = io.BytesIO()
         image.save(buffer, "PNG")
         return buffer.getvalue()
@@ -280,6 +361,31 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
         raise
     except Exception as exc:
         raise CalendarImageUnavailable(str(exc)) from exc
+
+
+def _text_width(font: Any, text: str) -> int:
+    if hasattr(font, "getlength"):
+        return int(font.getlength(text))
+    bbox = font.getbbox(text)
+    return int(bbox[2] - bbox[0])
+
+
+def _looks_cjk(path: str) -> bool:
+    name = Path(path).name.lower()
+    tokens = ("cjk", "wqy", "sourcehan", "source-han", "notosanssc", "notosansjp", "msyh", "pingfang", "hiragino")
+    return any(token in name for token in tokens)
+
+
+def _search_latin() -> tuple[str, str | None] | None:
+    for regular, bold in _LATIN_CANDIDATES:
+        if Path(regular).is_file():
+            paired = bold if bold and Path(bold).is_file() else None
+            return regular, paired
+    for pattern in _LATIN_GLOBS:
+        for match in sorted(glob.glob(pattern, recursive=True)):
+            if not _looks_cjk(match):
+                return match, None
+    return None
 
 
 def _existing(path: str | None) -> str | None:
