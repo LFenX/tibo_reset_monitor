@@ -13,7 +13,7 @@ from tests.support import FakeClock, TempStoreTest, make_event, make_post, snaps
 from tibo_reset_monitor.cli import main
 from tibo_reset_monitor.core.chat import ChatController, Inbound, PairingGate
 from tibo_reset_monitor.core.http import HttpResponse
-from tibo_reset_monitor.core.i18n import GUIDE_VERSION, chat_text
+from tibo_reset_monitor.core.i18n import GUIDE_VERSION, usage_guide
 from tibo_reset_monitor.core.model import Receipt, Target
 from tibo_reset_monitor.config import load_config
 from tibo_reset_monitor.core.guide import deliver_guides
@@ -77,15 +77,15 @@ def _flush(runtime: Runtime) -> None:
 
 class GuideCopyTest(unittest.TestCase):
     def test_both_languages_list_every_command_and_the_short_flows(self):
-        chinese = chat_text("zh", "guide")
-        english = chat_text("en", "guide")
+        chinese = usage_guide("zh", channel="telegram", allow_self_subscribe=False, admin=True)
+        english = usage_guide("en", channel="telegram", allow_self_subscribe=False, admin=True)
         for text in (chinese, english):
             for command in COMMANDS:
                 self.assertIn(command, text)
         self.assertIn("私聊", chinese)
         self.assertIn("加进群", chinese)
-        self.assertIn("private chat", english)
-        self.assertIn("add the bot to the group", english)
+        self.assertIn("direct chat", english)
+        self.assertIn("Add the bot to a group", english)
         self.assertNotEqual(chinese, english)
 
 
@@ -98,7 +98,8 @@ class GuideDeliveryTest(TempStoreTest):
         runtime = _runtime(self.store, channel, self.clock)
         _flush(runtime)
         self.assertEqual([item["recipient"] for item in channel.sent], ["42"])
-        self.assertIn("使用指南", channel.sent[0]["text"])
+        self.assertIn("先读我", channel.sent[0]["text"])
+        self.assertIn("allow_self_subscribe 当前关闭", channel.sent[0]["text"])
         _flush(runtime)
         self.assertEqual(len(channel.sent), 1)
         path = self.store.path
@@ -108,11 +109,11 @@ class GuideDeliveryTest(TempStoreTest):
         runtime.store = self.store
         _flush(runtime)
         self.assertEqual(len(channel.sent), 1)
-        with patch("tibo_reset_monitor.service.GUIDE_VERSION", "2"):
+        with patch("tibo_reset_monitor.service.GUIDE_VERSION", "3"):
             prepare_guides(runtime, collaborators=lambda channel: set())
         deliver_guides(runtime.store, runtime.channels, runtime.clock)
         self.assertEqual(len(channel.sent), 2)
-        self.assertEqual(self.store.guide_row("telegram", "42", "2")["status"], "sent")
+        self.assertEqual(self.store.guide_row("telegram", "42", "3")["status"], "sent")
         self.assertEqual(self.store.guide_row("telegram", "42", GUIDE_VERSION)["status"], "sent")
 
     def test_language_follows_the_personal_target_then_the_channel(self):
@@ -124,8 +125,8 @@ class GuideDeliveryTest(TempStoreTest):
         runtime = _runtime(self.store, channel, self.clock)
         _flush(runtime)
         by_recipient = {item["recipient"]: item["text"] for item in channel.sent}
-        self.assertIn("使用指南", by_recipient["1"])
-        self.assertIn("Usage guide", by_recipient["2"])
+        self.assertIn("先读我", by_recipient["1"])
+        self.assertIn("Read this first", by_recipient["2"])
 
     def test_welcome_switch_and_cli_send_nothing(self):
         channel = GuideChannel(
@@ -160,7 +161,7 @@ class GuideDeliveryTest(TempStoreTest):
         with self.assertLogs("tibo_reset_monitor", level="INFO") as captured:
             _flush(runtime)
         self.assertEqual(calls["n"], 1)
-        self.assertEqual(self.store.guide_row("telegram", "42", "1")["status"], "retryable")
+        self.assertEqual(self.store.guide_row("telegram", "42", GUIDE_VERSION)["status"], "retryable")
         text = "\n".join(captured.output)
         self.assertNotIn(TOKEN, text)
         self.assertNotIn("abcdef", text)
@@ -172,7 +173,7 @@ class GuideDeliveryTest(TempStoreTest):
         self.clock.advance(31)
         deliver_guides(runtime.store, runtime.channels, runtime.clock)
         self.assertEqual(calls["n"], 2)
-        self.assertEqual(self.store.guide_row("telegram", "42", "1")["status"], "sent")
+        self.assertEqual(self.store.guide_row("telegram", "42", GUIDE_VERSION)["status"], "sent")
         self.assertEqual(channel.sent[0]["key"], channel.sent[1]["key"])
 
     def test_cannot_dm_is_skipped_until_start_or_pair(self):
@@ -195,7 +196,7 @@ class GuideDeliveryTest(TempStoreTest):
         with self.assertLogs("tibo_reset_monitor", level="INFO") as captured:
             _flush(runtime)
         self.assertEqual(len(channel.sent), 1)
-        self.assertEqual(self.store.guide_row("telegram", "42", "1")["status"], "skipped")
+        self.assertEqual(self.store.guide_row("telegram", "42", GUIDE_VERSION)["status"], "skipped")
         logged = "\n".join(captured.output)
         self.assertIn("has not started the bot", logged)
         self.assertNotIn(TOKEN, logged)
@@ -213,13 +214,13 @@ class GuideDeliveryTest(TempStoreTest):
         )
         reply = controller.handle(_inbound("s1", "/start"))
         self.assertIsNotNone(reply)
+        self.assertIn("先读我", reply.text)
         self.assertIn("/subscribe", reply.text)
-        self.assertEqual(len(channel.sent), 2)
-        self.assertEqual(self.store.guide_row("telegram", "42", "1")["status"], "sent")
+        self.assertEqual(len(channel.sent), 1)
         controller.handle(_inbound("s2", "/start"))
         controller.handle(_inbound("s3", "/help"))
         controller.handle(_inbound("s4", "你好"))
-        self.assertEqual(len(channel.sent), 2)
+        self.assertEqual(len(channel.sent), 1)
 
         gate = PairingGate()
         code = gate.issue(self.clock.now())
@@ -233,9 +234,9 @@ class GuideDeliveryTest(TempStoreTest):
             welcome=_welcome_opener(runtime, "telegram"),
         )
         paired.handle(_inbound("p1", f"/pair {code}", user_id="99", chat_id="99"))
-        self.assertEqual([item["recipient"] for item in channel.sent], ["42", "42", "99"])
+        self.assertEqual([item["recipient"] for item in channel.sent], ["42", "99"])
         paired.handle(_inbound("p2", f"/pair {gate.issue(self.clock.now())}", user_id="99", chat_id="99"))
-        self.assertEqual(len(channel.sent), 3)
+        self.assertEqual(len(channel.sent), 2)
 
     def test_feishu_uses_collaborators_and_skips_when_they_are_missing(self):
         channel = GuideChannel(
@@ -246,7 +247,7 @@ class GuideDeliveryTest(TempStoreTest):
         prepare_guides(runtime, collaborators=lambda channel: {"ou_b", "ou_a"})
         deliver_guides(runtime.store, runtime.channels, runtime.clock)
         self.assertEqual([item["recipient"] for item in channel.sent], ["ou_a", "ou_b"])
-        self.assertIn("Usage guide", channel.sent[0]["text"])
+        self.assertIn("Read this first", channel.sent[0]["text"])
 
         empty = GuideChannel(
             "feishu",
@@ -315,7 +316,7 @@ class GuidePollTest(unittest.TestCase):
                 self.assertEqual(poll(runtime), 0)
             self.assertEqual(transport.guides, 1)
             self.assertFalse(any("welcome guide" in line for line in second.output))
-            row = runtime.store.guide_row("telegram", "6173752247", "1")
+            row = runtime.store.guide_row("telegram", "6173752247", GUIDE_VERSION)
             self.assertEqual(row["status"], "skipped")
 
 

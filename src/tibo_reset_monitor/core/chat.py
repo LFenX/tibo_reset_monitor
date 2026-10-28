@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Callable
 
-from tibo_reset_monitor.core.i18n import chat_text
+from tibo_reset_monitor.core.i18n import chat_text, usage_guide
 from tibo_reset_monitor.core.model import parse_utc
 from tibo_reset_monitor.core.store import StateStore
 from tibo_reset_monitor.logutil import redact
@@ -34,6 +34,9 @@ _ADMIN_ID = re.compile(r"^(?:[1-9]\d{0,18}|ou_[A-Za-z0-9_]{1,120})$")
 _COMMANDS = {
     "/start": "help",
     "/help": "help",
+    "#帮助": "help",
+    "#指南": "help",
+    "#使用说明": "help",
     "/status": "status",
     "#状态": "status",
     "/subscribe": "subscribe",
@@ -142,6 +145,8 @@ class ChatController:
         self.extra_admins = extra_admins
         self.welcome = welcome
         self._hits: dict[str, list[datetime]] = {}
+        self._extra_loaded = False
+        self._extra_ids: set[str] | None = None
 
     def handle(self, inbound: Inbound) -> Reply | None:
         now = self.clock.now()
@@ -155,22 +160,23 @@ class ChatController:
             return None
         if not inbound.text.strip():
             return None
+        self._extra_loaded = False
+        command, argument = _split_command(inbound.text)
         if self._limited(inbound.user_id, now):
             return Reply(inbound.chat_id, self._t("slow"))
-        command, argument = _split_command(inbound.text)
+        if command == "help":
+            return self._guide_for(inbound)
         if command is None and inbound.scope == "personal" and self.store.load_session(self.channel, inbound.user_id):
             return self._select(inbound, inbound.text.strip(), now)
         if command is None:
             if inbound.scope == "personal":
-                return Reply(inbound.chat_id, self._t("help"))
+                return self._guide_for(inbound)
             return None
         return self._dispatch(inbound, command, argument, now)
 
     def _dispatch(self, inbound: Inbound, command: str, argument: str, now: datetime) -> Reply | None:
         if command == "help":
-            if _opened_with_start(inbound.text):
-                self._welcome(inbound.user_id)
-            return Reply(inbound.chat_id, self._t("help"))
+            return self._guide_for(inbound)
         if command == "pair":
             return self._pair(inbound, argument, now)
         if command in {"subscribe_dm", "unsubscribe_dm"} and inbound.scope != "personal" and not self._is_admin(inbound.user_id):
@@ -181,18 +187,18 @@ class ChatController:
             return self._unsubscribe_dm(inbound, now)
         if command == "subscribe" and inbound.scope == "group":
             if not self._is_admin(inbound.user_id):
-                return Reply(inbound.chat_id, self._t("need_admin_group"))
+                return self._deny(inbound, group=True)
             return self._subscribe_group(inbound.chat_id, inbound.chat_title or inbound.chat_id, inbound.chat_id, now)
         if command == "unsubscribe" and inbound.scope == "group":
             if not self._is_admin(inbound.user_id):
-                return Reply(inbound.chat_id, self._t("need_admin_group"))
+                return self._deny(inbound, group=True)
             return self._unsubscribe_group(inbound.chat_id, inbound.chat_title or inbound.chat_id, inbound.chat_id, now)
         if command == "subscribe":
             return self._subscribe_dm(inbound, now)
         if command == "unsubscribe":
             return self._unsubscribe_dm(inbound, now)
         if not self._is_admin(inbound.user_id):
-            return Reply(inbound.chat_id, self._t("denied"))
+            return self._deny(inbound)
         if command == "status":
             return Reply(inbound.chat_id, self._status())
         if command == "cancel":
@@ -210,7 +216,7 @@ class ChatController:
         if inbound.scope != "personal":
             return Reply(inbound.chat_id, self._t("only_dm"))
         if not self.allow_self_subscribe and not self._is_admin(inbound.user_id):
-            return Reply(inbound.chat_id, self._t("denied"))
+            return self._deny(inbound, subscribe=True)
         _key, created = self.store.subscribe(
             channel=self.channel,
             kind="personal",
@@ -222,7 +228,7 @@ class ChatController:
 
     def _unsubscribe_dm(self, inbound: Inbound, now: datetime) -> Reply:
         if not self.allow_self_subscribe and not self._is_admin(inbound.user_id):
-            return Reply(inbound.chat_id, self._t("denied"))
+            return self._deny(inbound, subscribe=True)
         removed = self.store.unsubscribe(self.channel, "personal", inbound.user_id, now, reason="unsubscribed")
         return Reply(inbound.chat_id, self._t("dm_off" if removed else "dm_off_none"))
 
@@ -348,16 +354,58 @@ class ChatController:
             return None
         return listed
 
+    def _guide_for(self, inbound: Inbound) -> Reply:
+        return Reply(
+            inbound.chat_id,
+            usage_guide(
+                self.language,
+                channel=self.channel,
+                allow_self_subscribe=self.allow_self_subscribe,
+                admin=self._is_admin(inbound.user_id),
+                scope=inbound.scope,
+            ),
+        )
+
+    def _deny(self, inbound: Inbound, *, subscribe: bool = False, group: bool = False) -> Reply:
+        if not self._any_admin():
+            key = "denied_no_admin_feishu" if self.channel == "feishu" else "denied_no_admin_telegram"
+            return Reply(inbound.chat_id, self._t(key))
+        if subscribe:
+            return Reply(inbound.chat_id, self._t("denied_subscribe"))
+        if group:
+            return Reply(inbound.chat_id, self._t("need_admin_group"))
+        return Reply(inbound.chat_id, self._t("denied"))
+
     def _is_admin(self, user_id: str) -> bool:
         if user_id in self.admins or self.store.is_chat_admin(self.channel, user_id):
             return True
+        extra = self._extra_admin_ids()
+        return bool(extra and user_id in extra)
+
+    def _any_admin(self) -> bool:
+        if self.admins or self.store.chat_admin_ids(self.channel):
+            return True
         if self.extra_admins is None:
             return False
+        extra = self._extra_admin_ids()
+        if extra is None:
+            return True
+        return bool(extra)
+
+    def _extra_admin_ids(self) -> set[str] | None:
+        """Collaborators, when configured. ``None`` means the lookup failed."""
+        if self._extra_loaded:
+            return self._extra_ids
+        self._extra_loaded = True
+        if self.extra_admins is None:
+            self._extra_ids = set()
+            return self._extra_ids
         try:
-            return user_id in self.extra_admins()
+            self._extra_ids = {str(item) for item in self.extra_admins() if str(item)}
         except Exception as exc:
             log.warning("admin lookup failed: %s", type(exc).__name__)
-            return False
+            self._extra_ids = None
+        return self._extra_ids
 
     def _limited(self, user_id: str, now: datetime) -> bool:
         recent = [stamp for stamp in self._hits.get(user_id, []) if (now - stamp).total_seconds() < COMMAND_WINDOW]
@@ -405,12 +453,6 @@ def _list_index(text: str) -> int | None:
     if not text.isascii() or not text.isdigit() or len(text) > 6:
         return None
     return int(text)
-
-
-def _opened_with_start(text: str) -> bool:
-    normalized = normalize_command_text(text)
-    token = normalized.split(" ", 1)[0].lower() if normalized else ""
-    return token == "/start"
 
 
 def _split_command(text: str) -> tuple[str | None, str]:

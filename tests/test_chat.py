@@ -300,6 +300,48 @@ class ChatFlowTest(TempStoreTest):
         self.assertEqual(self.store.due_rows(NOW), [])
         self.assertEqual(self.store.read_row(row.id).state.status, "cancelled")
 
+    def test_help_follows_role_channel_and_ignores_the_picker(self):
+        admin = self.controller.handle(_inbound(event_id="h1", text="/help@ResetBot"))
+        assert admin is not None
+        self.assertIn("/addadmin", admin.text)
+        self.assertIn("allow_self_subscribe 当前关闭", admin.text)
+        self.assertIn("点 Start", admin.text)
+        self.assertNotIn("版本管理与发布", admin.text)
+        stranger = self.controller.handle(_inbound(event_id="h2", user_id="7", chat_id="7", text="#指南"))
+        assert stranger is not None
+        self.assertNotIn("/addadmin", stranger.text)
+        self.assertIn("请联系管理员", stranger.text)
+        self.assertIn("/help", stranger.text)
+        opened = self.controller
+        opened.handle(_inbound(event_id="h3", text="#添加群聊"))
+        during = opened.handle(_inbound(event_id="h4", text="#使用说明"))
+        assert during is not None
+        self.assertIn("先读我", during.text)
+        self.assertIsNotNone(self.store.load_session("telegram", "42"))
+        brief = self.controller.handle(
+            _inbound(event_id="h5", scope="group", chat_id="-100", user_id="42", text="/help")
+        )
+        assert brief is not None
+        self.assertIn("私聊", brief.text)
+        self.assertNotIn("/addadmin", brief.text)
+        self.assertIsNone(
+            self.controller.handle(_inbound(event_id="h6", scope="group", chat_id="-100", user_id="7", text="大家好"))
+        )
+        refused = self.controller.handle(_inbound(event_id="h7", user_id="7", chat_id="7", text="/subscribe"))
+        assert refused is not None
+        self.assertIn("allow_self_subscribe 关闭", refused.text)
+        self.assertIn("/help", refused.text)
+        open_self = self._controller(allow_self_subscribe=True, admins=("42",), channel="feishu")
+        feishu_admin = open_self.handle(_inbound(channel="feishu", event_id="h8", text="/help"))
+        assert feishu_admin is not None
+        self.assertIn("版本管理与发布", feishu_admin.text)
+        self.assertIn("allow_self_subscribe 当前开启", feishu_admin.text)
+        nobody = self._controller(admins=(), channel="feishu", extra_admins=lambda: set())
+        empty = nobody.handle(_inbound(channel="feishu", event_id="h9", user_id="7", chat_id="7", text="/status"))
+        assert empty is not None
+        self.assertIn("还没有管理员", empty.text)
+        self.assertIn("协作者", empty.text)
+
     def test_state_file_is_owner_only(self):
         mode = os.stat(self.store.path).st_mode
         self.assertEqual(mode & 0o077, 0)
@@ -308,12 +350,12 @@ class ChatFlowTest(TempStoreTest):
         english = self._controller(language="en")
         reply = english.handle(_inbound(text="/help"))
         assert reply is not None
-        self.assertIn("Commands", reply.text)
-        self.assertNotIn("添加群聊", reply.text)
+        self.assertIn("Read this first", reply.text)
+        self.assertIn("/addadmin", reply.text)
         supporting = [name for name, cls in REGISTRY.items() if getattr(cls, "supports_chat", False)]
         self.assertEqual(set(supporting), {"telegram", "feishu"})
         for name in supporting:
-            for language, needle in (("zh", "订阅"), ("en", "Commands")):
+            for language, needle in (("zh", "先读我"), ("en", "Read this first")):
                 controller = self._controller(channel=name, language=language, group_catalog=lambda: [])
                 answer = controller.handle(_inbound(channel=name, event_id=f"{name}-{language}", text="/help"))
                 assert answer is not None

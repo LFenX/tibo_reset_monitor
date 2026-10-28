@@ -6,11 +6,26 @@
 
 `welcome_message` 默认是 `true`。进程拿到锁并且对话管理就绪后，会给配置里的管理员各发一条使用指南：Telegram 用数字 chat id，飞书用 `open_id`。飞书的 `admins` 为空时，改发给应用协作者；协作者也拿不到就跳过，不反复请求。Telegram 在对方还没给机器人发过消息时发不出去，这时记一条日志并跳过，等对方第一次 `/start` 或配对成功再发。同一份指南对同一个人只发一次，记在状态库里；指南内容版本变化后才会再发。`welcome_message` 设为 `false`，或启动时加 `run --no-welcome`，都不会发。发送失败会按通知一样稍后重试，不会挡住额度轮询，日志里也不会出现 token 或配对码。
 
+## 谁能用、权限与可用范围
+
+每份部署用自己的机器人和密钥。飞书自建应用只在创建它的那个企业里有效，不能拿去给别的企业用；别的企业要自己创建应用、自己填 App Secret。Telegram 同理，每个 bot token 只属于一个机器人。
+
+飞书里别人搜不到、或点开没有单聊权限，通常是可用范围没包括他们。到开放平台「版本管理与发布」，把可用范围设成对应的成员或部门，发布版本后再试。入口名称以当前页面为准。范围外的人、以及其他企业的人，都用不了这一份机器人。
+
+| 谁 | 能做 | 不能做 |
+| --- | --- | --- |
+| 管理员（配置 `admins`、配对成功，或飞书应用协作者） | 开关自己的单聊、添加或移除群、查看 `/status`、`/addadmin` | — |
+| 非管理员，`allow_self_subscribe` 为 false（默认） | `/help`、`/start`、`#帮助`、`#指南`、`#使用说明` | 开单聊、管理群、查看全部订阅 |
+| 非管理员，`allow_self_subscribe` 为 true | 在私聊给自己开关单聊，以及上面的帮助指令 | 管理群、查看全部订阅 |
+| 已订阅群里的任何人 | 收到通知 | 在群里管理通知 |
+
+群里的 `/help` 只回简短说明，并提示去私聊看完整指南。群里的普通聊天不会回复。
+
 ## 指令
 
 | 作用 | Telegram | 飞书 / 中文别名 |
 | --- | --- | --- |
-| 帮助 | `/start` `/help` | 任意不是指令的文字，或 `/help` |
+| 帮助（任何人，不受选群窗口影响） | `/start` `/help`，也可 `/help@机器人` | `#帮助`、`#指南`、`#使用说明`。私聊里的非指令文字也会给出指南；群里只对指令回复 |
 | 状态（仅管理员） | `/status` | `#状态` |
 | 开启自己的单聊 | `/subscribe` | `#开启单聊通知` |
 | 关闭自己的单聊 | `/unsubscribe` | `#关闭单聊通知` |
@@ -66,11 +81,26 @@ The smallest file is [`config.minimal.example.json`](../config.minimal.example.j
 
 `welcome_message` defaults to `true`. After the process holds the lock and chat control is ready, each configured admin receives one usage guide: a Telegram numeric chat id, or a Feishu `open_id`. When Feishu `admins` is empty, the guide goes to the app collaborators instead; if those cannot be listed, it is skipped. Telegram cannot open a direct chat until that person has messaged the bot, so the send is skipped with one log line and is delivered on their first `/start` or successful `/pair`. The same guide version is sent once per person and recorded in the state database. A new guide version is sent again. Set `welcome_message` to `false`, or start with `run --no-welcome`, to turn this off. A failed send is retried on a later poll, the same way notifications are, and does not stop quota polling. Logs do not include the token or a pairing code.
 
+### Who can use it
+
+Each deployment uses its own bot and secrets. A Feishu custom app works only in the company that created it. Another company deploys its own app and App Secret. A Telegram bot token likewise belongs to one bot.
+
+If someone cannot find the Feishu bot or cannot open a direct chat, they are usually outside the availability scope. In the open platform, under Version management and release, set the scope to those people or departments and publish. The menu name follows the current page. People outside that scope, and people in other companies, cannot use this copy of the bot.
+
+| Who | Can | Cannot |
+| --- | --- | --- |
+| Admin (`admins`, a successful `/pair`, or a Feishu collaborator) | Turn on their own direct messages, add or remove groups, `/status`, `/addadmin` | — |
+| Non-admin, `allow_self_subscribe` false (the default) | `/help`, `/start`, `#帮助`, `#指南`, `#使用说明` | Turn on direct messages, manage groups, list every subscription |
+| Non-admin, `allow_self_subscribe` true | Turn their own direct messages on or off, plus the help commands | Manage groups, list every subscription |
+| Anyone in a subscribed group | Receive notices | Manage notifications from the group |
+
+`/help` in a group is a short note that points to a direct chat for the full guide. Ordinary group chat gets no reply.
+
 ### Commands
 
 | Action | Telegram | Feishu / Chinese alias |
 | --- | --- | --- |
-| Help | `/start` `/help` | any non-command text, or `/help` |
+| Help (anyone; not blocked by the picker) | `/start` `/help`, including `/help@BotName` | `#帮助`, `#指南`, `#使用说明`. A non-command in a direct chat also shows the guide. A group only answers commands |
 | Status (admins) | `/status` | `#状态` |
 | Turn on your direct messages | `/subscribe` | `#开启单聊通知` |
 | Turn them off | `/unsubscribe` | `#关闭单聊通知` |

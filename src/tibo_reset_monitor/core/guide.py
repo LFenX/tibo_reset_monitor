@@ -13,7 +13,7 @@ import re
 from datetime import datetime
 from typing import Any
 
-from tibo_reset_monitor.core.i18n import chat_text
+from tibo_reset_monitor.core.i18n import usage_guide
 from tibo_reset_monitor.core.model import (
     PERMANENT,
     SENT,
@@ -81,7 +81,15 @@ def _deliver_one(store: Any, channel: Any, row: Any, now: datetime) -> None:
     if channel is None or sender is None:
         _skip(store, claimed, now, "this channel cannot send a direct usage guide")
         return
-    text = chat_text(str(claimed["language"] or "zh"), "guide")
+    settings = getattr(channel, "settings", None) or {}
+    allow_self = settings.get("allow_self_subscribe") == "true" if isinstance(settings, dict) else False
+    text = usage_guide(
+        str(claimed["language"] or "zh"),
+        channel=channel_name,
+        allow_self_subscribe=allow_self,
+        admin=True,
+        scope="personal",
+    )
     key = idempotency_key(f"guide\x1f{version}", channel_name, recipient)
     try:
         receipt = sender(recipient, text, idempotency_key=key)
