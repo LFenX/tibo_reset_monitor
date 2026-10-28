@@ -180,7 +180,9 @@ class ChatController:
         if command == "pair":
             return self._pair(inbound, argument, now)
         if command in {"subscribe_dm", "unsubscribe_dm"} and inbound.scope != "personal" and not self._is_admin(inbound.user_id):
-            return Reply(inbound.chat_id, self._t("only_dm"))
+            if self.allow_self_subscribe:
+                return Reply(inbound.chat_id, self._t("only_dm"))
+            return self._deny(inbound, subscribe=command == "subscribe_dm")
         if command == "subscribe_dm":
             return self._subscribe_dm(inbound, now)
         if command == "unsubscribe_dm":

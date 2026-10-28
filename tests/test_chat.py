@@ -327,6 +327,12 @@ class ChatFlowTest(TempStoreTest):
         self.assertIsNone(
             self.controller.handle(_inbound(event_id="h6", scope="group", chat_id="-100", user_id="7", text="大家好"))
         )
+        in_group = self.controller.handle(
+            _inbound(event_id="h6b", scope="group", chat_id="-100", user_id="7", text="#开启单聊通知")
+        )
+        assert in_group is not None
+        self.assertIn("allow_self_subscribe 关闭", in_group.text)
+        self.assertIn("/help", in_group.text)
         refused = self.controller.handle(_inbound(event_id="h7", user_id="7", chat_id="7", text="/subscribe"))
         assert refused is not None
         self.assertIn("allow_self_subscribe 关闭", refused.text)
