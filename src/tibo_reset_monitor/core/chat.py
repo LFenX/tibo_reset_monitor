@@ -228,7 +228,7 @@ class ChatController:
 
     def _unsubscribe_dm(self, inbound: Inbound, now: datetime) -> Reply:
         if not self.allow_self_subscribe and not self._is_admin(inbound.user_id):
-            return self._deny(inbound, subscribe=True)
+            return self._deny(inbound)
         removed = self.store.unsubscribe(self.channel, "personal", inbound.user_id, now, reason="unsubscribed")
         return Reply(inbound.chat_id, self._t("dm_off" if removed else "dm_off_none"))
 

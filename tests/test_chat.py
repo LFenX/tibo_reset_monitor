@@ -331,6 +331,10 @@ class ChatFlowTest(TempStoreTest):
         assert refused is not None
         self.assertIn("allow_self_subscribe 关闭", refused.text)
         self.assertIn("/help", refused.text)
+        unsubscribe = self.controller.handle(_inbound(event_id="h7b", user_id="7", chat_id="7", text="/unsubscribe"))
+        assert unsubscribe is not None
+        self.assertIn("不在管理员名单", unsubscribe.text)
+        self.assertNotIn("allow_self_subscribe 关闭", unsubscribe.text)
         open_self = self._controller(allow_self_subscribe=True, admins=("42",), channel="feishu")
         feishu_admin = open_self.handle(_inbound(channel="feishu", event_id="h8", text="/help"))
         assert feishu_admin is not None
