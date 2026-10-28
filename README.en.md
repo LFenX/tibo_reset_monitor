@@ -112,7 +112,7 @@ The caption is:
 
 A manual text uses the same shell: title `手动提醒`, caption line `手动发送`, and the calendar when it can be drawn.
 
-Calendar marks come from the full snapshot `https://aihot.news/api/v1/codex-resets` (the same `CodexResetsResponse` as `recent`; OpenAPI operation `codexResets`) overlaid with the recent feed. The full snapshot is fetched at most every 6 hours by default, also when the Beijing month changes, and never more often than once per 10 minutes. A failed history fetch does not block the notification and does not erase a cached copy. The grid then uses the recent feed alone. A day is confirmed from `occurredOn` / `confirmedAt`. An estimate is not drawn as a confirmation.
+Calendar marks come from the full snapshot `https://aihot.news/api/v1/codex-resets` (the same `CodexResetsResponse` as `recent`; OpenAPI operation `codexResets`) overlaid with the recent feed. The full snapshot is fetched at most every 6 hours by default, also when the Beijing month changes, and never more often than once per 10 minutes. A failed history fetch does not block the notification and does not erase a cached copy. The grid then uses the recent feed alone. A day is confirmed from `occurredOn` / `confirmedAt`. An estimate is not drawn as a confirmation. The bottom of the image is only the three color swatches: 已确认, 预计已生效, and 等待确认.
 
 Drawing is optional:
 

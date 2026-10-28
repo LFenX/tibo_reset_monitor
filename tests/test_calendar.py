@@ -169,6 +169,32 @@ class CalendarModelTest(unittest.TestCase):
         png = render_calendar_png(model, fonts)
         self.assertTrue(png.startswith(b"\x89PNG"))
         self.assertGreater(len(png), 1000)
+        self._assert_legend_sits_at_the_bottom(png, model["year"], model["month"])
+
+    def _assert_legend_sits_at_the_bottom(self, png: bytes, year: int, month: int) -> None:
+        import calendar as calendar_mod
+        import io
+
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(png)).convert("RGB")
+        weeks = calendar_mod.Calendar(firstweekday=0).monthdatescalendar(year, month)
+        cell_step = 90 + 8
+        legend_y = 176 + len(weeks) * cell_step
+        self.assertEqual(image.height, legend_y + 24 + 22)
+        self.assertLess(image.height, 165 + len(weeks) * cell_step + 95)
+        swatches = {(0x9C, 0xC5, 0xB5), (0xC7, 0xDC, 0xD0), (0xDB, 0xC9, 0xA9)}
+        found = set()
+        for y in range(legend_y, min(image.height, legend_y + 24)):
+            for x in range(0, image.width, 2):
+                pixel = image.getpixel((x, y))
+                for swatch in swatches:
+                    if all(abs(pixel[channel] - swatch[channel]) <= 8 for channel in range(3)):
+                        found.add(swatch)
+        self.assertEqual(found, swatches)
+        # The old footnotes sat well below the legend. That band is now padding or the border.
+        footnote_y = legend_y + 57
+        self.assertGreaterEqual(footnote_y, image.height - 8)
 
 
 class HistoryCacheTest(TempStoreTest):

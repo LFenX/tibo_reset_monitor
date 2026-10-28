@@ -210,7 +210,10 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
         weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(model["year"], model["month"])
         width, margin, gap, cell_height = 1120, 30, 8, 90
         cell_width = (width - 2 * margin - 6 * gap) // 7
-        image = Image.new("RGB", (width, 165 + len(weeks) * (cell_height + gap) + 95), "white")
+        legend_y = 176 + len(weeks) * (cell_height + gap)
+        # Legend dots are 13px tall and sit 5px below legend_y. Keep a short pad, then stop.
+        image_height = legend_y + 24 + 22
+        image = Image.new("RGB", (width, image_height), "white")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((1, 1, image.width - 2, image.height - 2), radius=20, outline="#dbe3e5", width=2)
         draw.text((margin, 25), f'{model["year"]} 年 {model["month"]} 月', font=face(30, True), fill="#20333f")
@@ -256,17 +259,9 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
                     draw.text((x + 10, y + 40 + index * 23), record["label"], font=face(17), fill=ink)
                 if len(records) > 2:
                     draw.text((x + cell_width - 35, y + 65), "+" + str(len(records) - 2), font=face(15), fill="#60767e")
-        legend_y = 176 + len(weeks) * (cell_height + gap)
         for x, color, label in ((margin, "#9cc5b5", "已确认"), (230, "#c7dcd0", "预计已生效"), (485, "#dbc9a9", "等待确认")):
             draw.ellipse((x, legend_y + 5, x + 13, legend_y + 18), fill=color)
             draw.text((x + 24, legend_y), label, font=face(18), fill="#647b86")
-        draw.text((margin, legend_y + 34), "重置确认：形式未明确；补充确认：按引用关系单列。", font=face(17), fill="#788991")
-        draw.text(
-            (margin, legend_y + 57),
-            "确认日期不代表精确到账时间；补充确认不另计一次额度重置。",
-            font=face(17),
-            fill="#788991",
-        )
         buffer = io.BytesIO()
         image.save(buffer, "PNG")
         return buffer.getvalue()
