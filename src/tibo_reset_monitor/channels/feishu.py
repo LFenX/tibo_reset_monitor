@@ -76,6 +76,16 @@ class FeishuChannel:
             "photo_alt": message.calendar_line,
         }
 
+    def send_text(self, receive_id: str, text: str, *, idempotency_key: str) -> Receipt:
+        """Plain direct message to an open_id."""
+        message = {
+            "receive_id": receive_id,
+            "receive_id_type": "open_id",
+            "msg_type": "text",
+            "content": json.dumps({"text": text}, ensure_ascii=False),
+        }
+        return self._post_message(message, idempotency_key or uuid.uuid4().hex, refreshed=False)
+
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
         del target
         content = message.get("content")

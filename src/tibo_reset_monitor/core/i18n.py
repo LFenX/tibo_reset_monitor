@@ -478,6 +478,9 @@ def _replace_fragments(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+# Bump this when the guide copy changes. Each (channel, recipient, version) is sent once.
+GUIDE_VERSION = "1"
+
 _CHAT = {
     "zh": {
         "help": (
@@ -526,6 +529,21 @@ _CHAT = {
         "admin_usage": "用法：/addadmin <用户 id>",
         "list_failed": "暂时列不出群，请稍后再试。",
         "not_group_cmd": "请在与机器人的单聊里管理群订阅。",
+        "guide": (
+            "使用指南\n"
+            "\n"
+            "单聊：在私聊里发送 /subscribe 或 #开启单聊通知。关闭发送 /unsubscribe 或 #关闭单聊通知。\n"
+            "\n"
+            "群聊：先把机器人加进群，再在私聊里发送 /addgroup 或 #添加群聊，回复编号。"
+            "在群里直接发送 /subscribe 也会订阅该群。"
+            "移除发送 /removegroup、#移除群聊、#取消群聊 或 #取消通知。\n"
+            "\n"
+            "/start /help 帮助\n"
+            "/status #状态 查看订阅（管理员）\n"
+            "/cancel #取消 退出选择\n"
+            "/pair <配对码> 在私聊里完成首次配对\n"
+            "/addadmin <用户 id> 添加管理员"
+        ),
     },
     "en": {
         "help": (
@@ -574,6 +592,22 @@ _CHAT = {
         "admin_usage": "Usage: /addadmin <user id>",
         "list_failed": "The group list is unavailable. Try again shortly.",
         "not_group_cmd": "Manage group subscriptions in a direct chat with the bot.",
+        "guide": (
+            "Usage guide\n"
+            "\n"
+            "Direct messages: in a private chat send /subscribe or #开启单聊通知. "
+            "Turn them off with /unsubscribe or #关闭单聊通知.\n"
+            "\n"
+            "Groups: add the bot to the group, then in a private chat send /addgroup or #添加群聊 and reply with the number. "
+            "Sending /subscribe in the group subscribes that group. "
+            "Remove it with /removegroup, #移除群聊, #取消群聊, or #取消通知.\n"
+            "\n"
+            "/start /help help\n"
+            "/status #状态 list subscriptions (admins)\n"
+            "/cancel #取消 leave the current choice\n"
+            "/pair <code> become an admin in a private chat\n"
+            "/addadmin <user id> add an admin"
+        ),
     },
 }
 

@@ -41,6 +41,7 @@ Subscriptions made by talking to the bot live in the state database (`subscripti
 2. Turning each inbound event into `tibo_reset_monitor.core.chat.Inbound` with only `event_id`, chat id, user id, text, and optional membership or migration fields. Do not store the raw payload or any token.
 3. Calling `ChatController.handle(inbound)` and sending the `Reply` yourself.
 4. Supplying `group_catalog()` when the platform can list groups the bot is in. Otherwise the controller uses chats recorded from membership updates.
+5. Implementing `send_text(recipient, text, *, idempotency_key) -> Receipt` if the channel should deliver the startup usage guide. The guide text comes from `chat_text(language, "guide")`. Bump `GUIDE_VERSION` in `core/i18n.py` when that copy changes.
 
 Command names, the one-minute picker, admin checks, and subscription rows are shared. Put new reply sentences in `core/i18n.py` (`chat_text`) for both `zh` and `en`. `tests/test_chat.py` renders help for every registered channel that sets `supports_chat`.
 

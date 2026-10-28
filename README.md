@@ -283,6 +283,8 @@ function verify(secret, body, timestamp, signature, windowSec = 300) {
 
 不必手改 `targets`。`chat_control` 默认开启，`targets` 可以是空数组。最小示例是 [`config.minimal.example.json`](config.minimal.example.json)。从创建机器人到第一次配对的步骤、指令表和排错写在 [docs/chat-setup.md](docs/chat-setup.md)。
 
+启动就绪后会给管理员单聊发一次使用指南（`welcome_message` 默认 `true`，可用 `run --no-welcome` 关掉）。对方还没和机器人说过话时会跳过，等第一次 `/start` 或配对成功再发。
+
 Telegram 在 `run` 里用 `getUpdates` 收消息。如果机器人已经设置了 webhook，两者不能同时用，日志会提示先删除 webhook。没有任何管理员时，启动会在标准输出打印一次性配对码，在单聊里发送 `/pair <码>`。飞书收消息需要可选依赖 `pip install '.[feishu-bot]'`；不安装时仍按配置里的 targets 发送，并在日志里说明对话管理已关闭。
 
 ## Docker 与后台运行

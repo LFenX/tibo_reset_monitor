@@ -16,6 +16,7 @@ from typing import Callable
 from tibo_reset_monitor.core.i18n import chat_text
 from tibo_reset_monitor.core.model import parse_utc
 from tibo_reset_monitor.core.store import StateStore
+from tibo_reset_monitor.logutil import redact
 
 log = logging.getLogger("tibo_reset_monitor")
 
@@ -123,6 +124,7 @@ class ChatController:
         group_catalog: Callable[[], list[tuple[str, str]] | None] | None = None,
         pairing: PairingGate | None = None,
         extra_admins: Callable[[], set[str]] | None = None,
+        welcome: Callable[[str], None] | None = None,
     ) -> None:
         self.store = store
         self.clock = clock
@@ -133,6 +135,7 @@ class ChatController:
         self.group_catalog = group_catalog
         self.pairing = pairing or PairingGate()
         self.extra_admins = extra_admins
+        self.welcome = welcome
         self._hits: dict[str, list[datetime]] = {}
 
     def handle(self, inbound: Inbound) -> Reply | None:
@@ -160,6 +163,8 @@ class ChatController:
 
     def _dispatch(self, inbound: Inbound, command: str, argument: str, now: datetime) -> Reply | None:
         if command == "help":
+            if _opened_with_start(inbound.text):
+                self._welcome(inbound.user_id)
             return Reply(inbound.chat_id, self._t("help"))
         if command == "pair":
             return self._pair(inbound, argument, now)
@@ -311,6 +316,7 @@ class ChatController:
         if not self.pairing.consume(inbound.user_id, argument, now):
             return Reply(inbound.chat_id, self._t("pair_bad"))
         self.store.add_chat_admin(self.channel, inbound.user_id, now)
+        self._welcome(inbound.user_id)
         return Reply(inbound.chat_id, self._t("pair_ok"))
 
     def _add_admin(self, inbound: Inbound, argument: str, now: datetime) -> Reply:
@@ -362,6 +368,14 @@ class ChatController:
     def _t(self, key: str, **values: str) -> str:
         return chat_text(self.language, key, **values)
 
+    def _welcome(self, user_id: str) -> None:
+        if self.welcome is None or not user_id:
+            return
+        try:
+            self.welcome(user_id)
+        except Exception as exc:
+            log.warning("welcome guide failed: %s", redact(str(exc)).replace("\n", " ")[:300])
+
 
 def normalize_command_text(text: str) -> str:
     """Drop a Telegram ``@BotName`` suffix from the first token."""
@@ -372,6 +386,12 @@ def normalize_command_text(text: str) -> str:
     if "@" in token:
         token = token.split("@", 1)[0]
     return (token + (" " + rest if rest else "")).strip()
+
+
+def _opened_with_start(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    token = normalized.split(" ", 1)[0].lower() if normalized else ""
+    return token == "/start"
 
 
 def _split_command(text: str) -> tuple[str | None, str]:

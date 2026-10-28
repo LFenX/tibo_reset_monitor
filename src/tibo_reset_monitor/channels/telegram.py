@@ -68,6 +68,29 @@ class TelegramChannel:
             "parse_mode": "HTML",
         }
 
+    def send_text(self, chat_id: str, text: str, *, idempotency_key: str = "") -> Receipt:
+        """Plain direct message. Telegram rejects this until the user has started the bot."""
+        del idempotency_key
+        token = os.environ.get(self._token_env, "").strip()
+        if not token:
+            return Receipt("retryable", detail=f"{self._token_env} is not set")
+        body = json.dumps(
+            {"chat_id": str(chat_id), "text": text, "link_preview_options": {"is_disabled": True}},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        url = f"{self._api_base}/bot{token}/sendMessage"
+        try:
+            response = self._transport.send(
+                "POST",
+                url,
+                {"Content-Type": "application/json; charset=utf-8"},
+                body,
+                self._timeout,
+            )
+        except TransportError as exc:
+            return receipt_from_transport(exc, sent=True)
+        return _receipt(response.status, response.body, response.headers)
+
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
         del target, idempotency_key  # Telegram has no uuid; the outbox row is the idempotency record.
         token = os.environ.get(self._token_env, "").strip()

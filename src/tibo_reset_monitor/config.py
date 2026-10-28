@@ -41,6 +41,7 @@ _CHANNEL_KEYS = {
         "chat_control",
         "admins",
         "allow_self_subscribe",
+        "welcome_message",
     },
     "telegram": {
         "enabled",
@@ -52,6 +53,7 @@ _CHANNEL_KEYS = {
         "chat_control",
         "admins",
         "allow_self_subscribe",
+        "welcome_message",
     },
     "webhook": {"enabled", "language", "timezone", "targets"},
 }
@@ -272,6 +274,9 @@ def _channel(
             "true" if _flag(raw.get("allow_self_subscribe", False), f"{prefix}.allow_self_subscribe", errors) else "false"
         )
         settings["admins"] = ",".join(_admins(raw.get("admins", []), f"{prefix}.admins", errors))
+        settings["welcome_message"] = (
+            "true" if _flag(raw.get("welcome_message", True), f"{prefix}.welcome_message", errors) else "false"
+        )
     targets_raw = raw.get("targets", [])
     if not isinstance(targets_raw, list):
         errors.append(f"{prefix}.targets must be an array")

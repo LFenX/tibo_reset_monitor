@@ -4,6 +4,8 @@
 
 最小配置见仓库里的 [`config.minimal.example.json`](../config.minimal.example.json)。密钥只放环境变量。
 
+`welcome_message` 默认是 `true`。进程拿到锁并且对话管理就绪后，会给配置里的管理员各发一条使用指南：Telegram 用数字 chat id，飞书用 `open_id`。飞书的 `admins` 为空时，改发给应用协作者；协作者也拿不到就跳过，不反复请求。Telegram 在对方还没给机器人发过消息时发不出去，这时记一条日志并跳过，等对方第一次 `/start` 或配对成功再发。同一份指南对同一个人只发一次，记在状态库里；指南内容版本变化后才会再发。`welcome_message` 设为 `false`，或启动时加 `run --no-welcome`，都不会发。发送失败会按通知一样稍后重试，不会挡住额度轮询，日志里也不会出现 token 或配对码。
+
 ## 指令
 
 | 作用 | Telegram | 飞书 / 中文别名 |
@@ -61,6 +63,8 @@
 `chat_control` defaults to `true`. `targets` may be empty. Subscriptions are stored in the state database and are not written back into the config file. Static targets and chat subscriptions are merged. A new subscription receives only notices detected after it was added.
 
 The smallest file is [`config.minimal.example.json`](../config.minimal.example.json). Secrets stay in environment variables.
+
+`welcome_message` defaults to `true`. After the process holds the lock and chat control is ready, each configured admin receives one usage guide: a Telegram numeric chat id, or a Feishu `open_id`. When Feishu `admins` is empty, the guide goes to the app collaborators instead; if those cannot be listed, it is skipped. Telegram cannot open a direct chat until that person has messaged the bot, so the send is skipped with one log line and is delivered on their first `/start` or successful `/pair`. The same guide version is sent once per person and recorded in the state database. A new guide version is sent again. Set `welcome_message` to `false`, or start with `run --no-welcome`, to turn this off. A failed send is retried on a later poll, the same way notifications are, and does not stop quota polling. Logs do not include the token or a pairing code.
 
 ### Commands
 

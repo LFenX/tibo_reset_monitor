@@ -15,8 +15,10 @@ from typing import Any
 
 from tibo_reset_monitor.channels import build_channels
 from tibo_reset_monitor.config import AppConfig
+from tibo_reset_monitor.core.guide import deliver_guides, guide_language
 from tibo_reset_monitor.core.history import HistoryCalendar
 from tibo_reset_monitor.core.http import UrllibTransport
+from tibo_reset_monitor.core.i18n import GUIDE_VERSION
 from tibo_reset_monitor.core.model import MANUAL, CycleReport, Notice, Target, format_utc
 from tibo_reset_monitor.logutil import redact
 from tibo_reset_monitor.core.scheduler import deliver_due, run_cycle
@@ -40,6 +42,7 @@ class Runtime:
     clock: Any
     owner: str
     calendar: HistoryCalendar | None = None
+    welcome_enabled: bool = True
 
     def close(self) -> None:
         self.store.close()
@@ -105,6 +108,8 @@ def poll(runtime: Runtime) -> int:
         log.warning("another monitor process is running; skipping this poll")
         return 0
     try:
+        prepare_guides(runtime)
+        deliver_guides(runtime.store, runtime.channels, runtime.clock)
         _refresh_history(runtime)
         report = run_cycle(
             store=runtime.store,
@@ -126,8 +131,10 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
         return 1
     stop_chat = threading.Event()
     _start_chat_control(runtime, stop_chat)
+    prepare_guides(runtime)
     try:
         while True:
+            deliver_guides(runtime.store, runtime.channels, runtime.clock)
             runtime.store.acquire_lock(runtime.owner, runtime.clock.now(), runtime.config.stale_lock_seconds)
             _refresh_history(runtime)
             report = run_cycle(
@@ -182,6 +189,7 @@ def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
             group_catalog=catalog,
             pairing=pairing,
             extra_admins=extra,
+            welcome=_welcome_opener(runtime, channel.name),
         )
         if channel.name == "telegram":
             if not admins and not runtime.store.chat_admin_ids("telegram"):
@@ -206,6 +214,92 @@ def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
                     log.warning("feishu chat control stopped: %s", type(exc).__name__)
 
             threading.Thread(target=feishu_loop, name="feishu-chat", daemon=True).start()
+
+
+def prepare_guides(runtime: Runtime, collaborators: Any = None) -> None:
+    """Queue one usage guide per configured admin. Does not send and does not raise."""
+    try:
+        _prepare_guides(runtime, collaborators)
+    except Exception as exc:
+        log.warning("welcome guide setup failed: %s", redact(str(exc)).replace("\n", " ")[:300])
+
+
+def _prepare_guides(runtime: Runtime, collaborators: Any) -> None:
+    from tibo_reset_monitor.channels.feishu_inbox import collaborator_open_ids
+
+    lookup = collaborators or collaborator_open_ids
+    for channel in runtime.channels:
+        if not _channel_welcome_enabled(runtime, channel):
+            continue
+        settings = channel.settings if isinstance(getattr(channel, "settings", None), dict) else {}
+        recipients = [part for part in str(settings.get("admins", "")).split(",") if part]
+        if not recipients and getattr(channel, "name", "") == "feishu":
+            recipients = _collaborators_once(runtime, channel, lookup)
+        now = runtime.clock.now()
+        for recipient in recipients:
+            runtime.store.enqueue_guide(
+                channel.name,
+                recipient,
+                GUIDE_VERSION,
+                guide_language(channel, recipient),
+                now,
+            )
+
+
+def _collaborators_once(runtime: Runtime, channel: Any, lookup: Any) -> list[str]:
+    seen = getattr(runtime, "_guide_lookups", None)
+    if seen is None:
+        seen = set()
+        runtime._guide_lookups = seen
+    key = f"{channel.name}:{GUIDE_VERSION}"
+    if key in seen:
+        return []
+    seen.add(key)
+    try:
+        found = lookup(channel)
+    except Exception as exc:
+        log.info("feishu welcome skipped: collaborator list is unavailable (%s)", type(exc).__name__)
+        return []
+    recipients = sorted({str(item).strip() for item in (found or set()) if str(item).strip()})
+    if not recipients:
+        log.info("feishu welcome skipped: no admins and no collaborators")
+    return recipients
+
+
+def _welcome_opener(runtime: Runtime, channel_name: str):
+    def open_for(user_id: str) -> None:
+        channel = next((item for item in runtime.channels if getattr(item, "name", "") == channel_name), None)
+        if channel is None or not _channel_welcome_enabled(runtime, channel):
+            return
+        if not runtime.store.open_guide(
+            channel_name,
+            user_id,
+            GUIDE_VERSION,
+            guide_language(channel, user_id),
+            runtime.clock.now(),
+        ):
+            return
+        deliver_guides(
+            runtime.store,
+            runtime.channels,
+            runtime.clock,
+            only=(channel_name, user_id, GUIDE_VERSION),
+        )
+
+    return open_for
+
+
+def _channel_welcome_enabled(runtime: Runtime, channel: Any) -> bool:
+    if not runtime.welcome_enabled:
+        return False
+    if getattr(channel, "name", "") not in {"telegram", "feishu"}:
+        return False
+    settings = getattr(channel, "settings", None)
+    if not isinstance(settings, dict):
+        return False
+    if settings.get("chat_control", "true") != "true":
+        return False
+    return settings.get("welcome_message", "true") == "true"
 
 
 def run_telegram_chat_loop(inbox: Any, stop: threading.Event, sleep: Any = None) -> None:

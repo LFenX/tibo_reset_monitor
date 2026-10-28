@@ -353,10 +353,51 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(telegram.targets, [])
         self.assertEqual(telegram.settings["chat_control"], "true")
         self.assertEqual(telegram.settings["admins"], "424242")
+        self.assertEqual(telegram.settings["welcome_message"], "true")
         self.assertEqual(feishu.settings["chat_control"], "true")
         self.assertEqual(feishu.settings["allow_self_subscribe"], "false")
+        self.assertEqual(feishu.settings["welcome_message"], "true")
         minimal = load_config(ROOT / "config.minimal.example.json", environ={})
         self.assertEqual(next(channel for channel in minimal.channels if channel.name == "telegram").targets, [])
+
+    def test_welcome_message_can_be_turned_off(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = load_config(
+                _write(
+                    root,
+                    {
+                        "channels": {
+                            "telegram": {
+                                "enabled": True,
+                                "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                                "welcome_message": False,
+                                "targets": [],
+                            }
+                        }
+                    },
+                )
+            )
+            self.assertEqual(config.channels[0].settings["welcome_message"], "false")
+            with self.assertRaises(ConfigError) as caught:
+                load_config(
+                    _write(
+                        root,
+                        {
+                            "channels": {
+                                "telegram": {
+                                    "enabled": True,
+                                    "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                                    "welcome_message": "yes",
+                                    "targets": [],
+                                }
+                            }
+                        },
+                    )
+                )
+        self.assertIn("$.channels.telegram.welcome_message", str(caught.exception))
 
 
 if __name__ == "__main__":

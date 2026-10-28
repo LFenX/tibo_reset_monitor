@@ -283,6 +283,8 @@ function verify(secret, body, timestamp, signature, windowSec = 300) {
 
 You do not have to edit `targets` by hand. `chat_control` defaults to on, and `targets` may be an empty array. The smallest file is [`config.minimal.example.json`](config.minimal.example.json). Creating the bot, the first pairing, the command list, and common errors are in [docs/chat-setup.md](docs/chat-setup.md).
 
+Once the process is ready it sends each admin one usage guide in a direct chat (`welcome_message` defaults to `true`; `run --no-welcome` turns it off). If that person has not talked to the bot yet, the send is skipped until their first `/start` or a successful pairing.
+
 Telegram listens with `getUpdates` inside `run`. That cannot run while a webhook is set; the log says to delete the webhook. When there is no admin yet, startup prints a one-time pairing code on stdout. Send `/pair <code>` in a direct chat. Feishu listening needs the optional `pip install '.[feishu-bot]'`. Without it, configured targets still receive notifications and the log says chat control is off.
 
 ## Docker and background runs

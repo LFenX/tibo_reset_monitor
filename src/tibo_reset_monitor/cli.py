@@ -44,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("poll", help="fetch once, enqueue new posts, and deliver due notifications")
-    sub.add_parser("run", help="poll in a loop (default every 10 minutes)")
+    run = sub.add_parser("run", help="poll in a loop (default every 10 minutes)")
+    run.add_argument("--no-welcome", action="store_true", help="do not send the usage guide to admins")
 
     status = sub.add_parser("status", help="show baseline, snapshot, and outbox counts")
     status.add_argument("--json", action="store_true")
@@ -70,6 +71,8 @@ def _dispatch(args: argparse.Namespace, runtime) -> int:
     if args.command == "poll":
         return poll(runtime)
     if args.command == "run":
+        if getattr(args, "no_welcome", False):
+            runtime.welcome_enabled = False
         return run_forever(runtime)
     if args.command == "status":
         print(status_text(runtime, as_json=args.json))

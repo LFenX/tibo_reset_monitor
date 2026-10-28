@@ -123,6 +123,19 @@ CREATE TABLE IF NOT EXISTS history_snapshot (
     body_json TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS guide_delivery (
+    channel TEXT NOT NULL,
+    recipient TEXT NOT NULL,
+    version TEXT NOT NULL,
+    language TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT,
+    first_ambiguous_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, recipient, version)
+);
 """
 
 
@@ -904,6 +917,94 @@ class StateStore:
 
     def clear_session(self, channel: str, user_id: str) -> None:
         self.conn.execute("DELETE FROM chat_session WHERE channel = ? AND user_id = ?", (channel, user_id))
+        self.conn.commit()
+
+    def enqueue_guide(self, channel: str, recipient: str, version: str, language: str, now: datetime) -> None:
+        """Remember a guide to send. A row that already exists is left alone."""
+        self.conn.execute(
+            """
+            INSERT INTO guide_delivery(
+                channel, recipient, version, language, status, attempts,
+                next_attempt_at, first_ambiguous_at, last_error, updated_at
+            ) VALUES (?, ?, ?, ?, 'pending', 0, NULL, NULL, NULL, ?)
+            ON CONFLICT(channel, recipient, version) DO NOTHING
+            """,
+            (channel, recipient, version, language, format_utc(now)),
+        )
+        self.conn.commit()
+
+    def open_guide(self, channel: str, recipient: str, version: str, language: str, now: datetime) -> bool:
+        """Make this guide due now unless this version was already sent."""
+        self.enqueue_guide(channel, recipient, version, language, now)
+        cursor = self.conn.execute(
+            """
+            UPDATE guide_delivery
+            SET status = 'pending', language = ?, attempts = 0,
+                next_attempt_at = NULL, last_error = NULL, updated_at = ?
+            WHERE channel = ? AND recipient = ? AND version = ?
+              AND status NOT IN ('sent', 'inflight')
+            """,
+            (language, format_utc(now), channel, recipient, version),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def guide_row(self, channel: str, recipient: str, version: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM guide_delivery WHERE channel = ? AND recipient = ? AND version = ?",
+            (channel, recipient, version),
+        ).fetchone()
+
+    def inflight_guides(self) -> list[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM guide_delivery WHERE status = 'inflight'").fetchall())
+
+    def due_guides(self, now: datetime) -> list[sqlite3.Row]:
+        return list(
+            self.conn.execute(
+                """
+                SELECT * FROM guide_delivery
+                WHERE status IN ('pending', 'retryable', 'ambiguous')
+                  AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                ORDER BY channel, recipient
+                """,
+                (format_utc(now),),
+            ).fetchall()
+        )
+
+    def claim_guide(self, channel: str, recipient: str, version: str, now: datetime) -> bool:
+        cursor = self.conn.execute(
+            """
+            UPDATE guide_delivery
+            SET status = 'inflight', attempts = attempts + 1, updated_at = ?
+            WHERE channel = ? AND recipient = ? AND version = ?
+              AND status IN ('pending', 'retryable', 'ambiguous')
+              AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+            """,
+            (format_utc(now), channel, recipient, version, format_utc(now)),
+        )
+        self.conn.commit()
+        return cursor.rowcount > 0
+
+    def write_guide(self, channel: str, recipient: str, version: str, state: DeliveryState, now: datetime) -> None:
+        self.conn.execute(
+            """
+            UPDATE guide_delivery
+            SET status = ?, attempts = ?, next_attempt_at = ?, first_ambiguous_at = ?,
+                last_error = ?, updated_at = ?
+            WHERE channel = ? AND recipient = ? AND version = ?
+            """,
+            (
+                state.status,
+                state.attempts,
+                format_utc(state.next_attempt_at) if state.next_attempt_at else None,
+                format_utc(state.first_ambiguous_at) if state.first_ambiguous_at else None,
+                (state.last_error or None),
+                format_utc(now),
+                channel,
+                recipient,
+                version,
+            ),
+        )
         self.conn.commit()
 
     def _cancel_target_pending(self, channel: str, target_key: str, now: datetime, reason: str) -> None:
