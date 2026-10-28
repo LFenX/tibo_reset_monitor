@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>He resets. We report.</strong><br>
-  Track Tibo's Codex / ChatGPT quota-reset updates and send them to Feishu, Telegram, or a webhook.
+  Track Tibo's Codex / ChatGPT quota-reset updates, with notifications to Feishu, Telegram, or your own channels via webhooks.
 </p>
 
 <p align="center">

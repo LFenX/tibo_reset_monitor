@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>重置有消息，自动通知你。</strong><br>
-  追踪 Tibo 的 Codex / ChatGPT 额度重置动态，推送到飞书、Telegram 或 Webhook。
+  追踪 Tibo 的 Codex / ChatGPT 额度重置动态，推送到飞书、Telegram，或通过 Webhook 接入自定义通知渠道。
 </p>
 
 <p align="center">
