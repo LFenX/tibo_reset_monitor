@@ -724,6 +724,8 @@ class StateStore:
 
     def migrate_chat(self, channel: str, old_id: str, new_id: str, now: datetime) -> None:
         """Point a group subscription and its pending deliveries at the new chat id."""
+        if not old_id or not new_id or old_id == new_id:
+            return
         with self.transaction():
             row = self.conn.execute(
                 "SELECT title, status FROM known_chat WHERE channel = ? AND chat_id = ?",
@@ -744,19 +746,47 @@ class StateStore:
             ).fetchone()
             if sub is None:
                 return
-            new_key = _subscription_key(channel, str(sub["kind"]), new_id)
+            old_key = str(sub["target_key"])
+            kind = str(sub["kind"])
+            existing = self.conn.execute(
+                "SELECT target_key, status FROM subscription WHERE channel = ? AND kind = ? AND address = ?",
+                (channel, kind, new_id),
+            ).fetchone()
+            if existing is None:
+                new_key = _subscription_key(channel, kind, new_id)
+                self.conn.execute(
+                    """
+                    UPDATE subscription
+                    SET address = ?, target_key = ?, updated_at = ?
+                    WHERE channel = ? AND address = ?
+                    """,
+                    (new_id, new_key, format_utc(now), channel, old_id),
+                )
+                self.conn.execute(
+                    "UPDATE outbox SET target_key = ?, updated_at = ? WHERE channel = ? AND target_key = ?",
+                    (new_key, format_utc(now), channel, old_key),
+                )
+                return
+            dest_key = str(existing["target_key"])
+            if str(existing["status"]) != "active":
+                self.conn.execute(
+                    """
+                    UPDATE subscription
+                    SET status = 'active', stop_reason = NULL, permanent_failures = 0, updated_at = ?
+                    WHERE channel = ? AND target_key = ?
+                    """,
+                    (format_utc(now), channel, dest_key),
+                )
+            self._move_outbox_target(channel, old_key, dest_key, now)
             self.conn.execute(
                 """
                 UPDATE subscription
-                SET address = ?, target_key = ?, updated_at = ?
-                WHERE channel = ? AND address = ?
+                SET status = 'stopped', stop_reason = 'chat migrated', updated_at = ?
+                WHERE channel = ? AND target_key = ?
                 """,
-                (new_id, new_key, format_utc(now), channel, old_id),
+                (format_utc(now), channel, old_key),
             )
-            self.conn.execute(
-                "UPDATE outbox SET target_key = ?, updated_at = ? WHERE channel = ? AND target_key = ?",
-                (new_key, format_utc(now), channel, str(sub["target_key"])),
-            )
+            self._cancel_target_pending(channel, old_key, now, "chat migrated")
 
     def subscribe(
         self,
@@ -1019,6 +1049,27 @@ class StateStore:
             ),
         )
         self.conn.commit()
+
+    def _move_outbox_target(self, channel: str, old_key: str, dest_key: str, now: datetime) -> None:
+        """Point pending deliveries at the destination chat, skipping notices it already has."""
+        held = {
+            int(row["notice_id"])
+            for row in self.conn.execute(
+                "SELECT notice_id FROM outbox WHERE channel = ? AND target_key = ?",
+                (channel, dest_key),
+            )
+        }
+        rows = self.conn.execute(
+            "SELECT id, notice_id FROM outbox WHERE channel = ? AND target_key = ?",
+            (channel, old_key),
+        ).fetchall()
+        for row in rows:
+            if int(row["notice_id"]) in held:
+                continue
+            self.conn.execute(
+                "UPDATE outbox SET target_key = ?, updated_at = ? WHERE id = ?",
+                (dest_key, format_utc(now), int(row["id"])),
+            )
 
     def _cancel_target_pending(self, channel: str, target_key: str, now: datetime, reason: str) -> None:
         statuses = tuple(CANCELLABLE_STATUSES)

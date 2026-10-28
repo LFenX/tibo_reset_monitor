@@ -404,6 +404,35 @@ class ChatFlowTest(TempStoreTest):
         self.assertNotEqual(moved.key, old_key)
         self.assertEqual(self.store.due_rows(NOW)[0].target_key, moved.key)
 
+    def test_migrate_into_an_existing_subscription_keeps_one_target(self):
+        self.store.remember_chat("telegram", "-100", "Ops", "joined", NOW)
+        self.store.subscribe(channel="telegram", kind="group", address="-100", display_name="Ops", now=NOW)
+        self.store.subscribe(channel="telegram", kind="group", address="-100999", display_name="Ops supergroup", now=NOW)
+        dest = next(item for item in self.store.subscription_targets("telegram", "zh", "UTC") if item.address == "-100999")
+        notice = Notice(
+            dedupe_key="m2",
+            post_key="m2",
+            stage="announcement",
+            stage_label="预告",
+            title="",
+            display_label="",
+            author="",
+            text="hi",
+            original_text="",
+            url="",
+            published_at="",
+        )
+        old = next(item for item in self.store.subscription_targets("telegram", "zh", "UTC") if item.address == "-100")
+        self.store.ingest([notice], [old], {"events": [], "activities": []}, None, NOW)
+        self.store.conn.commit()
+        self.store.migrate_chat("telegram", "-100", "-100999", NOW)
+        active = [item for item in self.store.subscriptions("telegram") if item["status"] == "active"]
+        self.assertEqual([item["address"] for item in active], ["-100999"])
+        self.assertEqual(self.store.due_rows(NOW)[0].target_key, dest.key)
+        stopped = [item for item in self.store.subscriptions("telegram") if item["address"] == "-100"]
+        self.assertEqual(stopped[0]["status"], "stopped")
+        self.assertEqual(stopped[0]["stop_reason"], "chat migrated")
+
     def test_membership_removal_stops_the_group(self):
         self.store.subscribe(channel="telegram", kind="group", address="-100", display_name="Ops", now=NOW)
         self.controller.handle(
