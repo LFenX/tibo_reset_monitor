@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from tibo_reset_monitor.core.chat import Inbound
+from tibo_reset_monitor.logutil import redact
 
 log = logging.getLogger("tibo_reset_monitor")
 
@@ -137,23 +138,7 @@ def start_feishu_listener(channel: Any, controller: Any) -> Any | None:
         return None
 
     def on_message(data: Any) -> None:
-        try:
-            message = data.event.message
-            sender = data.event.sender.sender_id
-            inbound = inbound_from_fields(
-                message_id=str(message.message_id or ""),
-                chat_id=str(message.chat_id or ""),
-                chat_type=str(message.chat_type or ""),
-                open_id=str(sender.open_id or ""),
-                text=text_from_content(str(message.content or "")),
-            )
-        except Exception:
-            log.warning("Feishu message could not be read")
-            return
-        reply = controller.handle(inbound)
-        if reply is None:
-            return
-        _send_text(channel, reply.chat_id, reply.text)
+        handle_feishu_event(channel, controller, data)
 
     handler = (
         lark.EventDispatcherHandler.builder("", "")
@@ -168,6 +153,34 @@ def start_feishu_listener(channel: Any, controller: Any) -> Any | None:
     client = lark.ws.Client(app_id, secret, event_handler=handler)
     log.info("Feishu chat control connected")
     return client
+
+
+def handle_feishu_event(channel: Any, controller: Any, data: Any) -> None:
+    """Handle one inbound event. A bad payload or a failed reply does not raise."""
+    try:
+        message = data.event.message
+        sender = data.event.sender.sender_id
+        inbound = inbound_from_fields(
+            message_id=str(message.message_id or ""),
+            chat_id=str(message.chat_id or ""),
+            chat_type=str(message.chat_type or ""),
+            open_id=str(sender.open_id or ""),
+            text=text_from_content(str(message.content or "")),
+        )
+    except Exception:
+        log.warning("Feishu message could not be read")
+        return
+    try:
+        reply = controller.handle(inbound)
+    except Exception as exc:
+        log.warning("Feishu message could not be handled: %s", redact(str(exc)).replace("\n", " ")[:300])
+        return
+    if reply is None:
+        return
+    try:
+        _send_text(channel, reply.chat_id, reply.text)
+    except Exception as exc:
+        log.warning("Feishu reply failed: %s", redact(str(exc)).replace("\n", " ")[:300])
 
 
 def os_secret(channel: Any) -> str:

@@ -9,6 +9,7 @@ import unittest
 from tests.support import FakeClock, TempStoreTest
 from tibo_reset_monitor.channels.feishu_inbox import (
     feishu_sdk_available,
+    handle_feishu_event,
     inbound_from_fields,
     list_bot_chats,
     text_from_content,
@@ -185,6 +186,36 @@ class InboxPollTest(TempStoreTest):
         self.assertNotIn("123456:AAAAAAAAAAAAAAAAAAAA", text)
         self.assertIn("<redacted-token>", text)
 
+    def test_unreadable_offset_does_not_stop_polling(self):
+        os.environ["TIBO_TELEGRAM_BOT_TOKEN"] = "123456:test-token-value"
+        self.addCleanup(os.environ.pop, "TIBO_TELEGRAM_BOT_TOKEN", None)
+        self.store.set_meta("telegram_update_offset", "not-a-number")
+        self.store.conn.commit()
+
+        class Transport:
+            def __init__(self) -> None:
+                self.bodies = []
+
+            def send(self, method, url, headers, body, timeout):
+                self.bodies.append(body)
+                return HttpResponse(200, {}, b'{"ok":true,"result":[]}', url)
+
+        channel = TelegramChannel(
+            ChannelSpec(
+                name="telegram",
+                enabled=True,
+                settings={"api_base": "https://api.telegram.org", "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN"},
+                targets=[],
+            ),
+            Transport(),
+            clock=None,
+        )
+        inbox = TelegramInbox(channel, ChatController(self.store, FakeClock(), channel="telegram", language="zh"), channel._transport)
+        with self.assertLogs("tibo_reset_monitor", level="WARNING"):
+            inbox.poll_once()
+        sent = json.loads(channel._transport.bodies[0].decode())
+        self.assertNotIn("offset", sent)
+
 
 class FeishuInboxTest(unittest.TestCase):
     def test_keeps_only_needed_fields(self):
@@ -225,6 +256,30 @@ class FeishuInboxTest(unittest.TestCase):
         chats = list_bot_chats(channel)
         self.assertEqual(chats, [("oc_a", "A"), ("oc_b", "B")])
         self.assertNotIn("t-token", json.dumps(chats))
+
+    def test_a_handler_failure_does_not_escape(self):
+        class Event:
+            class event:
+                class message:
+                    message_id = "om_1"
+                    chat_id = "oc_1"
+                    chat_type = "p2p"
+                    content = '{"text":"/help"}'
+
+                class sender:
+                    class sender_id:
+                        open_id = "ou_1"
+
+        class Boom:
+            def handle(self, inbound):
+                raise RuntimeError("boom 123456:AAAAAAAAAAAAAAAAAAAA")
+
+        channel = type("C", (), {"_timeout": 5, "_api_base": "https://open.feishu.cn", "_access_token": lambda self, force: None})()
+        with self.assertLogs("tibo_reset_monitor", level="WARNING") as captured:
+            handle_feishu_event(channel, Boom(), Event())
+        text = "\n".join(captured.output)
+        self.assertIn("could not be handled", text)
+        self.assertNotIn("123456:AAAAAAAAAAAAAAAAAAAA", text)
 
     def test_sdk_flag_matches_the_environment(self):
         try:

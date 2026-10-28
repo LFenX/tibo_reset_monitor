@@ -81,6 +81,17 @@ class SourceClientTest(unittest.TestCase):
         )
         self.assertEqual(validate_snapshot(body)["count"], 1)
 
+    def test_oversized_body_is_not_parsed(self):
+        transport = FakeTransport(
+            lambda _call: HttpResponse(200, {}, b"{" + b"x" * 2_000_000, "https://aihot.news/api")
+        )
+        client = SourceClient("https://aihot.news/api/v1/codex-resets/recent", transport=transport, user_agent="test-agent/0.1")
+        result = client.fetch(None)
+        assert result.failure is not None
+        self.assertEqual(result.failure.kind, "malformed")
+        self.assertIn("too large", result.failure.message)
+        self.assertIsNone(result.body)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,7 +81,10 @@ class TelegramInbox:
         offset = self.channel_offset()
         payload: dict[str, Any] = {"timeout": 20, "allowed_updates": ["message", "my_chat_member"]}
         if offset:
-            payload["offset"] = int(offset)
+            try:
+                payload["offset"] = int(offset)
+            except (TypeError, ValueError):
+                log.warning("telegram update offset is unreadable; fetching without it")
         response = self.transport.send(
             "POST",
             f"{self.channel._api_base}/bot{token}/getUpdates",

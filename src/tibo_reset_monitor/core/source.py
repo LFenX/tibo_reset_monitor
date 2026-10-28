@@ -15,6 +15,7 @@ from tibo_reset_monitor.core.model import FetchResult, SourceFailure
 
 DEFAULT_SOURCE_URL = "https://aihot.news/api/v1/codex-resets/recent"
 REQUIRED_FIELDS = ("schemaVersion", "timezone", "checkedAt", "historyFrom", "count", "events")
+_MAX_BODY_BYTES = 2_000_000
 
 
 class SnapshotError(ValueError):
@@ -98,6 +99,8 @@ class SourceClient:
             return FetchResult(failure=SourceFailure(kind, str(exc)))
 
         response_etag = _etag_of(response.headers) or etag
+        if len(response.body) > _MAX_BODY_BYTES:
+            return FetchResult(failure=SourceFailure("malformed", "response is too large", status=response.status))
         if response.status == 304:
             return FetchResult(not_modified=True, etag=response_etag)
         if response.status in (429, 503):
