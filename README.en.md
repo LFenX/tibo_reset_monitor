@@ -1,149 +1,220 @@
-# tibo-reset-monitor
+<p align="center">
+  <img src="docs/assets/banner.jpg" alt="tibo-reset-monitor mascot: a character with headphones holding a glowing calendar beside a small robot and a bell" width="100%">
+</p>
 
-Poll the public [AIHOT](https://aihot.news) API and notify you when Tibo (X: [@thsottiaux](https://x.com/thsottiaux), OpenAI Codex lead) posts a Codex or ChatGPT quota-reset update. A new source post is pushed to every configured Feishu, Telegram, or webhook target.
+<h1 align="center">tibo-reset-monitor</h1>
 
-The feed is `https://aihot.news/api/v1/codex-resets/recent` (last 7 days, `ETag` / `If-None-Match`, gzip, `Retry-After` on rate limit). The schema is the `CodexResetsResponse` in the [OpenAPI document](https://aihot.news/openapi-v1.json). **The confirmation time is the source post time, not the moment credit lands on an account.** AIHOT terms: [aihot.news/terms](https://aihot.news/terms).
+<p align="center">
+Poll the public AIHOT feed and notify Feishu, Telegram, or a webhook when Tibo posts a new Codex or ChatGPT quota-reset update.
+</p>
 
-中文说明见 [README.md](README.md).
+<p align="center">
+  <a href="README.md">简体中文</a>
+</p>
 
-## Behavior
+<p align="center">
+  <a href="https://github.com/LFenX/tibo_reset_monitor/actions/workflows/ci.yml"><img src="https://github.com/LFenX/tibo_reset_monitor/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/LFenX/tibo_reset_monitor/blob/main/.github/workflows/ci.yml"><img src="https://img.shields.io/badge/python-3.10%20%E2%80%93%203.13-3776AB" alt="Python 3.10–3.13"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT License"></a>
+</p>
 
-- Default poll interval is 10 minutes. `304 Not Modified` leaves the saved snapshot untouched.
-- The **first successful fetch only builds a baseline**. Historical posts are not announced. After that, every new source post (a new post id + stage) notifies.
-- Stages are announcement/preview, confirmation, revision, and retraction. A post that shows up in both the event post list and the activity feed notifies once.
-- Related chatter (`kind: related`) and the outage hint (`outage`, which the API says is not a reset fact) do not notify.
-- State lives in SQLite. Each (event, target) delivery has its own outbox row, idempotency key, receipt, and retry state. One failing target never blocks the others and never causes a successful target to be sent again.
-- Clear failures are retried with backoff. An ambiguous outcome (timeout) keeps the same idempotency key. About 55 minutes after the first ambiguous outcome the row becomes `needs_review` instead of being retried blindly. That stays inside Feishu's roughly one-hour `uuid` dedupe window.
-- A retracted event that has not been sent yet is cancelled. A message already delivered is left as sent, and the retraction itself is still announced.
-- A fetch failure, rate limit, or malformed body never overwrites the last valid snapshot.
-- Targets added later only receive events detected after they were added. There is no history backfill.
+Tibo is [@thsottiaux](https://x.com/thsottiaux) on X (OpenAI Codex lead). The feed is the public AIHOT endpoint [`/api/v1/codex-resets/recent`](https://aihot.news/api/v1/codex-resets/recent). The confirmation time is the source post's publish time, not the moment credit lands on an account. Terms: [aihot.news/terms](https://aihot.news/terms).
 
-Run a single `poll` or `run` process. A short lock in the state database skips overlapping cron runs.
+## Contents
+
+- [Features](#features)
+- [Preview](#preview)
+- [Quick start](#quick-start)
+- [Commands](#commands)
+- [Configuration](#configuration)
+- [Channels](#channels)
+- [Docker and background runs](#docker-and-background-runs)
+- [How it works](#how-it-works)
+- [FAQ](#faq)
+- [Development](#development)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Features
+
+- Polls the last 7 days every 10 minutes by default, with `ETag` / `If-None-Match` and gzip.
+- The first successful fetch only builds a baseline. History is not pushed. Later, each new source post (post id + stage) notifies.
+- Stages are announcement, confirmation, revision, and retraction. A post that appears in both the event list and the activity feed notifies once.
+- Feishu, Telegram, and Webhook can be enabled together. Each channel can mix `group` and `personal` targets.
+- Telegram sends one message per target: caption text, then the calendar image. Without an image it sends one text message.
+- One failing target does not block the others and does not resend a target that already succeeded.
+- State is a local SQLite file. Secrets are read only from the environment.
+
+## Preview
+
+A Telegram `sendPhoto` caption looks like this. The calendar image follows the last line, `重置日历`. Without Pillow or a CJK font, the same text is one `sendMessage` and there is no second image.
+
+```html
+<b>Tibo</b>
+<i>@thsottiaux · X</i>
+
+<code>重置（形式未明确）</code> <code>预告</code>
+
+搞定了。明天见，会有好消息。
+
+<i>帖子未明确适用范围</i>
+<i>帖子发布 · 2026-10-28 14:29:38（北京时间）</i>
+
+<blockquote>原帖 · Tibo @thsottiaux
+And it's done. See you tomorrow for some good news.
+引用 @thsottiaux
+Lands by midnight PST.
+2026-10-28 14:29:38 · 北京时间</blockquote>
+<a href="https://x.com/thsottiaux/status/123">查看原帖</a>
+
+重置日历 · 2026 年 10 月
+```
+
+The English original comes from `fullOriginalText`, or `originalText` when that field is absent. A `context` item with `relation: quote` is shown as `引用 @author`; `reply` is `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The blockquote is omitted when both the original text and `context` are empty.
+
+The calendar month is Beijing time. A `reset_credit` cell says 发重置卡; every other event says 额度重置. 补充确认 is still used when the form was not explicit and the post quotes another event's 补充说明. The header counts only confirmed events in that month. Grey cells at the edges belong to the neighboring month. November 2026 below is six week rows. December 2026 and February 2027 are in `docs/` as well.
+
+<p align="center">
+  <img src="docs/calendar-sample-2026-11.png" alt="Sample November 2026 calendar with late-October events in the grey cells" width="100%">
+</p>
+
+| Sample | Week rows |
+| --- | --- |
+| [November 2026](docs/calendar-sample-2026-11.png) | 6 |
+| [December 2026](docs/calendar-sample-2026-12.png) | 5 |
+| [February 2027](docs/calendar-sample-2027-02.png) | 4, not a leap year |
+
+These images are drawn from fake events. They are not a screenshot of a live notification.
 
 ## Quick start
 
-Python 3.10 or newer. The core and the v1 channels use the standard library only.
+Python 3.10 or newer. The core and the three channels use the standard library only. The calendar image needs an optional extra:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+pip install -e '.[calendar]'
+```
+
+Skip the extra with `pip install -e .` if you do not want the image. Telegram then sends one text message and logs a warning.
+
+```bash
 cp config.example.json config.json
 cp .env.example .env
 ```
 
-Replace the placeholder `receive_id` and `chat_id` values in `config.json`. Put secrets only in the environment:
+Replace the placeholder `receive_id` and `chat_id` values. Put secrets in the environment, not in the config file:
 
 ```bash
-export TIBO_FEISHU_APP_SECRET='your feishu app secret'
-export TIBO_TELEGRAM_BOT_TOKEN='your telegram bot token'
+export TIBO_FEISHU_APP_SECRET='your Feishu app secret'
+export TIBO_TELEGRAM_BOT_TOKEN='your Telegram bot token'
 ```
+
+The first run builds a baseline and does not push historical posts:
 
 ```bash
 tibo-reset-monitor poll --config config.json
 tibo-reset-monitor status --config config.json
-tibo-reset-monitor list --config config.json
 ```
 
-Without installing:
+Without installing the package:
 
 ```bash
 PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
 ```
 
-Every id in `config.example.json` is a fake placeholder. Do not put real secrets in the config file, and do not commit `config.json` or `.env`.
+Every id and token in `config.example.json` and `.env.example` is a placeholder. `config.json` and `.env` are listed in `.gitignore`.
+
+## Commands
+
+Global flags: `--config` (default `config.json`), `--log-level`, and `--version`.
+
+| Command | What it does |
+| --- | --- |
+| `poll` | Fetch once, enqueue new posts, and deliver due outbox rows. Use this from cron, a systemd timer, or Windows Task Scheduler |
+| `run` | Loop every `poll_interval_seconds`. Default 600 |
+| `status` | Baseline, latest snapshot, and outbox counts. `--json` prints JSON |
+| `list` | Detected notices and per-target delivery state. `--limit` defaults to 20. `--json` is optional |
+| `send-test --channel telegram --target example-person` | Send a test message. It does not mean a reset happened |
+| `manual --channel feishu --target example-group --event 3` | Re-send one notice from `list` with a new idempotency key |
+| `manual --text "hello" --channel telegram --target example-person` | Send custom text. The title is 手动提醒 |
+| `manual ... --preview` | Print the payload and do not send |
+
+`poll` exits 2 when the config is invalid and 1 when the source fetch fails. A failed target still exits 0 because the failure is stored and retried.
 
 ## Configuration
 
-JSON is the config format because `tomllib` is not in the Python 3.10 standard library (it arrived in 3.11). This project reads JSON only.
+The config file is JSON. `tomllib` is not in the Python 3.10 standard library, so this project does not read TOML.
+
+The full example is [`config.example.json`](config.example.json).
 
 | Field | Meaning |
 | --- | --- |
+| `source.url` | Default `https://aihot.news/api/v1/codex-resets/recent`. Must be https |
+| `source.history_url` | Optional. Default is the recent URL with `/recent` removed: `/api/v1/codex-resets` |
 | `source.poll_interval_seconds` | Interval for `run`. Default 600, minimum 60 |
-| `source.url` | AIHOT recent URL by default. Must be https |
-| `state.path` | SQLite path. `TIBO_STATE_PATH` overrides it |
-| `channels.*.enabled` | Disabled channels are not contacted |
-| `channels.*.targets[]` | Each target has a `name` and a `kind`: `group` or `personal` |
+| `source.timeout_seconds` | HTTP timeout. Default 20, range 1–120 |
+| `state.path` | SQLite path. `TIBO_STATE_PATH` overrides the file |
+| `logging.level` | `DEBUG`, `INFO`, `WARNING`, or `ERROR` |
+| `logging.file` | Optional log file. The console is always used |
+| `calendar.font_path` | Optional CJK font path. Empty means search the usual locations |
+| `calendar.font_bold_path` | Optional bold font. The regular face is used when it is absent |
+| `calendar.font_index` | Optional. Noto / Source Han CJK collections default to index 2 (Simplified Chinese) |
+| `calendar.history_refresh_seconds` | Full-history refresh interval. Default 21600 (6 hours), minimum 600 |
+| `channels.<name>.enabled` | Disabled channels are not contacted |
+| `channels.<name>.targets[]` | `name` plus `kind`: `group` or `personal` |
 
-Feishu groups use `receive_id_type: chat_id`. Personal Feishu targets use `open_id`, `user_id`, or `email`. Telegram groups use a negative chat id or a public `@channelusername`. A personal Telegram target is the user's positive numeric chat id. You can mix group and personal targets on both channels.
+Secrets are environment variable names such as `app_secret_env`, `bot_token_env`, and `url_env`. A field named `app_secret` or `bot_token` is rejected.
 
-The webhook channel is optional. Its URL comes from the environment variable named by `url_env`. Requests send an `Idempotency-Key` header.
+## Channels
 
-For Lark outside Feishu China, set Feishu `api_base` to `https://open.larksuite.com`.
+All three channels can be on at once. A target added later only receives events detected after it was added. There is no history backfill.
 
-## Create a Feishu app
-
-1. Open the [Feishu open platform](https://open.feishu.cn/app) (or [Lark](https://open.larksuite.com/app)) and create a custom app.
-2. Enable the bot capability.
-3. Grant permission to send messages as the bot (`im:message:send_as_bot`). Email personal targets also need the app to resolve a user in the tenant by email.
-4. Publish a version in your tenant. Put the App ID in `app_id`. Put the App Secret in `TIBO_FEISHU_APP_SECRET`.
-5. **Group:** add the bot to the group. `chat_id` usually starts with `oc_`. With the tenant token, `GET /open-apis/im/v1/chats` lists chats the bot is in. `receive_id_type` must be `chat_id`.
-6. **Personal:** `open_id` usually starts with `ou_`, `user_id` is the tenant user id, and `email` is the user's email in the tenant. Pick one and set `receive_id_type`.
-
-The monitor calls the Feishu Open API directly. It does not use `lark-cli`. Messages are Card JSON 2.0: stage, author, body, and a link to the original post. The outbox idempotency key is sent as the `uuid` field.
-
-## Create a Telegram bot
+### Telegram
 
 1. Talk to [@BotFather](https://t.me/BotFather), send `/newbot`, and store the token in `TIBO_TELEGRAM_BOT_TOKEN`.
-2. **Personal:** the user must open the bot and press Start, otherwise sends return 403. Then call `getUpdates` with the token in an environment variable (do not paste the token into chat or logs):
+2. Personal targets: the user opens the bot and presses Start, or sends return 403. Then read the chat id with the token in an environment variable. Do not paste the token into chat or logs:
 
    ```bash
    curl -s "https://api.telegram.org/bot${TIBO_TELEGRAM_BOT_TOKEN}/getUpdates"
    ```
 
-   Use your positive `message.chat.id` as the `chat_id` of a `personal` target.
-3. **Group:** add the bot to the group or channel and send a message it can see (mention it, or temporarily disable privacy mode, if you need `getUpdates` to observe the message). Group ids are negative; supergroups often start with `-100`. A public channel can use `@channelusername`. Set `kind` to `group`.
-4. Sending notifications does not require the bot to keep reading the group. After you have the chat id you can turn privacy mode back on.
+   `message.chat.id` is a positive integer. Set `kind` to `personal`.
+3. Groups and channels: add the bot and read the negative chat id from a message it can see. Supergroups often start with `-100`. A public channel can use `@channelusername`. Set `kind` to `group`.
+4. After you have the id you can turn privacy mode back on. Sending notifications does not require the bot to keep reading the group.
 
-403 (blocked, or not allowed to post) and 400 `chat not found` are stored as permanent failures with a readable reason. 429 follows `retry_after`.
+One message per target. `sendPhoto` puts the caption above the calendar when the image can be drawn; otherwise one `sendMessage` is sent. A photo caption is at most 1024 characters after HTML is parsed. Plain text is at most 4096. A long body or preview is cut with `…`. Tags, times, and the link stay. There is no avatar, because the photo is the calendar.
 
-### What a Telegram message looks like
+403 (blocked, or not allowed to post) and 400 `chat not found` are permanent failures. 429 follows `retry_after`.
 
-Each notice is **one** message per target. When the calendar image can be drawn, that message is `sendPhoto`: the HTML caption is above the PNG. The original post is a link at the end of the caption. There is no second message that only contains the URL, and there is no avatar. A photo message can carry only one image, and that image is the calendar.
+### Feishu
 
-The caption is:
+The Feishu channel in this repository sends one interactive card (Card JSON 2.0). It calls the Feishu Open API directly, does not use `lark-cli`, and does not attach the calendar image. The outbox idempotency key is the `uuid` field.
 
-- A bold author. Posts on x.com / twitter.com by `thsottiaux` say **Tibo**. Other X accounts say `@handle`. Any other link says the hostname.
-- An italic line: `@thsottiaux · X`, or just `X` / the hostname.
-- Two separate `<code>` chips: the event `displayLabel` (or `重置卡` for `reset_credit`, otherwise `重置（形式未明确）`) and the stage (预告 / 确认 / 补充 / 撤回).
-- The body (`fullText`, otherwise `text`).
-- Audience (`audienceZh`, otherwise `scopeLabel`, otherwise `帖子未明确适用范围`; omitted when the event type is `activity`), `productsZh` when present, and `帖子发布 · YYYY-MM-DD HH:MM:SS（北京时间）`.
-- An original-post preview in the same caption, inside `<blockquote>`. The original wording is `fullOriginalText`, or `originalText` when that is absent. Each `context` item with `relation: quote` is shown as `引用 @author` plus that item's `originalText`; `reply` uses `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The block is omitted when both the original text and `context` are empty.
-- A “查看原帖” link.
-- A final line `重置日历 · YYYY 年 M 月`, directly above the calendar image. The month is the current Beijing month.
+1. Create a custom app on the [Feishu open platform](https://open.feishu.cn/app). For Lark, set `api_base` to `https://open.larksuite.com`.
+2. Enable the bot and grant permission to send messages as the bot (`im:message:send_as_bot`). Email personal targets also need the app to resolve a user in the tenant by email.
+3. Publish a version. Put the App ID in `app_id` (or `app_id_env`). Put the App Secret in `TIBO_FEISHU_APP_SECRET`.
+4. Groups: add the bot to the group. `receive_id_type` must be `chat_id`. The id usually starts with `oc_`. `GET /open-apis/im/v1/chats` with the tenant token lists chats the bot is in.
+5. Personal targets: `receive_id_type` is `open_id`, `user_id`, or `email`.
 
-A photo caption is at most 1024 characters after HTML is parsed. A long main body or preview is cut and ends with `…`. Tags, times, and the link stay. The text fallback uses the same layout with a 4096 limit.
+### Webhook
 
-A manual text uses the same shell: title `手动提醒`, caption line `手动发送`, and the calendar when it can be drawn.
+Optional. `enabled` defaults to false. Each target URL comes from the environment variable named by `url_env` and must be https. The request is JSON and sends `Idempotency-Key`. The body includes `idempotency_key`, the target `name` and `kind`, and the notice fields. 2xx is success. 429 and 5xx are retried. Other 4xx results are permanent failures.
 
-Calendar marks come from the full snapshot `https://aihot.news/api/v1/codex-resets` (the same `CodexResetsResponse` as `recent`; OpenAPI operation `codexResets`) overlaid with the recent feed. The full snapshot is fetched at most every 6 hours by default, also when the Beijing month changes, and never more often than once per 10 minutes. A failed history fetch does not block the notification and does not erase a cached copy. The grid then uses the recent feed alone. A day is confirmed from `occurredOn` / `confirmedAt`. An estimate is not drawn as a confirmation. The month is Beijing time: 23:59 on 31 October is still October, and 00:00 on 1 November is November even while UTC is still the previous day. A cell says 发重置卡 when the event type is `reset_credit`, and 额度重置 otherwise. 补充确认 is unchanged: it is only used when the form was not explicit and the post quotes another event's 补充说明. The header counts only confirmed events in that month, so a new month starts at zero. Grey cells at the edges are the neighboring month, and events on those days are still drawn. A month can be 4, 5, or 6 week rows; the image height follows the row count and does not clip the grid. The bottom of the image is only the three color swatches: 已确认, 预计已生效, and 等待确认. After the Beijing month changes, the full history is fetched again, still no more than once every 10 minutes. If that fetch fails, the notice is still sent and the calendar is drawn for the new month from the cache on hand.
+## Docker and background runs
 
-Drawing is optional:
+The image is Python 3.12 and installs Pillow plus WenQuanYi Micro Hei, so the calendar can be drawn. The database is `/data`.
 
 ```bash
-pip install '.[calendar]'
+docker build -t tibo-reset-monitor .
+docker run --rm \
+  -v "$PWD/config.json:/config/config.json:ro" \
+  -v tibo-state:/data \
+  --env-file .env \
+  tibo-reset-monitor
 ```
 
-That installs Pillow. Fonts are searched in this order: `calendar.font_path` (and optional `font_bold_path`), Windows Microsoft YaHei `msyh.ttc` / `msyhbd.ttc`, macOS PingFang or Hiragino, then Linux Noto Sans CJK, WenQuanYi, and Source Han Sans. A Noto CJK collection uses face index 2 (Simplified Chinese) unless `calendar.font_index` is set. If no font is found, Pillow is missing, or drawing fails, Telegram sends **one** text message instead (limit 4096, same truncation) and logs a warning. The notification is not failed because the image could not be produced.
-
-Sample grid for October 2026, drawn from fake events: [`docs/calendar-sample.png`](docs/calendar-sample.png).
-
-## Commands
-
-| Command | Purpose |
-| --- | --- |
-| `poll` | One cycle. Use this from cron, a systemd timer, or Windows Task Scheduler |
-| `run` | Loop at the configured interval |
-| `status` | Baseline, latest snapshot, outbox counts. `--json` prints JSON |
-| `list` | Detected notices and per-target delivery state |
-| `send-test --channel telegram --target example-person` | Send a test message. It does not mean a reset happened |
-| `manual --channel feishu --target example-group --event 3` | Re-send a stored notice with a new idempotency key |
-| `manual --text "hello" --channel telegram --target example-person` | Send custom text |
-| `manual ... --preview` | Print the payload and do not send |
-
-`poll` exits 1 when the source fetch fails and 2 when the config is invalid. A failed target still exits 0 because the failure is stored and retried. `needs_review` means an ambiguous send stopped being retried; use `manual` if the chat never got it.
-
-## Scheduling
+The default command is `run --config /config/config.json`.
 
 ### Linux / macOS cron
 
@@ -153,7 +224,7 @@ Sample grid for October 2026, drawn from fake events: [`docs/calendar-sample.png
 
 ### systemd
 
-Unit files live in `deploy/systemd/`. The service runs one `poll`; the timer fires it every 10 minutes.
+Unit files are in [`deploy/systemd/`](deploy/systemd/). The service runs one `poll`. The timer fires it every 10 minutes:
 
 ```bash
 sudo cp deploy/systemd/tibo-reset-monitor.service deploy/systemd/tibo-reset-monitor.timer /etc/systemd/system/
@@ -169,20 +240,40 @@ You can change `ExecStart` to `run` for a long-lived process. Do not run the tim
 schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_monitor poll --config C:\tibo-reset-monitor\config.json"
 ```
 
-Set `TIBO_FEISHU_APP_SECRET` and `TIBO_TELEGRAM_BOT_TOKEN` in the task environment. Set the task's working directory to the project directory so the relative state path stays stable.
+Set the secrets in the task environment. Set the start directory to the project directory so the relative `state/` path stays stable.
 
-### Docker
+## How it works
 
-```bash
-docker build -t tibo-reset-monitor .
-docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
-```
+1. `poll` or `run` requests the recent feed and sends the previous `ETag`. A `304` leaves the saved snapshot untouched.
+2. The first successful response records the current posts as a baseline and does not notify.
+3. Later posts are deduped by (post id, stage). The stage comes from a post's `stage` and an activity's `action` (`announce`, `confirm`, `amend`, `withdraw`). Activity `kind: related` and the `outage` hint do not notify.
+4. Each (notice, target) row in the SQLite outbox has its own idempotency key and retry state. Feishu sends that key as `uuid`. Telegram has no equivalent field; the outbox is what prevents a second send after success.
+5. Clear failures are retried with backoff. An ambiguous outcome such as a timeout keeps the same key. About 55 minutes after the first ambiguous outcome the row becomes `needs_review` and is not retried automatically. Use `manual --event` if you confirmed it never arrived.
+6. A retraction cancels deliveries that have not been sent. A message already delivered stays sent, and the retraction itself is still announced.
+7. A failed, rate-limited, or unreadable fetch does not overwrite the last valid snapshot.
+8. The calendar uses the full snapshot `/api/v1/codex-resets` overlaid with recent. It is fetched at most every 6 hours by default, also after the Beijing month changes, and never more often than once every 10 minutes. A failed history fetch does not block the notice and does not erase the cache.
 
-The image runs `run` by default. The database is `/data` via `TIBO_STATE_PATH`. The image installs Pillow and WenQuanYi Micro Hei so the Telegram calendar can be drawn. Without those, notifications fall back to a single text message.
+Run a single `poll` or `run`. A short lock in the state database skips overlapping cron runs.
 
-## Adding a channel
+## FAQ
 
-See [docs/adding-a-channel.md](docs/adding-a-channel.md). `src/tibo_reset_monitor/core/` does not import channels. A new channel is one module under `channels/` plus one registry entry.
+**Why were the past week's resets not pushed on startup?**  
+The first successful fetch is a baseline. That avoids dumping history into a chat.
+
+**I added a personal target. Why was nothing backfilled?**  
+A target only receives events detected after it is in the config. Re-send an older notice with `manual --event`.
+
+**The group got it and the direct message did not.**  
+Check `list`. A Telegram user has to press Start. A Feishu bot has to be in the group, and a personal id has to match `receive_id_type`. One target's failure does not cancel the others.
+
+**What is `needs_review`?**  
+After a timeout the program cannot tell whether the provider accepted the message. It retries with the same idempotency key, then stops after about 55 minutes so a later retry cannot slip past Feishu's roughly one-hour dedupe window. Use `manual` if you confirmed it never arrived.
+
+**Is the confirmation time when credit hits the account?**  
+No. The time shown is the source post's publish time. When credit appears on an account is whatever the product shows.
+
+**There is no calendar image.**  
+Install `pip install -e '.[calendar]'` and provide a CJK font, or set `calendar.font_path`. If the font or Pillow is missing, Telegram still sends one text message.
 
 ## Development
 
@@ -190,25 +281,14 @@ See [docs/adding-a-channel.md](docs/adding-a-channel.md). `src/tibo_reset_monito
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs those tests on Python 3.10 through 3.13. HTTP is mocked. The tests do not call Feishu or Telegram.
+GitHub Actions runs Python 3.10, 3.11, 3.12, and 3.13 twice: once without Pillow, and once with Pillow and WenQuanYi Micro Hei. Tests use a fake HTTP transport. They do not call Feishu or Telegram.
 
-## FAQ
+To add a channel, see [docs/adding-a-channel.md](docs/adding-a-channel.md). `src/tibo_reset_monitor/core/` does not import any channel.
 
-**Why were the resets from the past week not pushed on startup?**  
-The first successful fetch is a baseline. That avoids dumping history into a chat.
+## Contributing
 
-**I added a personal target. Why was nothing backfilled?**  
-A target only receives events detected after it is in the config. Use `manual --event` for an older notice.
-
-**The group got it and the direct message did not.**  
-Check `list`. A Telegram user has to press Start. A Feishu bot has to be in the group, and a personal id has to match `receive_id_type`. One target's failure does not cancel the others.
-
-**What is `needs_review`?**  
-After a timeout the program cannot tell whether the provider accepted the message. It retries with the same idempotency key, then stops after about 55 minutes so a later retry cannot slip past Feishu's dedupe window and send a duplicate. Use `manual` if you confirmed it never arrived.
-
-**Is the confirmation time when credit hits the account?**  
-No. AIHOT's `confirmedAt`, and the time shown here, are the source post's publish time. When credit appears on an account is whatever the product shows. `estimate` and `schedule` are windows from the feed, not an account receipt.
+Issues and changes are welcome on the [GitHub repository](https://github.com/LFenX/tibo_reset_monitor). The short rules are in [CONTRIBUTING.md](CONTRIBUTING.md): stay compatible with Python 3.10, do not commit secrets or real chat ids, and keep the core importable without Pillow.
 
 ## License
 
-MIT. Copyright 2026 LFenX. See [LICENSE](LICENSE).
+[MIT License](LICENSE). Copyright (c) 2026 LFenX.
