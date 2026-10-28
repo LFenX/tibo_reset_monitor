@@ -1,128 +1,237 @@
-# tibo-reset-monitor
+<p align="center">
+  <img src="docs/readme-cover.png" alt="Tibo, patron saint of resets, pressing RESET while programmers await the signal" width="100%">
+</p>
 
-Poll the public [AIHOT](https://aihot.news) API and notify you when Tibo (X: [@thsottiaux](https://x.com/thsottiaux), OpenAI Codex lead) posts a Codex or ChatGPT quota-reset update. A new source post is pushed to every configured Feishu, Telegram, or webhook target.
+<h1 align="center">tibo-reset-monitor</h1>
 
-The feed is `https://aihot.news/api/v1/codex-resets/recent` (last 7 days, `ETag` / `If-None-Match`, gzip, `Retry-After` on rate limit). The schema is the `CodexResetsResponse` in the [OpenAPI document](https://aihot.news/openapi-v1.json). **The confirmation time is the source post time, not the moment credit lands on an account.** AIHOT terms: [aihot.news/terms](https://aihot.news/terms).
+<p align="center">
+  <strong>He resets. We report.</strong><br>
+  Track Tibo's Codex / ChatGPT quota-reset updates and send them to Feishu, Telegram, or a webhook.
+</p>
 
-中文说明见 [README.md](README.md).
+<p align="center">
+  <a href="https://github.com/LFenX/tibo_reset_monitor/actions/workflows/ci.yml"><img src="https://github.com/LFenX/tibo_reset_monitor/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI on main"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.10+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-D4AF37" alt="MIT License"></a>
+</p>
 
-## Behavior
+<p align="center">
+  <a href="README.md">简体中文</a> · <strong>English</strong>
+</p>
 
-- Default poll interval is 10 minutes. `304 Not Modified` leaves the saved snapshot untouched.
-- The **first successful fetch only builds a baseline**. Historical posts are not announced. After that, every new source post (a new post id + stage) notifies.
-- Stages are announcement/preview, confirmation, revision, and retraction. A post that shows up in both the event post list and the activity feed notifies once.
-- Related chatter (`kind: related`) and the outage hint (`outage`, which the API says is not a reset fact) do not notify.
-- State lives in SQLite. Each (event, target) delivery has its own outbox row, idempotency key, receipt, and retry state. One failing target never blocks the others and never causes a successful target to be sent again.
-- Clear failures are retried with backoff. An ambiguous outcome (timeout) keeps the same idempotency key. About 55 minutes after the first ambiguous outcome the row becomes `needs_review` instead of being retried blindly. That stays inside Feishu's roughly one-hour `uuid` dedupe window.
-- A retracted event that has not been sent yet is cancelled. A message already delivered is left as sent, and the retraction itself is still announced.
-- A fetch failure, rate limit, or malformed body never overwrites the last valid snapshot.
-- Targets added later only receive events detected after they were added. There is no history backfill.
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#notification-channels">Channels</a> ·
+  <a href="#deployment">Deployment</a> ·
+  <a href="#faq">FAQ</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-Run a single `poll` or `run` process. A short lock in the state database skips overlapping cron runs.
+---
+
+## Features
+
+| Capability | What it does |
+| --- | --- |
+| Reset tracking | Poll the public AIHOT feed for announcements, confirmations, revisions, and retractions |
+| Multiple destinations | Send to Feishu and Telegram groups or individuals, or your own webhook |
+| Independent delivery | Persist state in SQLite, deduplicate and retry per target, and isolate destination failures |
+| Flexible deployment | Run once, run continuously, or use cron, systemd, Windows Task Scheduler, or Docker |
+
+> The first successful fetch builds a baseline without sending historical posts. This project tracks public announcements: a confirmation time is the source post's publication time. Check the product itself to see whether your account's quota has been restored.
 
 ## Quick start
 
-Python 3.10 or newer. The core and the v1 channels use the standard library only.
+Requires **Python 3.10+** and Git. The core and built-in notification channels use only the Python standard library.
+
+### 1. Install
+
+These commands are for Linux / macOS. PowerShell instructions are available below.
 
 ```bash
+git clone https://github.com/LFenX/tibo_reset_monitor.git
+cd tibo_reset_monitor
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+python -m pip install -e .
 cp config.example.json config.json
 cp .env.example .env
 ```
 
-Replace the placeholder `receive_id` and `chat_id` values in `config.json`. Put secrets only in the environment:
+### 2. Configure notifications
+
+Edit your local `config.json` using [the example](config.example.json):
+
+- Enable only the channels you use; set the others to `"enabled": false`.
+- Replace the placeholder IDs in `targets` and remove unused example targets.
+- Put the enabled channels' secrets in `.env`. The program reads environment variables and **does not load `.env` automatically**.
+
+See [notification channels](#notification-channels) for setup. All App IDs, chat IDs, and user IDs in the example are placeholders. Keep secrets out of JSON and do not commit `config.json` or `.env`.
+
+### 3. Start
 
 ```bash
-export TIBO_FEISHU_APP_SECRET='your feishu app secret'
-export TIBO_TELEGRAM_BOT_TOKEN='your telegram bot token'
+set -a
+. ./.env
+set +a
+
+tibo-reset-monitor --config config.json poll
+tibo-reset-monitor --config config.json status
+tibo-reset-monitor --config config.json run
 ```
 
-```bash
-tibo-reset-monitor poll --config config.json
-tibo-reset-monitor status --config config.json
-tibo-reset-monitor list --config config.json
+`poll` runs one cycle, `status` shows the saved state, and `run` polls continuously at the configured interval (10 minutes by default). Press `Ctrl+C` to stop. The global `--config` option must come before the subcommand.
+
+<details>
+<summary><strong>Windows / PowerShell</strong></summary>
+
+```powershell
+git clone https://github.com/LFenX/tibo_reset_monitor.git
+cd tibo_reset_monitor
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+Copy-Item config.example.json config.json
+Copy-Item .env.example .env
 ```
 
-Without installing:
+Edit `config.json` as described above. Set the enabled channels' variables in your current PowerShell session before running:
 
-```bash
-PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
+```powershell
+$env:TIBO_FEISHU_APP_SECRET = 'replace-with-feishu-app-secret'
+$env:TIBO_TELEGRAM_BOT_TOKEN = 'replace-with-telegram-bot-token'
+
+tibo-reset-monitor --config config.json poll
+tibo-reset-monitor --config config.json status
+tibo-reset-monitor --config config.json run
 ```
 
-Every id in `config.example.json` is a fake placeholder. Do not put real secrets in the config file, and do not commit `config.json` or `.env`.
+For webhooks, also set the environment variable named by the target's `url_env`. Set only the credentials required by your enabled channels.
 
-## Configuration
+</details>
 
-JSON is the config format because `tomllib` is not in the Python 3.10 standard library (it arrived in 3.11). This project reads JSON only.
+## Notification channels
 
-| Field | Meaning |
-| --- | --- |
-| `source.poll_interval_seconds` | Interval for `run`. Default 600, minimum 60 |
-| `source.url` | AIHOT recent URL by default. Must be https |
-| `state.path` | SQLite path. `TIBO_STATE_PATH` overrides it |
-| `channels.*.enabled` | Disabled channels are not contacted |
-| `channels.*.targets[]` | Each target has a `name` and a `kind`: `group` or `personal` |
+Choose your channels in [config.example.json](config.example.json). Each channel can have multiple group or personal targets.
 
-Feishu groups use `receive_id_type: chat_id`. Personal Feishu targets use `open_id`, `user_id`, or `email`. Telegram groups use a negative chat id or a public `@channelusername`. A personal Telegram target is the user's positive numeric chat id. You can mix group and personal targets on both channels.
+| Channel | Destinations | Credentials |
+| --- | --- | --- |
+| Feishu / Lark | Groups and individuals | App ID + `TIBO_FEISHU_APP_SECRET` |
+| Telegram | Groups, channels, and individuals | `TIBO_TELEGRAM_BOT_TOKEN` |
+| Webhook | Your HTTPS endpoint | Environment variable named by `url_env` |
 
-The webhook channel is optional. Its URL comes from the environment variable named by `url_env`. Requests send an `Idempotency-Key` header.
+<details>
+<summary><strong>Feishu / Lark: create an app and find destination IDs</strong></summary>
 
-For Lark outside Feishu China, set Feishu `api_base` to `https://open.larksuite.com`.
+1. Create a custom app in the [Feishu open platform](https://open.feishu.cn/app) or [Lark](https://open.larksuite.com/app), and enable its bot capability.
+2. Grant `im:message:send_as_bot`, create a version, and publish it within your tenant.
+3. Put the App ID in `app_id` and the App Secret in `TIBO_FEISHU_APP_SECRET`.
+4. **Group:** add the bot to the group, set `receive_id` to its `chat_id` (usually starting with `oc_`), and use `receive_id_type: chat_id`. The app can call `GET /open-apis/im/v1/chats` with a tenant token to list its chats.
+5. **Personal:** choose `open_id`, `user_id`, or `email` as `receive_id_type` and provide the matching `receive_id`. Email targets also require permission to resolve tenant users by email.
 
-## Create a Feishu app
+For international Lark, set `api_base` to `https://open.larksuite.com`. The monitor calls the Open API directly; `lark-cli` is not required. Notifications use Card JSON 2.0 with the stage, author, body, and original post link.
 
-1. Open the [Feishu open platform](https://open.feishu.cn/app) (or [Lark](https://open.larksuite.com/app)) and create a custom app.
-2. Enable the bot capability.
-3. Grant permission to send messages as the bot (`im:message:send_as_bot`). Email personal targets also need the app to resolve a user in the tenant by email.
-4. Publish a version in your tenant. Put the App ID in `app_id`. Put the App Secret in `TIBO_FEISHU_APP_SECRET`.
-5. **Group:** add the bot to the group. `chat_id` usually starts with `oc_`. With the tenant token, `GET /open-apis/im/v1/chats` lists chats the bot is in. `receive_id_type` must be `chat_id`.
-6. **Personal:** `open_id` usually starts with `ou_`, `user_id` is the tenant user id, and `email` is the user's email in the tenant. Pick one and set `receive_id_type`.
+</details>
 
-The monitor calls the Feishu Open API directly. It does not use `lark-cli`. Messages are Card JSON 2.0: stage, author, body, and a link to the original post. The outbox idempotency key is sent as the `uuid` field.
+<details>
+<summary><strong>Telegram: create a bot and find chat_id</strong></summary>
 
-## Create a Telegram bot
-
-1. Talk to [@BotFather](https://t.me/BotFather), send `/newbot`, and store the token in `TIBO_TELEGRAM_BOT_TOKEN`.
-2. **Personal:** the user must open the bot and press Start, otherwise sends return 403. Then call `getUpdates` with the token in an environment variable (do not paste the token into chat or logs):
+1. Send `/newbot` to [@BotFather](https://t.me/BotFather) and store the token in `TIBO_TELEGRAM_BOT_TOKEN`.
+2. **Personal:** open the bot and press Start, then request updates:
 
    ```bash
    curl -s "https://api.telegram.org/bot${TIBO_TELEGRAM_BOT_TOKEN}/getUpdates"
    ```
 
-   Use your positive `message.chat.id` as the `chat_id` of a `personal` target.
-3. **Group:** add the bot to the group or channel and send a message it can see (mention it, or temporarily disable privacy mode, if you need `getUpdates` to observe the message). Group ids are negative; supergroups often start with `-100`. A public channel can use `@channelusername`. Set `kind` to `group`.
-4. Sending notifications does not require the bot to keep reading the group. After you have the chat id you can turn privacy mode back on.
+   Use the positive `message.chat.id` as a string in `chat_id`, with `kind: personal`.
+3. **Group / channel:** add the bot, grant posting permission, send it a visible message, and query `getUpdates`. Group IDs are negative; supergroup IDs usually start with `-100`. Public channels can also use `@channelusername`. Set `kind` to `group`.
+4. With privacy mode enabled, send a message the bot can see, such as a mention. Once you have the ID, privacy mode can be restored; continuous chat reading is not required.
 
-403 (blocked, or not allowed to post) and 400 `chat not found` are stored as permanent failures with a readable reason. 429 follows `retry_after`.
+403 (blocked or not allowed to post) and 400 `chat not found` are stored as permanent failures. 429 follows `retry_after`.
 
-## Commands
+</details>
 
-| Command | Purpose |
-| --- | --- |
-| `poll` | One cycle. Use this from cron, a systemd timer, or Windows Task Scheduler |
-| `run` | Loop at the configured interval |
-| `status` | Baseline, latest snapshot, outbox counts. `--json` prints JSON |
-| `list` | Detected notices and per-target delivery state |
-| `send-test --channel telegram --target example-person` | Send a test message. It does not mean a reset happened |
-| `manual --channel feishu --target example-group --event 3` | Re-send a stored notice with a new idempotency key |
-| `manual --text "hello" --channel telegram --target example-person` | Send custom text |
-| `manual ... --preview` | Print the payload and do not send |
+<details>
+<summary><strong>Webhook: connect your own receiver</strong></summary>
 
-`poll` exits 1 when the source fetch fails and 2 when the config is invalid. A failed target still exits 0 because the failure is stored and retried. `needs_review` means an ambiguous send stopped being retried; use `manual` if the chat never got it.
+Enable `channels.webhook` and give each target a `name`, `kind`, and `url_env`. The latter names an environment variable whose value is the actual HTTPS URL:
 
-## Scheduling
-
-### Linux / macOS cron
-
-```cron
-*/10 * * * * cd /opt/tibo-reset-monitor && . .venv/bin/activate && set -a && . ./.env && set +a && python -m tibo_reset_monitor poll --config /opt/tibo-reset-monitor/config.json
+```bash
+export TIBO_WEBHOOK_EXAMPLE_URL='https://example.com/your-webhook'
 ```
 
-### systemd
+Requests include `Idempotency-Key`, which your receiver can use to deduplicate deliveries. Keep the actual URL out of the JSON configuration.
 
-Unit files live in `deploy/systemd/`. The service runs one `poll`; the timer fires it every 10 minutes.
+</details>
+
+## Configuration and commands
+
+See [config.example.json](config.example.json) for the complete configuration and [.env.example](.env.example) for credential variable names.
+
+| Setting | Default / purpose |
+| --- | --- |
+| `source.poll_interval_seconds` | `600`, minimum `60`; polling interval for `run` |
+| `source.url` | AIHOT recent endpoint; HTTPS is required |
+| `state.path` | `state/monitor.sqlite3`; overridden by `TIBO_STATE_PATH` |
+| `logging.level` / `logging.file` | `INFO` / `logs/monitor.log` in the example configuration |
+| `channels.*.enabled` | Whether the channel is enabled |
+| `channels.*.targets` | Destination list; each target has a `name` and `kind` |
+
+Commands read `config.json` from the current directory by default. To choose another file, use `tibo-reset-monitor --config PATH <command>`.
+
+| Subcommand | Purpose |
+| --- | --- |
+| `poll` | Fetch once and deliver due notifications |
+| `run` | Poll continuously at the configured interval |
+| `status --json` | Show baseline, snapshot, and outbox counts |
+| `list --limit 20` | Show notices and per-target delivery state; also supports `--json` |
+| `send-test --channel telegram --target example-person` | Send a test message to one destination |
+| `manual --channel feishu --target example-group --event 3` | Resend a saved notice with a new idempotency key |
+| `manual --channel telegram --target example-person --text "hello" --preview` | Preview custom text without sending it |
+
+Target names must match your configuration; get event IDs from `list`. `poll` exits `1` if the source fetch fails and `2` for invalid configuration. Individual delivery failures still exit `0`; inspect them with `list`.
+
+## Deployment
+
+Choose one execution method. Use a single `poll` / `run` process for each state database.
+
+<details>
+<summary><strong>Docker</strong></summary>
+
+Configure your local `config.json` and `.env` first. Set `logging.file` to `/data/monitor.log` so the container user can write logs in the mounted volume.
+
+```bash
+docker build -t tibo-reset-monitor .
+docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
+```
+
+The image runs `run` by default and uses `TIBO_STATE_PATH` to write the database to `/data/monitor.sqlite3`. The named `tibo-state` volume persists the state.
+
+</details>
+
+<details>
+<summary><strong>Linux / macOS: cron</strong></summary>
+
+Assuming the project is installed at `/opt/tibo-reset-monitor` with a virtual environment and a configured `.env`:
+
+```cron
+*/10 * * * * cd /opt/tibo-reset-monitor && set -a && . ./.env && set +a && .venv/bin/python -m tibo_reset_monitor --config /opt/tibo-reset-monitor/config.json poll
+```
+
+Run once every 10 minutes. Relative state paths resolve from the project directory.
+
+</details>
+
+<details>
+<summary><strong>Linux: systemd</strong></summary>
+
+See the example [service](deploy/systemd/tibo-reset-monitor.service) and [timer](deploy/systemd/tibo-reset-monitor.timer). Before installing them, update the example service's `ExecStart` to put the arguments in this order:
+
+```ini
+ExecStart=/opt/tibo-reset-monitor/.venv/bin/python -m tibo_reset_monitor --config /opt/tibo-reset-monitor/config.json poll
+```
+
+Check that `WorkingDirectory`, `EnvironmentFile`, and the installation paths match your setup, then install:
 
 ```bash
 sudo cp deploy/systemd/tibo-reset-monitor.service deploy/systemd/tibo-reset-monitor.timer /etc/systemd/system/
@@ -130,54 +239,65 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tibo-reset-monitor.timer
 ```
 
-You can change `ExecStart` to `run` for a long-lived process. Do not run the timer and the daemon together.
+The service runs one `poll`; the timer triggers it every 10 minutes. If you switch to a continuous `run`, disable the timer.
 
-### Windows Task Scheduler
+</details>
 
-```bat
-schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_monitor poll --config C:\tibo-reset-monitor\config.json"
-```
+<details>
+<summary><strong>Windows: Task Scheduler</strong></summary>
 
-Set `TIBO_FEISHU_APP_SECRET` and `TIBO_TELEGRAM_BOT_TOKEN` in the task environment. Set the task's working directory to the project directory so the relative state path stays stable.
+For a project installed at `C:\tibo_reset_monitor`, create a task that repeats every 10 minutes with these action settings:
 
-### Docker
+| Field | Value |
+| --- | --- |
+| Program/script | `C:\tibo_reset_monitor\.venv\Scripts\python.exe` |
+| Add arguments | `-m tibo_reset_monitor --config C:\tibo_reset_monitor\config.json poll` |
+| Start in | `C:\tibo_reset_monitor` |
 
-```bash
-docker build -t tibo-reset-monitor .
-docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
-```
+Set the enabled channels' credential variables for the account that runs the task. The task does not load `.env` automatically. A fixed working directory keeps relative state paths consistent.
 
-The image runs `run` by default. The database is `/data` via `TIBO_STATE_PATH`.
+</details>
 
-## Adding a channel
+## FAQ
 
-See [docs/adding-a-channel.md](docs/adding-a-channel.md). `src/tibo_reset_monitor/core/` does not import channels. A new channel is one module under `channels/` plus one registry entry.
+<details>
+<summary><strong>Why did startup send no notifications?</strong></summary>
 
-## Development
+The first successful fetch only records a baseline; it does not backfill the past 7 days. New targets also receive only updates detected after they are added. Check the fetch state with `status` and your channel with `send-test`. Use `manual --event` when you need to resend a saved notice.
+
+</details>
+
+<details>
+<summary><strong>Why did the group receive a message but the direct message fail?</strong></summary>
+
+Check each destination with `list`. A Telegram user must press Start. A Feishu personal ID must match `receive_id_type`, and the bot must belong to the group. One destination's failure does not affect the others.
+
+</details>
+
+<details>
+<summary><strong>How do deduplication, retries, and retractions work?</strong></summary>
+
+- A new update is identified by post ID + stage. A post appearing in both the event list and the activity feed notifies once. Related chatter (`related`) and outage hints (`outage`) do not notify.
+- Each event and destination has its own outbox entry, idempotency key, receipt, and retry state. Clear failures are retried with backoff.
+- Ambiguous outcomes such as timeouts retain the same idempotency key. About 55 minutes after the first ambiguous outcome, the entry becomes `needs_review`. Use `manual` only after confirming the message never arrived.
+- A retraction cancels pending, unsent notices. Delivered messages remain in place, and the retraction itself is still announced.
+- `304 Not Modified` leaves the snapshot unchanged. Fetch failures, rate limits, and malformed responses preserve the last valid snapshot.
+- The short database lock skips overlapping polls; it does not make running multiple continuous processes a supported deployment.
+
+</details>
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for development conventions and [the channel guide](docs/adding-a-channel.md) to add a destination.
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs those tests on Python 3.10 through 3.13. HTTP is mocked. The tests do not call Feishu or Telegram.
+CI runs tests on Python 3.10–3.13 with mocked HTTP transports. Tests do not call live Feishu or Telegram services.
 
-## FAQ
+## Data source and license
 
-**Why were the resets from the past week not pushed on startup?**  
-The first successful fetch is a baseline. That avoids dumping history into a chat.
+Public updates come from [AIHOT](https://aihot.news)'s [recent endpoint](https://aihot.news/api/v1/codex-resets/recent), covering the last 7 days. It supports `ETag` / `If-None-Match`, gzip, and rate-limit `Retry-After`. See [OpenAPI](https://aihot.news/openapi-v1.json) for the schema and [AIHOT Terms](https://aihot.news/terms) for terms of use. Announcements are authored by [Tibo (@thsottiaux)](https://x.com/thsottiaux).
 
-**I added a personal target. Why was nothing backfilled?**  
-A target only receives events detected after it is in the config. Use `manual --event` for an older notice.
-
-**The group got it and the direct message did not.**  
-Check `list`. A Telegram user has to press Start. A Feishu bot has to be in the group, and a personal id has to match `receive_id_type`. One target's failure does not cancel the others.
-
-**What is `needs_review`?**  
-After a timeout the program cannot tell whether the provider accepted the message. It retries with the same idempotency key, then stops after about 55 minutes so a later retry cannot slip past Feishu's dedupe window and send a duplicate. Use `manual` if you confirmed it never arrived.
-
-**Is the confirmation time when credit hits the account?**  
-No. AIHOT's `confirmedAt`, and the time shown here, are the source post's publish time. When credit appears on an account is whatever the product shows. `estimate` and `schedule` are windows from the feed, not an account receipt.
-
-## License
-
-MIT. Copyright 2026 LFenX. See [LICENSE](LICENSE).
+[MIT License](LICENSE) · Copyright © 2026 LFenX

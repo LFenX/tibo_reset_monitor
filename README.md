@@ -1,128 +1,237 @@
-# tibo-reset-monitor
+<p align="center">
+  <img src="docs/readme-cover.png" alt="Tibo, patron saint of resets, pressing RESET while programmers await the signal" width="100%">
+</p>
 
-轮询 [AIHOT](https://aihot.news) 公开接口，跟踪 Tibo（X：[@thsottiaux](https://x.com/thsottiaux)，OpenAI Codex 负责人）发布的 Codex / ChatGPT 额度重置动态。出现**新的**来源帖时，向已配置的飞书、Telegram 或 Webhook 目标各发一条通知。
+<h1 align="center">tibo-reset-monitor</h1>
 
-数据来自 AIHOT 公开接口 `https://aihot.news/api/v1/codex-resets/recent`（最近 7 天，支持 `ETag` / `If-None-Match`、gzip，限流时返回 `Retry-After`）。接口说明见 [OpenAPI](https://aihot.news/openapi-v1.json)。**确认时间是来源帖子的发布时间，不是账户额度到账的时刻。** AIHOT 的使用条款见 [aihot.news/terms](https://aihot.news/terms)。
+<p align="center">
+  <strong>重置有消息，自动通知你。</strong><br>
+  追踪 Tibo 的 Codex / ChatGPT 额度重置动态，推送到飞书、Telegram 或 Webhook。
+</p>
 
-英文说明：[README.en.md](README.en.md)。
+<p align="center">
+  <a href="https://github.com/LFenX/tibo_reset_monitor/actions/workflows/ci.yml"><img src="https://github.com/LFenX/tibo_reset_monitor/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI on main"></a>
+  <a href="pyproject.toml"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.10+"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-D4AF37" alt="MIT License"></a>
+</p>
 
-## 它怎么工作
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
 
-- 默认每 10 分钟拉一次。`304 Not Modified` 不会动本地快照。
-- **第一次成功拉取只建立基线**，历史帖子不发通知。之后每条新的来源帖（新的「帖子 + 阶段」）才通知。
-- 阶段包括预告、确认、补充、撤回。同一条帖子若同时出现在事件帖子列表和活动流里，只通知一次。
-- 无关闲聊（接口里的 `related`）和故障提示（`outage`，接口写明它不是重置事实）不发通知。
-- 状态在 SQLite。每个「事件 × 目标」有自己的 outbox 行、幂等键、回执和重试状态。一个目标失败不会挡住其他目标，也不会让已成功的目标重发。
-- 明确失败会退避重试。超时这类结果不确定的发送会沿用同一个幂等键；距第一次不确定结果约 55 分钟后改为 `needs_review`，不再盲目重试（飞书的 `uuid` 大约 1 小时内去重）。
-- 尚未发出的通知如果对应事件被撤回，会被取消。已经发出的不会收回，撤回本身仍会通知。
-- 拉取失败、限流或响应格式不对时，**不会覆盖**上一份有效快照。
-- 后来新增的目标只接收新增之后发现的事件，不补发历史。
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#通知渠道">通知渠道</a> ·
+  <a href="#部署">部署</a> ·
+  <a href="#常见问题">常见问题</a> ·
+  <a href="CONTRIBUTING.md">参与贡献</a>
+</p>
 
-请只跑一个 `poll` / `run` 进程。状态库里有一把短锁，避免 cron 重叠时重复发送。
+---
+
+## 功能
+
+| 能力 | 说明 |
+| --- | --- |
+| 重置动态追踪 | 轮询 AIHOT 公开接口，识别预告、确认、补充和撤回 |
+| 多渠道通知 | 飞书与 Telegram 支持群聊、个人；Webhook 支持自定义接收端 |
+| 独立投递 | SQLite 保存状态，按目标去重和重试，一个目标失败不阻塞其他目标 |
+| 灵活运行 | 单次执行、常驻进程、cron、systemd、Windows 任务计划程序或 Docker |
+
+> 首次成功拉取只建立基线，不推送历史帖子。项目跟踪的是公开公告；“确认时间”是来源帖子的发布时间，账户额度是否到账以产品内显示为准。
 
 ## 快速开始
 
-需要 Python 3.10 或更高版本。核心和 v1 渠道只用标准库。
+需要 **Python 3.10+** 和 Git。核心与内置通知渠道仅使用 Python 标准库。
+
+### 1. 安装
+
+以下命令适用于 Linux / macOS；Windows 命令见下方折叠说明。
 
 ```bash
+git clone https://github.com/LFenX/tibo_reset_monitor.git
+cd tibo_reset_monitor
 python -m venv .venv
 source .venv/bin/activate
-pip install -e .
+python -m pip install -e .
 cp config.example.json config.json
 cp .env.example .env
 ```
 
-编辑 `config.json` 里的占位 `receive_id` / `chat_id`（这些不是密钥，但请换成你自己的）。密钥只放在环境变量里：
+### 2. 配置通知
+
+编辑本地 `config.json`（从[示例配置](config.example.json)复制）：
+
+- 只启用要使用的渠道：将其余渠道的 `enabled` 设为 `false`。
+- 替换 `targets` 中的占位 ID，并删除不用的示例目标。
+- 在 `.env` 中填入启用渠道的密钥。程序从环境变量读取密钥，**不会自动加载 `.env`**。
+
+渠道获取方式见[通知渠道](#通知渠道)。示例配置中的 App ID、群 ID 和用户 ID 均为占位值；真实密钥不写进 JSON，`config.json` 和 `.env` 不提交到仓库。
+
+### 3. 启动
 
 ```bash
-export TIBO_FEISHU_APP_SECRET='你的飞书 app secret'
-export TIBO_TELEGRAM_BOT_TOKEN='你的 Telegram bot token'
+set -a
+. ./.env
+set +a
+
+tibo-reset-monitor --config config.json poll
+tibo-reset-monitor --config config.json status
+tibo-reset-monitor --config config.json run
 ```
 
-```bash
-tibo-reset-monitor poll --config config.json
-tibo-reset-monitor status --config config.json
-tibo-reset-monitor list --config config.json
+`poll` 执行一轮，`status` 查看状态，`run` 按配置间隔持续运行（默认 10 分钟），按 `Ctrl+C` 退出。全局参数 `--config` 必须放在子命令前。
+
+<details>
+<summary><strong>Windows / PowerShell</strong></summary>
+
+```powershell
+git clone https://github.com/LFenX/tibo_reset_monitor.git
+cd tibo_reset_monitor
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e .
+Copy-Item config.example.json config.json
+Copy-Item .env.example .env
 ```
 
-不安装也可以：
+按上面的要求编辑 `config.json`。在当前 PowerShell 会话中设置启用渠道所需的变量，再运行：
 
-```bash
-PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
+```powershell
+$env:TIBO_FEISHU_APP_SECRET = 'replace-with-feishu-app-secret'
+$env:TIBO_TELEGRAM_BOT_TOKEN = 'replace-with-telegram-bot-token'
+
+tibo-reset-monitor --config config.json poll
+tibo-reset-monitor --config config.json status
+tibo-reset-monitor --config config.json run
 ```
 
-`config.example.json` 里的 app id、chat id、open id 都是假的占位符。不要把真实密钥写进配置文件，也不要提交 `config.json` 或 `.env`。
+Webhook 用户还需设置目标 `url_env` 指向的环境变量。这里只需要设置已启用渠道的密钥。
 
-## 配置
+</details>
 
-使用 JSON，因为 Python 3.10 的标准库没有 `tomllib`（那是 3.11 才有的）。程序只读 JSON。
+## 通知渠道
 
-| 字段 | 含义 |
-| --- | --- |
-| `source.poll_interval_seconds` | `run` 的间隔，默认 600，最小 60 |
-| `source.url` | 默认 AIHOT recent 接口，必须是 https |
-| `state.path` | SQLite 路径，也可用环境变量 `TIBO_STATE_PATH` 覆盖 |
-| `channels.*.enabled` | `false` 的渠道不会发送 |
-| `channels.*.targets[]` | 每个目标有 `name` 和 `kind`：`group`（群）或 `personal`（个人） |
+在 [config.example.json](config.example.json) 中选择渠道，同一渠道可配置多个群聊或个人目标。
 
-飞书群目标使用 `receive_id_type: chat_id`。个人目标使用 `open_id`、`user_id` 或 `email`。Telegram 群是负数 chat id 或公开频道的 `@channelusername`；个人目标是用户的正整数 chat id。两种渠道都可以同时配置群和个人，数量不限。
+| 渠道 | 目标 | 凭据 |
+| --- | --- | --- |
+| 飞书 / Lark | 群聊、个人 | App ID + `TIBO_FEISHU_APP_SECRET` |
+| Telegram | 群组、频道、个人 | `TIBO_TELEGRAM_BOT_TOKEN` |
+| Webhook | 自定义 HTTPS 接收端 | `url_env` 指向的环境变量 |
 
-Webhook 可选。把 URL 放在 `url_env` 指向的环境变量里，请求会带 `Idempotency-Key`。
+<details>
+<summary><strong>飞书 / Lark：创建应用与获取目标 ID</strong></summary>
 
-国际版 Lark 把飞书的 `api_base` 改成 `https://open.larksuite.com`。
+1. 在[飞书开放平台](https://open.feishu.cn/app)或 [Lark](https://open.larksuite.com/app) 创建企业自建应用，启用机器人。
+2. 开通 `im:message:send_as_bot` 权限，创建版本并在企业内发布。
+3. 将 App ID 填入 `app_id`，App Secret 放入 `TIBO_FEISHU_APP_SECRET`。
+4. **群聊**：将机器人加入群聊，填写群 `chat_id`（通常以 `oc_` 开头），`receive_id_type` 使用 `chat_id`。应用可用 tenant token 调用 `GET /open-apis/im/v1/chats` 查询机器人所在群。
+5. **个人**：`receive_id_type` 使用 `open_id`、`user_id` 或 `email`，并填入匹配的 `receive_id`。使用邮箱时，应用还需拥有按邮箱解析租户用户的权限。
 
-## 创建飞书应用
+国际版 Lark 将 `api_base` 设置为 `https://open.larksuite.com`。程序直接调用 Open API，无需安装 `lark-cli`。通知采用 Card JSON 2.0，包含阶段、作者、正文和原帖链接。
 
-1. 打开 [飞书开放平台](https://open.feishu.cn/app)（国际版用 [Lark](https://open.larksuite.com/app)），创建企业自建应用。
-2. 启用机器人能力。
-3. 开通权限「以应用的身份发消息」（`im:message:send_as_bot`）。用邮箱作为个人目标时，还要能按邮箱识别租户内用户。
-4. 创建版本并在本企业发布。把 App ID 填进配置的 `app_id`，把 App Secret 放进 `TIBO_FEISHU_APP_SECRET`。
-5. **群**：把机器人拉进群。`chat_id` 一般以 `oc_` 开头。可用该应用的 tenant token 调用 `GET /open-apis/im/v1/chats` 查看机器人所在的群。群目标的 `receive_id_type` 必须是 `chat_id`。
-6. **个人**：`open_id` 一般以 `ou_` 开头，`user_id` 是企业内用户 id，`email` 是该用户在租户里的邮箱。三选一，写到 `receive_id_type`。
+</details>
 
-本程序直接请求飞书 Open API，不依赖 `lark-cli`。消息是卡片 JSON 2.0：阶段、作者、正文、原帖链接。幂等键放在发送接口的 `uuid` 字段。
+<details>
+<summary><strong>Telegram：创建机器人与获取 chat_id</strong></summary>
 
-## 创建 Telegram 机器人
-
-1. 在 Telegram 里找 [@BotFather](https://t.me/BotFather)，发送 `/newbot`，拿到 token，放进 `TIBO_TELEGRAM_BOT_TOKEN`。
-2. **个人**：用户先打开机器人并按下 Start，否则发送会返回 403。然后在浏览器或 curl 里请求 `getUpdates`（把 token 放在环境变量里，不要贴到聊天或日志）：
+1. 向 [@BotFather](https://t.me/BotFather) 发送 `/newbot`，将 token 放入 `TIBO_TELEGRAM_BOT_TOKEN`。
+2. **个人**：用户先打开机器人并点击 Start，再查询更新：
 
    ```bash
    curl -s "https://api.telegram.org/bot${TIBO_TELEGRAM_BOT_TOKEN}/getUpdates"
    ```
 
-   在返回的 `message.chat.id` 里找到自己的**正整数** id，填到 `kind: personal` 的 `chat_id`。
-3. **群**：把机器人加进群或频道，在群里发一条消息（若开了隐私模式，需要 @ 机器人或暂时关闭隐私模式，这样 `getUpdates` 才看得到）。群和超级群的 id 是负数，超级群经常是 `-100` 开头。公开频道也可以填 `@channelusername`。`kind` 用 `group`。
-4. 只负责发通知时，机器人不需要一直读取群消息。查到 chat id 之后可以重新打开隐私模式。
+   将 `message.chat.id` 的正整数值以字符串填入 `chat_id`，`kind` 使用 `personal`。
+3. **群组 / 频道**：将机器人加入并授予发送权限，让它收到一条消息，再查询 `getUpdates`。群 ID 是负数，超级群通常以 `-100` 开头；公开频道也可使用 `@channelusername`，`kind` 使用 `group`。
+4. 隐私模式下，需向机器人发送它可见的消息（如 @ 机器人）。获得 ID 后可恢复隐私模式，无需持续读取聊天记录。
 
-403（被拉黑或无权发言）和 400 `chat not found` 记为永久失败，并在 `status` / `list` 里给出可读原因。429 会按 `retry_after` 退避。
+403（被拉黑或无权发言）与 400 `chat not found` 会记录为永久失败；429 按 `retry_after` 退避。
 
-## 命令
+</details>
 
-| 命令 | 作用 |
-| --- | --- |
-| `poll` | 跑一轮。适合 cron、systemd timer、Windows 任务计划程序 |
-| `run` | 按配置间隔循环 |
-| `status` | 基线、最近快照、outbox 计数。加 `--json` 输出 JSON |
-| `list` | 已发现的通知及每个目标的投递状态 |
-| `send-test --channel telegram --target example-person` | 给一个目标发测试消息，不代表发生了重置 |
-| `manual --channel feishu --target example-group --event 3` | 重发某条已存储通知（使用新的幂等键） |
-| `manual --text "自定义" --channel telegram --target example-person` | 发送自定义文本 |
-| `manual ... --preview` | 只打印将要发送的内容，不发送 |
+<details>
+<summary><strong>Webhook：连接自定义接收端</strong></summary>
 
-`poll` 在源站拉取失败时返回退出码 1，配置错误返回 2。某个目标投递失败仍返回 0，因为失败已写入 outbox，下一轮会重试。`needs_review` 表示某次发送结果不确定且已停止自动重试；确认对方没收到后，用 `manual` 重发。
+启用 `channels.webhook`，为每个目标填写 `name`、`kind` 和 `url_env`。后者是环境变量名称，变量值为实际的 HTTPS 地址：
 
-## 定时运行
-
-### Linux / macOS cron
-
-```cron
-*/10 * * * * cd /opt/tibo-reset-monitor && . .venv/bin/activate && set -a && . ./.env && set +a && python -m tibo_reset_monitor poll --config /opt/tibo-reset-monitor/config.json
+```bash
+export TIBO_WEBHOOK_EXAMPLE_URL='https://example.com/your-webhook'
 ```
 
-### systemd
+请求携带 `Idempotency-Key`。接收端可据此去重；不要将实际地址直接写入配置文件。
 
-示例单元在 `deploy/systemd/`。`tibo-reset-monitor.service` 是一次性的 `poll`，由 `tibo-reset-monitor.timer` 每 10 分钟触发：
+</details>
+
+## 配置与命令
+
+完整配置见 [config.example.json](config.example.json)，密钥变量示例见 [.env.example](.env.example)。
+
+| 配置项 | 默认值 / 用途 |
+| --- | --- |
+| `source.poll_interval_seconds` | `600`，最小 `60`；控制 `run` 的轮询间隔 |
+| `source.url` | AIHOT recent 接口，必须使用 HTTPS |
+| `state.path` | `state/monitor.sqlite3`；可用 `TIBO_STATE_PATH` 覆盖 |
+| `logging.level` / `logging.file` | 示例配置为 `INFO` / `logs/monitor.log` |
+| `channels.*.enabled` | 是否启用该渠道 |
+| `channels.*.targets` | 通知目标列表；每个目标包含 `name` 与 `kind` |
+
+命令默认读取当前目录的 `config.json`；指定其他文件时使用 `tibo-reset-monitor --config PATH <command>`。
+
+| 子命令 | 用途 |
+| --- | --- |
+| `poll` | 拉取一轮并投递到期通知 |
+| `run` | 按配置间隔持续运行 |
+| `status --json` | 查看基线、快照和 outbox 计数 |
+| `list --limit 20` | 查看通知及各目标的投递状态；支持 `--json` |
+| `send-test --channel telegram --target example-person` | 向指定目标发送测试消息 |
+| `manual --channel feishu --target example-group --event 3` | 以新幂等键重发已保存的通知 |
+| `manual --channel telegram --target example-person --text "hello" --preview` | 预览自定义消息，不发送 |
+
+示例中的目标名称需与配置一致；事件 ID 从 `list` 获取。`poll` 拉取失败时退出码为 `1`，配置错误为 `2`；单个目标投递失败仍为 `0`，失败状态可通过 `list` 查看。
+
+## 部署
+
+选择一种运行方式。使用同一个状态库时，只运行一个 `poll` / `run` 进程。
+
+<details>
+<summary><strong>Docker</strong></summary>
+
+先完成本地 `config.json` 和 `.env` 配置，并将 `logging.file` 设为 `/data/monitor.log`，使容器用户能在挂载卷中写日志。
+
+```bash
+docker build -t tibo-reset-monitor .
+docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
+```
+
+镜像默认执行 `run`，通过 `TIBO_STATE_PATH` 将数据库写入 `/data/monitor.sqlite3`，命名卷 `tibo-state` 保存状态。
+
+</details>
+
+<details>
+<summary><strong>Linux / macOS：cron</strong></summary>
+
+假设项目位于 `/opt/tibo-reset-monitor`，已安装虚拟环境并填好 `.env`：
+
+```cron
+*/10 * * * * cd /opt/tibo-reset-monitor && set -a && . ./.env && set +a && .venv/bin/python -m tibo_reset_monitor --config /opt/tibo-reset-monitor/config.json poll
+```
+
+每 10 分钟执行一轮。相对状态路径以项目目录为基准。
+
+</details>
+
+<details>
+<summary><strong>Linux：systemd</strong></summary>
+
+单元文件见 [service](deploy/systemd/tibo-reset-monitor.service) 和 [timer](deploy/systemd/tibo-reset-monitor.timer)。安装前，将示例 service 中的 `ExecStart` 调整为以下参数顺序：
+
+```ini
+ExecStart=/opt/tibo-reset-monitor/.venv/bin/python -m tibo_reset_monitor --config /opt/tibo-reset-monitor/config.json poll
+```
+
+确认 `WorkingDirectory`、`EnvironmentFile` 和安装路径匹配，再安装：
 
 ```bash
 sudo cp deploy/systemd/tibo-reset-monitor.service deploy/systemd/tibo-reset-monitor.timer /etc/systemd/system/
@@ -130,54 +239,65 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now tibo-reset-monitor.timer
 ```
 
-也可以把 `ExecStart` 改成 `run`，做成常驻服务。不要同时跑 timer 和常驻进程。
+service 每次执行一次 `poll`，timer 每 10 分钟触发。使用常驻 `run` 时，不再同时启用 timer。
 
-### Windows 任务计划程序
+</details>
 
-```bat
-schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_monitor poll --config C:\tibo-reset-monitor\config.json"
-```
+<details>
+<summary><strong>Windows：任务计划程序</strong></summary>
 
-在任务的环境里设置 `TIBO_FEISHU_APP_SECRET` 和 `TIBO_TELEGRAM_BOT_TOKEN`。工作目录设为项目目录，这样相对的 `state/` 路径才稳定。
+假设项目位于 `C:\tibo_reset_monitor`，创建每 10 分钟运行一次的任务，操作项设置如下：
 
-### Docker
+| 字段 | 值 |
+| --- | --- |
+| 程序或脚本 | `C:\tibo_reset_monitor\.venv\Scripts\python.exe` |
+| 添加参数 | `-m tibo_reset_monitor --config C:\tibo_reset_monitor\config.json poll` |
+| 起始于 | `C:\tibo_reset_monitor` |
 
-```bash
-docker build -t tibo-reset-monitor .
-docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
-```
+为执行任务的账户设置启用渠道所需的环境变量。任务不会自动加载 `.env`；固定工作目录可避免相对状态路径漂移。
 
-镜像默认执行 `run`。状态库在 `/data`（由 `TIBO_STATE_PATH` 指定）。
+</details>
 
-## 增加一个渠道
+## 常见问题
 
-看 [docs/adding-a-channel.md](docs/adding-a-channel.md)。核心（`src/tibo_reset_monitor/core/`）不导入任何渠道。新渠道是 `channels/` 里的一个文件，加上 `channels/__init__.py` 里的一行注册。
+<details>
+<summary><strong>启动后没收到通知，是配置有问题吗？</strong></summary>
 
-## 开发
+首次成功拉取只记录基线，不补发过去 7 天的帖子。新增目标也只接收加入后发现的动态。使用 `status` 确认拉取状态，用 `send-test` 检查渠道；确需重发旧通知时使用 `manual --event`。
+
+</details>
+
+<details>
+<summary><strong>群聊收到了，个人消息没收到，怎么排查？</strong></summary>
+
+使用 `list` 查看各目标状态。Telegram 用户需先点击 Start；飞书个人 ID 必须与 `receive_id_type` 匹配，群聊中需有机器人。一个目标失败不影响其他目标。
+
+</details>
+
+<details>
+<summary><strong>去重、重试与撤回如何处理？</strong></summary>
+
+- 以“帖子 ID + 阶段”识别新动态，同一帖子同时出现在事件列表和活动流时只通知一次。无关闲聊 `related` 与故障提示 `outage` 不发送。
+- 每个事件与目标有独立的 outbox 记录、幂等键、回执和重试状态。明确失败按退避策略重试。
+- 超时等结果不确定的投递继续使用同一个幂等键；从首次不确定结果起约 55 分钟后转为 `needs_review`。确认对方未收到后再用 `manual` 重发。
+- 撤回会取消尚未发出的通知；已送达的消息不收回，撤回本身仍会通知。
+- `304 Not Modified` 不修改快照。拉取失败、限流或响应格式错误时，保留上一份有效快照。
+- 状态库中的短锁用于跳过重叠轮询，不能据此部署多个常驻进程。
+
+</details>
+
+## 参与贡献
+
+欢迎提交 Issue 或 Pull Request。开发约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，扩展通知渠道见[渠道开发指南](docs/adding-a-channel.md)。
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions 在 Python 3.10–3.13 上跑同一套测试。测试使用假的 HTTP 传输，不访问飞书或 Telegram。
+CI 在 Python 3.10–3.13 上运行测试。测试使用模拟 HTTP 传输，不调用真实飞书或 Telegram 服务。
 
-## 常见问题
+## 数据来源与许可
 
-**为什么启动后没有把过去一周的重置都推送出来？**  
-第一次成功拉取只记基线。这是故意的，避免把历史记录刷进群里。
+公开动态来自 [AIHOT](https://aihot.news) 的 [recent 接口](https://aihot.news/api/v1/codex-resets/recent)，覆盖最近 7 天。接口支持 `ETag` / `If-None-Match`、gzip 与限流 `Retry-After`；结构见 [OpenAPI](https://aihot.news/openapi-v1.json)，使用条款见 [AIHOT Terms](https://aihot.news/terms)。公告作者为 [Tibo（@thsottiaux）](https://x.com/thsottiaux)。
 
-**新增了一个个人目标，为什么没有补发？**  
-目标只接收它加入配置之后新发现的事件。需要旧消息时用 `manual --event`。
-
-**群里收到了，私聊没有？**  
-看 `list`。Telegram 个人聊天要先按 Start。飞书机器人要在群里，个人 id 的类型要和 `receive_id_type` 一致。一个目标失败不会取消其他目标。
-
-**`needs_review` 是什么？**  
-发送超时后，程序无法确定对方是否已经收下。它会用同一个幂等键再试一段时间，大约 55 分钟后停止，避免飞书去重窗口结束后变成重复消息。确认没收到再用 `manual` 重发。
-
-**确认时间是到账时间吗？**  
-不是。AIHOT 的 `confirmedAt` 和这里展示的时间都是来源帖子的发布时间。账户里额度何时到账，以产品内显示为准。估计落地窗口来自接口里的 `estimate` / `schedule`，也不是账户回执。
-
-## 许可
-
-MIT，版权所有者 LFenX，2026。见 [LICENSE](LICENSE)。
+[MIT License](LICENSE) · Copyright © 2026 LFenX
