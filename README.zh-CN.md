@@ -17,8 +17,14 @@
 </p>
 
 <p align="center">
-  <a href="docs/usage.zh-CN.md">开始使用</a> · <a href="docs/chat-setup.md">机器人配置</a> · <a href="docs/webhook.md">Webhook</a>
+  <a href="#交给-agent">交给 Agent</a> · <a href="docs/usage.zh-CN.md">开始使用</a> · <a href="docs/chat-setup.md">机器人配置</a> · <a href="docs/webhook.md">Webhook</a>
 </p>
+
+## 交给 Agent
+
+把下面的提示词发给你的 Agent：
+
+> 请帮我在当前机器部署 https://github.com/LFenX/tibo_reset_monitor 。先阅读 README 和使用指南，检查环境并复用已有配置。仅补问缺失的通知渠道、语言和时区，引导我完成账号操作，并将必要密钥写入本地环境变量。完成依赖安装、配置和启动，验证监控状态，并告诉我如何在机器人中订阅。
 
 ## 开始使用
 

@@ -17,8 +17,14 @@
 </p>
 
 <p align="center">
-  <a href="docs/usage.md">Get started</a> · <a href="docs/chat-setup.md#chat-control">Bot setup</a> · <a href="docs/webhook.md">Webhook</a>
+  <a href="#agent-setup">Agent setup</a> · <a href="docs/usage.md">Get started</a> · <a href="docs/chat-setup.md#chat-control">Bot setup</a> · <a href="docs/webhook.md">Webhook</a>
 </p>
+
+## Agent setup
+
+Copy this prompt to your agent:
+
+> Set up https://github.com/LFenX/tibo_reset_monitor on this machine. Read its README and user guide, inspect the environment, and reuse any existing configuration. Ask only for missing channel, language and time zone choices; guide me through account steps and setting required secrets in local environment variables. Install the dependencies, configure and start the monitor, verify its status, and explain how to subscribe.
 
 ## Get started
 
