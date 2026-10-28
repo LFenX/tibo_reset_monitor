@@ -25,6 +25,7 @@ tibo-reset-monitor = "tibo_reset_monitor.cli:main"
 
 [project.optional-dependencies]
 calendar = ["Pillow>=10"]
+feishu-bot = ["lark-oapi>=1.4.0"]
 
 [project.urls]
 Homepage = "https://github.com/LFenX/tibo_reset_monitor"

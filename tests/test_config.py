@@ -322,6 +322,42 @@ class ConfigTest(unittest.TestCase):
             webhook = next(channel for channel in config.channels if channel.name == "webhook")
             self.assertEqual(webhook.targets[0].options["secret_env"], "TIBO_WEBHOOK_EXAMPLE_SECRET")
 
+    def test_chat_control_allows_empty_targets(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(
+                _write(
+                    Path(tmp),
+                    {
+                        "channels": {
+                            "telegram": {
+                                "enabled": True,
+                                "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                                "chat_control": True,
+                                "admins": ["424242"],
+                                "targets": [],
+                            },
+                            "feishu": {
+                                "enabled": True,
+                                "app_id": "cli_example",
+                                "app_secret_env": "TIBO_FEISHU_APP_SECRET",
+                                "targets": [],
+                            },
+                        }
+                    },
+                )
+            )
+        telegram = next(channel for channel in config.channels if channel.name == "telegram")
+        feishu = next(channel for channel in config.channels if channel.name == "feishu")
+        self.assertEqual(telegram.targets, [])
+        self.assertEqual(telegram.settings["chat_control"], "true")
+        self.assertEqual(telegram.settings["admins"], "424242")
+        self.assertEqual(feishu.settings["chat_control"], "true")
+        self.assertEqual(feishu.settings["allow_self_subscribe"], "false")
+        minimal = load_config(ROOT / "config.minimal.example.json", environ={})
+        self.assertEqual(next(channel for channel in minimal.channels if channel.name == "telegram").targets, [])
+
 
 if __name__ == "__main__":
     unittest.main()

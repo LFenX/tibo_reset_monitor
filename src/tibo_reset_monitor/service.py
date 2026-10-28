@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -121,6 +122,8 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
     if not runtime.store.acquire_lock(runtime.owner, now, runtime.config.stale_lock_seconds):
         log.error("another monitor process is running")
         return 1
+    stop_chat = threading.Event()
+    _start_chat_control(runtime, stop_chat)
     try:
         while True:
             runtime.store.acquire_lock(runtime.owner, runtime.clock.now(), runtime.config.stale_lock_seconds)
@@ -143,7 +146,68 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
         log.info("stopped")
         return 0
     finally:
+        stop_chat.set()
         runtime.store.release_lock(runtime.owner)
+
+
+def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
+    """Listen for Telegram and Feishu commands without blocking the poll loop."""
+    from tibo_reset_monitor.channels.feishu_inbox import collaborator_open_ids, list_bot_chats, start_feishu_listener
+    from tibo_reset_monitor.channels.telegram_inbox import TelegramInbox
+    from tibo_reset_monitor.core.chat import ChatController, PairingGate, issue_pairing_code
+
+    for channel in runtime.channels:
+        settings = getattr(channel, "settings", None) or {}
+        if not isinstance(settings, dict) or settings.get("chat_control", "true") != "true":
+            continue
+        if channel.name not in {"telegram", "feishu"}:
+            continue
+        admins = tuple(part for part in str(settings.get("admins", "")).split(",") if part)
+        pairing = PairingGate()
+        catalog = None
+        extra = None
+        if channel.name == "feishu":
+            catalog = lambda channel=channel: list_bot_chats(channel)
+            if not admins:
+                extra = lambda channel=channel: collaborator_open_ids(channel)
+        controller = ChatController(
+            runtime.store,
+            runtime.clock,
+            channel=channel.name,
+            language=str(settings.get("language", runtime.config.language)),
+            admins=admins,
+            allow_self_subscribe=settings.get("allow_self_subscribe") == "true",
+            group_catalog=catalog,
+            pairing=pairing,
+            extra_admins=extra,
+        )
+        if channel.name == "telegram":
+            if not admins and not runtime.store.chat_admin_ids("telegram"):
+                issue_pairing_code(pairing, runtime.clock.now())
+            inbox = TelegramInbox(channel, controller, channel._transport)
+            inbox.register_commands()
+
+            def loop(inbox: TelegramInbox = inbox) -> None:
+                while not stop.is_set():
+                    try:
+                        inbox.poll_once()
+                    except Exception as exc:
+                        log.warning("telegram chat control failed: %s", type(exc).__name__)
+                    stop.wait(1)
+
+            threading.Thread(target=loop, name="telegram-chat", daemon=True).start()
+        else:
+            client = start_feishu_listener(channel, controller)
+            if client is None:
+                continue
+
+            def feishu_loop(client: Any = client) -> None:
+                try:
+                    client.start()
+                except Exception as exc:
+                    log.warning("feishu chat control stopped: %s", type(exc).__name__)
+
+            threading.Thread(target=feishu_loop, name="feishu-chat", daemon=True).start()
 
 
 def status_text(runtime: Runtime, *, as_json: bool) -> str:

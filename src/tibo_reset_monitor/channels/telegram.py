@@ -31,10 +31,13 @@ _TAG_RE = re.compile(r"<[^>]+>")
 
 class TelegramChannel:
     name = "telegram"
+    supports_chat = True
 
     def __init__(self, spec: ChannelSpec, transport: Any, clock: Any) -> None:
         del clock
         self.targets = list(spec.targets)
+        self.settings = spec.settings
+        self.supports_chat = True
         self._transport = transport
         self._api_base = spec.settings.get("api_base", "https://api.telegram.org").rstrip("/")
         self._token_env = spec.settings.get("bot_token_env", "TIBO_TELEGRAM_BOT_TOKEN")

@@ -24,9 +24,12 @@ from tibo_reset_monitor.core.source import parse_retry_after
 
 class WebhookChannel:
     name = "webhook"
+    supports_chat = False
 
     def __init__(self, spec: ChannelSpec, transport: Any, clock: Any) -> None:
         self.targets = list(spec.targets)
+        self.settings = spec.settings
+        self.supports_chat = False
         self._transport = transport
         self._clock = clock
         self._language = normalize_language(spec.settings.get("language"))

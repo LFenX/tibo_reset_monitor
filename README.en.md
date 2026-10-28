@@ -279,6 +279,12 @@ function verify(secret, body, timestamp, signature, windowSec = 300) {
 }
 ```
 
+## Turn notifications on by talking to the bot
+
+You do not have to edit `targets` by hand. `chat_control` defaults to on, and `targets` may be an empty array. The smallest file is [`config.minimal.example.json`](config.minimal.example.json). Creating the bot, the first pairing, the command list, and common errors are in [docs/chat-setup.md](docs/chat-setup.md).
+
+Telegram listens with `getUpdates` inside `run`. That cannot run while a webhook is set; the log says to delete the webhook. When there is no admin yet, startup prints a one-time pairing code on stdout. Send `/pair <code>` in a direct chat. Feishu listening needs the optional `pip install '.[feishu-bot]'`. Without it, configured targets still receive notifications and the log says chat control is off.
+
 ## Docker and background runs
 
 The image is Python 3.12 and installs Pillow, WenQuanYi Micro Hei, and DejaVu Sans. Chinese calendars use the CJK font. English calendars use DejaVu. The database is `/data`.

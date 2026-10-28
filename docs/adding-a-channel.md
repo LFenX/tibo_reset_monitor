@@ -33,6 +33,17 @@ Read secrets from environment variables named in the config. Do not log tokens o
 
 The built-in webhook documents its body, `Idempotency-Key`, and optional HMAC in [webhook.md](webhook.md). A new channel that signs requests should sign the bytes it actually sends and keep the secret out of logs, the state database, and error text.
 
+## Chat control
+
+Subscriptions made by talking to the bot live in the state database (`subscription`) and are merged with static `targets` at send time. Do not rewrite the user's config file. A new channel joins this by:
+
+1. Setting `supports_chat = True` on the channel class.
+2. Turning each inbound event into `tibo_reset_monitor.core.chat.Inbound` with only `event_id`, chat id, user id, text, and optional membership or migration fields. Do not store the raw payload or any token.
+3. Calling `ChatController.handle(inbound)` and sending the `Reply` yourself.
+4. Supplying `group_catalog()` when the platform can list groups the bot is in. Otherwise the controller uses chats recorded from membership updates.
+
+Command names, the one-minute picker, admin checks, and subscription rows are shared. Put new reply sentences in `core/i18n.py` (`chat_text`) for both `zh` and `en`. `tests/test_chat.py` renders help for every registered channel that sets `supports_chat`.
+
 ## Steps
 
 1. Add `src/tibo_reset_monitor/channels/your_channel.py`.

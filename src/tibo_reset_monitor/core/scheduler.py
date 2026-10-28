@@ -13,6 +13,8 @@ from typing import Any, Protocol, Sequence
 from tibo_reset_monitor.core.dedupe import extract_notices
 from tibo_reset_monitor.core.model import (
     INFLIGHT,
+    PERMANENT,
+    SENT,
     CycleReport,
     Receipt,
     Target,
@@ -79,7 +81,7 @@ def run_cycle(
                     store.note_fetch("baseline", None, now)
                     log.info("baseline recorded %s source posts; no notifications sent", count)
                 else:
-                    created, cancelled = store.ingest(notices, _targets(channels), result.body, result.etag, now)
+                    created, cancelled = store.ingest(notices, effective_targets(channels, store), result.body, result.etag, now)
                     report.new_notices = len(created)
                     report.cancelled = cancelled
                     store.note_fetch("ok", None, now)
@@ -112,7 +114,7 @@ def deliver_due(
             )
             continue
         channel = by_name.get(row.channel)
-        target = _find_target(channel, row.target_key) if channel else None
+        target = _find_target(channel, row.target_key, store) if channel else None
         if channel is None or target is None:
             when = now + timedelta(seconds=600)
             store.defer(row.id, when, "target is not in the current config")
@@ -128,6 +130,17 @@ def deliver_due(
         decided_at = clock.now()
         decision = on_receipt(claimed.state, receipt, decided_at)
         store.apply_state(claimed.id, decision, decided_at)
+        if target is not None and target.options.get("subscription") == "1":
+            if decision.status == SENT:
+                store.record_subscription_result(claimed.channel, claimed.target_key, ok=True, detail="", now=decided_at)
+            elif decision.status == PERMANENT:
+                store.record_subscription_result(
+                    claimed.channel,
+                    claimed.target_key,
+                    ok=False,
+                    detail=decision.last_error or decision.receipt_detail or "permanent delivery failure",
+                    now=decided_at,
+                )
         store.conn.commit()
         reports.append(_delivery_report(claimed.channel, claimed.target_key, decision.status, decision.last_error or decision.receipt_detail or ""))
         log.info(
@@ -166,17 +179,35 @@ def _recover(store: StateStore, now: Any) -> None:
     log.warning("recovered %s in-flight deliveries as ambiguous", len(rows))
 
 
-def _targets(channels: Sequence[ChannelAdapter]) -> list[Target]:
+def effective_targets(channels: Sequence[ChannelAdapter], store: StateStore) -> list[Target]:
+    """Static config targets plus active chat subscriptions. The same address is kept once."""
     found: list[Target] = []
+    seen: set[tuple[str, str]] = set()
     for channel in channels:
-        found.extend(channel.targets)
+        settings = getattr(channel, "settings", {}) or {}
+        language = settings.get("language", "zh") if isinstance(settings, dict) else "zh"
+        timezone_name = settings.get("timezone", "UTC") if isinstance(settings, dict) else "UTC"
+        for target in channel.targets:
+            found.append(target)
+            seen.add((target.channel, target.address))
+        for target in store.subscription_targets(channel.name, language, timezone_name):
+            if (target.channel, target.address) in seen:
+                continue
+            found.append(target)
+            seen.add((target.channel, target.address))
     return found
 
 
-def _find_target(channel: ChannelAdapter | None, key: str) -> Target | None:
+def _find_target(channel: ChannelAdapter | None, key: str, store: StateStore) -> Target | None:
     if channel is None:
         return None
     for target in channel.targets:
+        if target.key == key:
+            return target
+    settings = getattr(channel, "settings", {}) or {}
+    language = settings.get("language", "zh") if isinstance(settings, dict) else "zh"
+    timezone_name = settings.get("timezone", "UTC") if isinstance(settings, dict) else "UTC"
+    for target in store.subscription_targets(channel.name, language, timezone_name):
         if target.key == key:
             return target
     return None

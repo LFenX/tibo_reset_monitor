@@ -75,6 +75,47 @@ CREATE TABLE IF NOT EXISTS process_lock (
     owner TEXT NOT NULL,
     acquired_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS subscription (
+    channel TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    address TEXT NOT NULL,
+    target_key TEXT NOT NULL UNIQUE,
+    display_name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    stop_reason TEXT,
+    permanent_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, kind, address)
+);
+CREATE TABLE IF NOT EXISTS known_chat (
+    channel TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (channel, chat_id)
+);
+CREATE TABLE IF NOT EXISTS chat_session (
+    channel TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    candidates_json TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY (channel, user_id)
+);
+CREATE TABLE IF NOT EXISTS chat_admin (
+    channel TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (channel, user_id)
+);
+CREATE TABLE IF NOT EXISTS inbound_seen (
+    channel TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY (channel, event_id)
+);
 CREATE TABLE IF NOT EXISTS history_snapshot (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     etag TEXT,
@@ -576,6 +617,289 @@ class StateStore:
             state=state,
             notice=notice,
         )
+
+
+    def claim_inbound(self, channel: str, event_id: str, now: datetime) -> bool:
+        """Return False when this update or message was already handled."""
+        try:
+            with self.transaction():
+                self.conn.execute(
+                    "INSERT INTO inbound_seen(channel, event_id, seen_at) VALUES (?, ?, ?)",
+                    (channel, event_id, format_utc(now)),
+                )
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def is_chat_admin(self, channel: str, user_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM chat_admin WHERE channel = ? AND user_id = ?",
+            (channel, user_id),
+        ).fetchone()
+        return row is not None
+
+    def add_chat_admin(self, channel: str, user_id: str, now: datetime) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO chat_admin(channel, user_id, created_at) VALUES (?, ?, ?)
+            ON CONFLICT(channel, user_id) DO NOTHING
+            """,
+            (channel, user_id, format_utc(now)),
+        )
+        self.conn.commit()
+
+    def chat_admin_ids(self, channel: str) -> list[str]:
+        rows = self.conn.execute("SELECT user_id FROM chat_admin WHERE channel = ? ORDER BY user_id", (channel,)).fetchall()
+        return [str(row["user_id"]) for row in rows]
+
+    def remember_chat(self, channel: str, chat_id: str, title: str, status: str, now: datetime) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO known_chat(channel, chat_id, title, status, updated_at) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(channel, chat_id) DO UPDATE SET
+                title = excluded.title,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            (channel, chat_id, title or chat_id, status, format_utc(now)),
+        )
+        self.conn.commit()
+
+    def known_chats(self, channel: str, *, status: str = "joined") -> list[tuple[str, str]]:
+        rows = self.conn.execute(
+            "SELECT chat_id, title FROM known_chat WHERE channel = ? AND status = ? ORDER BY title, chat_id",
+            (channel, status),
+        ).fetchall()
+        return [(str(row["chat_id"]), str(row["title"])) for row in rows]
+
+    def migrate_chat(self, channel: str, old_id: str, new_id: str, now: datetime) -> None:
+        """Point a group subscription and its pending deliveries at the new chat id."""
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT title, status FROM known_chat WHERE channel = ? AND chat_id = ?",
+                (channel, old_id),
+            ).fetchone()
+            title = str(row["title"]) if row else new_id
+            self.conn.execute("DELETE FROM known_chat WHERE channel = ? AND chat_id = ?", (channel, old_id))
+            self.conn.execute(
+                """
+                INSERT INTO known_chat(channel, chat_id, title, status, updated_at) VALUES (?, ?, ?, 'joined', ?)
+                ON CONFLICT(channel, chat_id) DO UPDATE SET title = excluded.title, status = 'joined', updated_at = excluded.updated_at
+                """,
+                (channel, new_id, title, format_utc(now)),
+            )
+            sub = self.conn.execute(
+                "SELECT target_key, display_name, kind, status, stop_reason, permanent_failures, created_at FROM subscription WHERE channel = ? AND address = ?",
+                (channel, old_id),
+            ).fetchone()
+            if sub is None:
+                return
+            new_key = _subscription_key(channel, str(sub["kind"]), new_id)
+            self.conn.execute(
+                """
+                UPDATE subscription
+                SET address = ?, target_key = ?, updated_at = ?
+                WHERE channel = ? AND address = ?
+                """,
+                (new_id, new_key, format_utc(now), channel, old_id),
+            )
+            self.conn.execute(
+                "UPDATE outbox SET target_key = ?, updated_at = ? WHERE channel = ? AND target_key = ?",
+                (new_key, format_utc(now), channel, str(sub["target_key"])),
+            )
+
+    def subscribe(
+        self,
+        *,
+        channel: str,
+        kind: str,
+        address: str,
+        display_name: str,
+        now: datetime,
+    ) -> tuple[str, bool]:
+        """Activate a subscription. The bool is False when it was already active."""
+        key = _subscription_key(channel, kind, address)
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT status FROM subscription WHERE channel = ? AND kind = ? AND address = ?",
+                (channel, kind, address),
+            ).fetchone()
+            if existing is not None and str(existing["status"]) == "active":
+                return key, False
+            self.conn.execute(
+                """
+                INSERT INTO subscription(
+                    channel, kind, address, target_key, display_name, status, stop_reason,
+                    permanent_failures, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'active', NULL, 0, ?, ?)
+                ON CONFLICT(channel, kind, address) DO UPDATE SET
+                    target_key = excluded.target_key,
+                    display_name = excluded.display_name,
+                    status = 'active',
+                    stop_reason = NULL,
+                    permanent_failures = 0,
+                    updated_at = excluded.updated_at
+                """,
+                (channel, kind, address, key, display_name or address, format_utc(now), format_utc(now)),
+            )
+        return key, True
+
+    def unsubscribe(self, channel: str, kind: str, address: str, now: datetime, *, reason: str) -> str | None:
+        """Stop one subscription and cancel its unsent deliveries. Returns the target key."""
+        with self.transaction():
+            row = self.conn.execute(
+                "SELECT target_key FROM subscription WHERE channel = ? AND kind = ? AND address = ? AND status = 'active'",
+                (channel, kind, address),
+            ).fetchone()
+            if row is None:
+                return None
+            key = str(row["target_key"])
+            self.conn.execute(
+                """
+                UPDATE subscription
+                SET status = 'stopped', stop_reason = ?, updated_at = ?
+                WHERE channel = ? AND target_key = ?
+                """,
+                (reason, format_utc(now), channel, key),
+            )
+            self._cancel_target_pending(channel, key, now, reason)
+        return key
+
+    def subscriptions(self, channel: str) -> list[dict[str, str]]:
+        rows = self.conn.execute(
+            """
+            SELECT kind, address, target_key, display_name, status, stop_reason
+            FROM subscription WHERE channel = ? ORDER BY kind, display_name, address
+            """,
+            (channel,),
+        ).fetchall()
+        return [
+            {
+                "kind": str(row["kind"]),
+                "address": str(row["address"]),
+                "target_key": str(row["target_key"]),
+                "display_name": str(row["display_name"]),
+                "status": str(row["status"]),
+                "stop_reason": str(row["stop_reason"] or ""),
+            }
+            for row in rows
+        ]
+
+    def subscription_targets(self, channel: str, language: str, timezone_name: str) -> list[Target]:
+        rows = self.conn.execute(
+            """
+            SELECT kind, address, target_key, display_name
+            FROM subscription WHERE channel = ? AND status = 'active'
+            """,
+            (channel,),
+        ).fetchall()
+        found: list[Target] = []
+        for row in rows:
+            kind = str(row["kind"])
+            options = {
+                "language": language,
+                "timezone": timezone_name,
+                "subscription": "1",
+                "display_name": str(row["display_name"]),
+            }
+            if channel == "feishu":
+                options["receive_id_type"] = "open_id" if kind == "personal" else "chat_id"
+            found.append(
+                Target(
+                    channel=channel,
+                    key=str(row["target_key"]),
+                    kind=kind,
+                    address=str(row["address"]),
+                    options=options,
+                )
+            )
+        return found
+
+    def record_subscription_result(self, channel: str, target_key: str, *, ok: bool, detail: str, now: datetime) -> bool:
+        """Count consecutive permanent failures. Three stops the subscription."""
+        row = self.conn.execute(
+            "SELECT permanent_failures, status FROM subscription WHERE channel = ? AND target_key = ?",
+            (channel, target_key),
+        ).fetchone()
+        if row is None or str(row["status"]) != "active":
+            return False
+        if ok:
+            self.conn.execute(
+                "UPDATE subscription SET permanent_failures = 0, updated_at = ? WHERE channel = ? AND target_key = ?",
+                (format_utc(now), channel, target_key),
+            )
+            self.conn.commit()
+            return False
+        failures = int(row["permanent_failures"]) + 1
+        if failures < 3:
+            self.conn.execute(
+                "UPDATE subscription SET permanent_failures = ?, updated_at = ? WHERE channel = ? AND target_key = ?",
+                (failures, format_utc(now), channel, target_key),
+            )
+            self.conn.commit()
+            return False
+        reason = detail or "permanent delivery failure"
+        with self.transaction():
+            self.conn.execute(
+                """
+                UPDATE subscription
+                SET status = 'stopped', stop_reason = ?, permanent_failures = ?, updated_at = ?
+                WHERE channel = ? AND target_key = ?
+                """,
+                (reason[:300], failures, format_utc(now), channel, target_key),
+            )
+            self._cancel_target_pending(channel, target_key, now, reason[:300])
+        return True
+
+    def save_session(self, channel: str, user_id: str, action: str, candidates: list[dict[str, str]], expires_at: datetime) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO chat_session(channel, user_id, action, candidates_json, expires_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(channel, user_id) DO UPDATE SET
+                action = excluded.action,
+                candidates_json = excluded.candidates_json,
+                expires_at = excluded.expires_at
+            """,
+            (channel, user_id, action, json.dumps(candidates, ensure_ascii=False), format_utc(expires_at)),
+        )
+        self.conn.commit()
+
+    def load_session(self, channel: str, user_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT action, candidates_json, expires_at FROM chat_session WHERE channel = ? AND user_id = ?",
+            (channel, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            candidates = json.loads(row["candidates_json"])
+        except json.JSONDecodeError:
+            candidates = []
+        return {"action": str(row["action"]), "candidates": candidates, "expires_at": str(row["expires_at"])}
+
+    def clear_session(self, channel: str, user_id: str) -> None:
+        self.conn.execute("DELETE FROM chat_session WHERE channel = ? AND user_id = ?", (channel, user_id))
+        self.conn.commit()
+
+    def _cancel_target_pending(self, channel: str, target_key: str, now: datetime, reason: str) -> None:
+        statuses = tuple(CANCELLABLE_STATUSES)
+        placeholders = ",".join("?" for _ in statuses)
+        self.conn.execute(
+            f"""
+            UPDATE outbox
+            SET status = 'cancelled', next_attempt_at = NULL, last_error = ?, updated_at = ?
+            WHERE channel = ? AND target_key = ? AND status IN ({placeholders})
+            """,
+            (reason[:300], format_utc(now), channel, target_key, *statuses),
+        )
+
+
+def _subscription_key(channel: str, kind: str, address: str) -> str:
+    import hashlib
+
+    digest = hashlib.sha256(f"{channel}|{kind}|{address}".encode("utf-8")).hexdigest()[:16]
+    return f"sub-{digest}"
 
 
 class _Transaction:

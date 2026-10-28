@@ -279,6 +279,12 @@ function verify(secret, body, timestamp, signature, windowSec = 300) {
 }
 ```
 
+## 和机器人对话来开关通知
+
+不必手改 `targets`。`chat_control` 默认开启，`targets` 可以是空数组。最小示例是 [`config.minimal.example.json`](config.minimal.example.json)。从创建机器人到第一次配对的步骤、指令表和排错写在 [docs/chat-setup.md](docs/chat-setup.md)。
+
+Telegram 在 `run` 里用 `getUpdates` 收消息。如果机器人已经设置了 webhook，两者不能同时用，日志会提示先删除 webhook。没有任何管理员时，启动会在标准输出打印一次性配对码，在单聊里发送 `/pair <码>`。飞书收消息需要可选依赖 `pip install '.[feishu-bot]'`；不安装时仍按配置里的 targets 发送，并在日志里说明对话管理已关闭。
+
 ## Docker 与后台运行
 
 镜像基于 Python 3.12，并安装了 Pillow、文泉驿微米黑和 DejaVu Sans。中文日历用中文字体，英文日历用 DejaVu。状态库在 `/data`。

@@ -33,9 +33,12 @@ _TOKEN_CODES = {99991661, 99991663, 99991668}
 
 class FeishuChannel:
     name = "feishu"
+    supports_chat = True
 
     def __init__(self, spec: ChannelSpec, transport: Any, clock: Any) -> None:
         self.targets = list(spec.targets)
+        self.settings = spec.settings
+        self.supports_chat = True
         self._transport = transport
         self._clock = clock
         self._api_base = spec.settings.get("api_base", "https://open.feishu.cn").rstrip("/")

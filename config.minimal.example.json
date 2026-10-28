@@ -1,0 +1,18 @@
+{
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+      "chat_control": true,
+      "targets": []
+    },
+    "feishu": {
+      "enabled": true,
+      "app_id": "cli_example_not_a_real_app_id",
+      "app_secret_env": "TIBO_FEISHU_APP_SECRET",
+      "chat_control": true,
+      "admins": [],
+      "targets": []
+    }
+  }
+}

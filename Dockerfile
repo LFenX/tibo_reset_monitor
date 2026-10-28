@@ -13,7 +13,7 @@ ENV TIBO_STATE_PATH=/data/monitor.sqlite3
 # Without Pillow, Telegram still sends one text message and Feishu sends the card without an image.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fonts-wqy-microhei fonts-dejavu-core tzdata \
-    && pip install --no-cache-dir 'Pillow>=10' \
+    && pip install --no-cache-dir 'Pillow>=10' 'lark-oapi>=1.4.0' \
     && rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --uid 10001 monitor \

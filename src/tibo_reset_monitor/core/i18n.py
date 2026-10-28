@@ -476,3 +476,110 @@ def _replace_fragments(text: str) -> str:
     for source, target in _SCOPE_FRAGMENTS:
         text = text.replace(source, target)
     return re.sub(r"\s+", " ", text).strip()
+
+
+_CHAT = {
+    "zh": {
+        "help": (
+            "可用指令：\n"
+            "/subscribe（#开启单聊通知）开启自己的单聊通知\n"
+            "/unsubscribe（#关闭单聊通知）关闭自己的单聊通知\n"
+            "/addgroup（#添加群聊）从机器人已加入的群里选择\n"
+            "/removegroup（#移除群聊，也可写 #取消群聊 / #取消通知）停止一个群\n"
+            "/cancel（#取消）退出当前选择\n"
+            "/status（#状态）查看订阅\n"
+            "在群里发送 /subscribe 可直接订阅该群。\n"
+            "首次使用可在单聊发送 /pair <配对码>。"
+        ),
+        "denied": "只有管理员可以管理通知。",
+        "slow": "操作太频繁，请稍后再试。",
+        "dm_on": "已开启你的单聊通知。之后的新动态会发到这里。",
+        "dm_on_already": "你的单聊通知已经开着。",
+        "dm_off": "已关闭你的单聊通知，未发出的消息已取消。",
+        "dm_off_none": "你还没有开启单聊通知。",
+        "group_on": "已订阅群 {name}。之后的新动态会发到这个群。",
+        "group_on_already": "这个群已经在订阅中。",
+        "group_off": "已取消群 {name} 的通知，未发出的消息已取消。",
+        "group_off_none": "这个群没有在订阅中。",
+        "only_dm": "单聊通知要在与机器人的私聊里开启。",
+        "need_admin_group": "只有管理员可以在群里开关通知。",
+        "status_title": "当前订阅：",
+        "status_empty": "还没有订阅。",
+        "status_line": "{kind} {name}（…{tail}）{extra}",
+        "kind_personal": "单聊",
+        "kind_group": "群聊",
+        "stopped": "已停止：{reason}",
+        "add_intro": "回复编号、完整群名来订阅。一次一个群，1 分钟内有效。",
+        "remove_intro": "回复编号、完整群名来取消。一次一个群，1 分钟内有效。",
+        "empty_add": "没有可添加的群。请先把机器人加进群。",
+        "empty_remove": "还没有订阅任何群。",
+        "choice": "{index}. {name}（…{tail}）",
+        "ambiguous": "有重名的群，请回复编号。",
+        "bad_choice": "没有这个选项。请按最新名单回复编号或完整群名。",
+        "expired": "选择已超时，请重新发送指令。",
+        "cancelled": "已退出选择。",
+        "pair_ok": "你已成为管理员。",
+        "pair_bad": "配对码无效或已过期。",
+        "pair_limited": "尝试次数过多，请稍后再试。",
+        "pair_dm": "请在与机器人的单聊里发送配对码。",
+        "admin_added": "已添加管理员。",
+        "admin_usage": "用法：/addadmin <用户 id>",
+        "list_failed": "暂时列不出群，请稍后再试。",
+        "not_group_cmd": "请在与机器人的单聊里管理群订阅。",
+    },
+    "en": {
+        "help": (
+            "Commands:\n"
+            "/subscribe turns on direct messages for you\n"
+            "/unsubscribe turns them off\n"
+            "/addgroup picks a group the bot has joined\n"
+            "/removegroup stops one group\n"
+            "/cancel leaves the current picker\n"
+            "/status lists subscriptions\n"
+            "Send /subscribe inside a group to subscribe that group.\n"
+            "The first admin sends /pair <code> in a direct chat."
+        ),
+        "denied": "Only an admin can manage notifications.",
+        "slow": "Too many requests. Try again in a moment.",
+        "dm_on": "Direct messages are on. New updates will come here.",
+        "dm_on_already": "Direct messages are already on.",
+        "dm_off": "Direct messages are off. Unsent messages were cancelled.",
+        "dm_off_none": "Direct messages were not on.",
+        "group_on": "Subscribed to {name}. New updates will go to that group.",
+        "group_on_already": "That group is already subscribed.",
+        "group_off": "Unsubscribed from {name}. Unsent messages were cancelled.",
+        "group_off_none": "That group was not subscribed.",
+        "only_dm": "Turn on direct messages in a private chat with the bot.",
+        "need_admin_group": "Only an admin can change group notifications.",
+        "status_title": "Subscriptions:",
+        "status_empty": "No subscriptions yet.",
+        "status_line": "{kind} {name} (…{tail}) {extra}",
+        "kind_personal": "direct",
+        "kind_group": "group",
+        "stopped": "stopped: {reason}",
+        "add_intro": "Reply with a number or the full group name. One group, valid for 1 minute.",
+        "remove_intro": "Reply with a number or the full group name to remove it. One group, valid for 1 minute.",
+        "empty_add": "No groups to add. Add the bot to a group first.",
+        "empty_remove": "No group subscriptions yet.",
+        "choice": "{index}. {name} (…{tail})",
+        "ambiguous": "More than one group has that name. Reply with the number.",
+        "bad_choice": "That does not match the latest list. Reply with a number or the full name.",
+        "expired": "That choice expired. Send the command again.",
+        "cancelled": "Cancelled.",
+        "pair_ok": "You are now an admin.",
+        "pair_bad": "That pairing code is invalid or expired.",
+        "pair_limited": "Too many attempts. Try again later.",
+        "pair_dm": "Send the pairing code in a direct chat with the bot.",
+        "admin_added": "Admin added.",
+        "admin_usage": "Usage: /addadmin <user id>",
+        "list_failed": "The group list is unavailable. Try again shortly.",
+        "not_group_cmd": "Manage group subscriptions in a direct chat with the bot.",
+    },
+}
+
+
+def chat_text(language: str, key: str, **values: str) -> str:
+    """Reply copy for chat control. Unknown keys fall back to English, then the key."""
+    catalog = _CHAT["en"] if language == "en" else _CHAT["zh"]
+    template = catalog.get(key) or _CHAT["en"].get(key) or key
+    return template.format(**values) if values else template

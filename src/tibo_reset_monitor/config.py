@@ -29,8 +29,30 @@ _CALENDAR_KEYS = {"font_path", "font_bold_path", "font_index", "history_refresh_
 _STATE_KEYS = {"path"}
 _LOGGING_KEYS = {"level", "file"}
 _CHANNEL_KEYS = {
-    "feishu": {"enabled", "api_base", "app_id", "app_id_env", "app_secret_env", "language", "timezone", "targets"},
-    "telegram": {"enabled", "api_base", "bot_token_env", "language", "timezone", "targets"},
+    "feishu": {
+        "enabled",
+        "api_base",
+        "app_id",
+        "app_id_env",
+        "app_secret_env",
+        "language",
+        "timezone",
+        "targets",
+        "chat_control",
+        "admins",
+        "allow_self_subscribe",
+    },
+    "telegram": {
+        "enabled",
+        "api_base",
+        "bot_token_env",
+        "language",
+        "timezone",
+        "targets",
+        "chat_control",
+        "admins",
+        "allow_self_subscribe",
+    },
     "webhook": {"enabled", "language", "timezone", "targets"},
 }
 _FEISHU_TARGET_KEYS = {"name", "kind", "receive_id", "receive_id_type", "language", "timezone"}
@@ -244,6 +266,12 @@ def _channel(
         settings["timezone"] = _timezone_name(raw.get("timezone"), f"{prefix}.timezone", errors) or inherited_timezone
     else:
         settings["timezone"] = inherited_timezone
+    if name in {"feishu", "telegram"}:
+        settings["chat_control"] = "true" if _flag(raw.get("chat_control", True), f"{prefix}.chat_control", errors) else "false"
+        settings["allow_self_subscribe"] = (
+            "true" if _flag(raw.get("allow_self_subscribe", False), f"{prefix}.allow_self_subscribe", errors) else "false"
+        )
+        settings["admins"] = ",".join(_admins(raw.get("admins", []), f"{prefix}.admins", errors))
     targets_raw = raw.get("targets", [])
     if not isinstance(targets_raw, list):
         errors.append(f"{prefix}.targets must be an array")
@@ -379,6 +407,22 @@ def _timezone_name(value: Any, path: str, errors: list[str]) -> str | None:
         errors.append(f"{path} must be an IANA time zone name like Asia/Shanghai (unknown {name!r})")
         return None
     return name
+
+
+def _flag(value: Any, path: str, errors: list[str]) -> bool:
+    if not isinstance(value, bool):
+        errors.append(f"{path} must be true or false")
+        return False
+    return value
+
+
+def _admins(value: Any, path: str, errors: list[str]) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        errors.append(f"{path} must be an array of strings")
+        return []
+    return [item.strip() for item in value]
 
 
 def _language(value: Any, path: str, errors: list[str]) -> str:
