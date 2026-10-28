@@ -58,13 +58,13 @@ A Telegram `sendPhoto` caption looks like this. The calendar image follows the l
 搞定了。明天见，会有好消息。
 
 <i>帖子未明确适用范围</i>
-<i>帖子发布 · 2026-10-28 14:29:38（北京时间）</i>
+<i>帖子发布 · 2026-10-28 14:29:38 UTC+8</i>
 
 <blockquote>原帖 · Tibo @thsottiaux
 And it's done. See you tomorrow for some good news.
 引用 @thsottiaux
 Lands by midnight PST.
-2026-10-28 14:29:38 · 北京时间</blockquote>
+2026-10-28 14:29:38 UTC+8</blockquote>
 <a href="https://x.com/thsottiaux/status/123">查看原帖</a>
 
 重置日历 · 2026 年 10 月
@@ -83,7 +83,7 @@ With `language` set to `en`, the same notice is English. The body is the origina
 And it's done. See you tomorrow for some good news.
 
 <i>Scope not specified in the post</i>
-<i>Posted · 2026-10-28 14:29:38 (Beijing time)</i>
+<i>Posted · 2026-10-28 14:29:38 UTC+8</i>
 
 Quoting @thsottiaux: Lands by midnight PST.
 <a href="https://x.com/thsottiaux/status/123">View original post</a>
@@ -91,7 +91,7 @@ Quoting @thsottiaux: Lands by midnight PST.
 Reset calendar · October 2026
 ```
 
-The calendar month is Beijing time. A `reset_credit` cell says 发重置卡; every other event says 额度重置. 补充确认 is still used when the form was not explicit and the post quotes another event's 补充说明. The header counts only confirmed events in that month. Grey cells at the edges belong to the neighboring month. November 2026 below is six week rows. December 2026 and February 2027 are in `docs/` as well.
+The calendar month is the target's own time zone. A `reset_credit` cell says 发重置卡; every other event says 额度重置. 补充确认 is still used when the form was not explicit and the post quotes another event's 补充说明. The header counts only confirmed events in that month. Grey cells at the edges belong to the neighboring month. November 2026 below is six week rows. December 2026 and February 2027 are in `docs/` as well.
 
 <p align="center">
   <img src="docs/calendar-sample-2026-11.png" alt="Sample November 2026 calendar with late-October events in the grey cells" width="100%">
@@ -188,14 +188,19 @@ The full example is [`config.example.json`](config.example.json).
 | `calendar.font_index` | Optional. Noto / Source Han CJK collections default to index 2 (Simplified Chinese) |
 | `calendar.history_refresh_seconds` | Full-history refresh interval. Default 21600 (6 hours), minimum 600 |
 | `language` | Global default, `zh` or `en`. Omitted means `zh` |
+| `timezone` | Global IANA time zone, such as `Asia/Shanghai`. Omitted means the machine's local zone. If that cannot be read, the process uses UTC and logs it once |
 | `channels.<name>.language` | Default for that channel. Overrides the global value. Feishu, Telegram, and Webhook share this meaning |
+| `channels.<name>.timezone` | Default time zone for that channel. Overrides the global value. All three channels share it |
 | `channels.<name>.targets[].language` | One target. Overrides the channel and the global value |
+| `channels.<name>.targets[].timezone` | One target's time zone. Overrides the channel and the global value |
 | `channels.<name>.enabled` | Disabled channels are not contacted |
 | `channels.<name>.targets[]` | `name` plus `kind`: `group` or `personal` |
 
 Secrets are environment variable names such as `app_secret_env`, `bot_token_env`, and `url_env`. A field named `app_secret` or `bot_token` is rejected.
 
-`language` is `zh` or `en`. It may be set on the root, on a channel, or on a target. The later value wins. Every channel uses the same cascade: the target, then the channel, then the global value, then `zh`. An unknown value fails at startup with the field path, for example `$.channels.telegram.targets[0].language must be "zh" or "en"`.
+`language` is `zh` or `en`. `timezone` is an IANA name. Either may be set on the root, on a channel, or on a target. The later value wins, and every channel uses that same cascade. An unknown value fails at startup with the field path, for example `$.channels.telegram.targets[0].language must be "zh" or "en"` or `$.timezone must be an IANA time zone name like Asia/Shanghai`.
+
+Times in a message use that target's zone and the offset in effect at that instant, such as `帖子发布 · 2026-10-28 14:29:38 UTC+8` or `Posted · 2026-10-28 14:29:38 UTC+8`. Daylight-saving changes use the new offset. A zone such as `Asia/Kolkata` is written `UTC+5:30`. A date-only field stays on that calendar day.
 
 `zh` is the current Chinese wording. `en` uses the original post (`fullOriginalText`, otherwise `originalText`). Stage names, tags, scope, the timestamp, and the calendar are English, and the original-post card is omitted. A quote or reply is one line: `Quoting @handle: …` or `Replying to @handle: …`.
 
@@ -284,7 +289,7 @@ Set the secrets in the task environment. Set the start directory to the project 
 5. Clear failures are retried with backoff. An ambiguous outcome such as a timeout keeps the same key. About 55 minutes after the first ambiguous outcome the row becomes `needs_review` and is not retried automatically. Use `manual --event` if you confirmed it never arrived.
 6. A retraction cancels deliveries that have not been sent. A message already delivered stays sent, and the retraction itself is still announced.
 7. A failed, rate-limited, or unreadable fetch does not overwrite the last valid snapshot.
-8. The calendar uses the full snapshot `/api/v1/codex-resets` overlaid with recent. It is fetched at most every 6 hours by default, also after the Beijing month changes, and never more often than once every 10 minutes. A failed history fetch does not block the notice and does not erase the cache.
+8. The calendar uses the full snapshot `/api/v1/codex-resets` overlaid with recent. It is fetched at most every 6 hours by default, also after a configured time zone enters a new month, and never more often than once every 10 minutes. A failed history fetch does not block the notice and does not erase the cache. Each time zone gets its own image.
 
 Run a single `poll` or `run`. A short lock in the state database skips overlapping cron runs.
 

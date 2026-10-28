@@ -1,5 +1,6 @@
 {
   "language": "zh",
+  "timezone": "Asia/Shanghai",
   "source": {
     "url": "https://aihot.news/api/v1/codex-resets/recent",
     "poll_interval_seconds": 600,
@@ -55,7 +56,8 @@
           "name": "example-person",
           "kind": "personal",
           "chat_id": "100000000",
-          "language": "en"
+          "language": "en",
+          "timezone": "America/Los_Angeles"
         }
       ]
     },

@@ -22,11 +22,13 @@ class WebhookChannel:
         self.targets = list(spec.targets)
         self._transport = transport
         self._language = normalize_language(spec.settings.get("language"))
+        self._timezone = spec.settings.get("timezone") or "UTC"
         self._timeout = 20.0
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
         language = normalize_language(target.options.get("language"), self._language)
-        message = compose(notice, language)
+        zone_name = (target.options.get("timezone") or self._timezone or "UTC").strip() or "UTC"
+        message = compose(notice, language, timezone_name=zone_name)
         text = message.text
         if message.quote_line:
             text = f"{text}\n\n{message.quote_line}" if text else message.quote_line
@@ -38,6 +40,7 @@ class WebhookChannel:
             "tags": list(message.tags),
             "scope": message.scope,
             "text": text,
+            "posted": message.posted_line,
         }
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:

@@ -18,6 +18,8 @@ Omitted values inherit. The default is `zh`. The loader rejects anything other t
 
 `en` uses the post's original text (`fullOriginalText`, otherwise `originalText`), not the Chinese translation, and does not include the original-post quote card. A quoted or replied-to post is one line on `OutboundMessage.quote_line` (`Quoting @handle: …` or `Replying to @handle: …`). `zh` keeps the existing Chinese wording. Raw ids, the canonical `stage`, timestamps, and URLs stay on the `Notice` and must not be translated.
 
+`timezone` uses the same three levels as `language`: root, channel, then target. Pass `target.options["timezone"]` into `compose(..., timezone_name=...)`. Stamps are rendered in that zone with the offset at that instant (`UTC+8`, `UTC-7`, `UTC+5:30`). Do not write a city name into the copy. If a channel draws the calendar, call `png(language, timezone_name)` and `month(timezone_name)` so two targets in different zones do not share one image. A date-only source field stays on that day; a timestamp is converted.
+
 `Receipt.outcome` is one of:
 
 | Outcome | Meaning |

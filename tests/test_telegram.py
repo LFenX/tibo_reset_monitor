@@ -33,7 +33,11 @@ def _channel(transport) -> TelegramChannel:
         ChannelSpec(
             name="telegram",
             enabled=True,
-            settings={"api_base": "https://api.telegram.org", "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN"},
+            settings={
+                "api_base": "https://api.telegram.org",
+                "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                "timezone": "Asia/Shanghai",
+            },
             targets=[],
         ),
         transport,
@@ -84,7 +88,7 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertIn("<code>预告</code>", caption)
         self.assertIn("&lt;b&gt;bold&lt;/b&gt;", caption)
         self.assertIn("&amp; more", caption)
-        self.assertIn("帖子发布 · 2026-10-28 10:00:00（北京时间）", caption)
+        self.assertIn("帖子发布 · 2026-10-28 10:00:00 UTC+8", caption)
         self.assertIn("帖子未明确适用范围", caption)
         self.assertIn('href="https://x.com/thsottiaux/status/p1"', caption)
         self.assertIn("查看原帖", caption)
@@ -163,18 +167,18 @@ class TelegramRequestTest(unittest.TestCase):
         notice = extract_notices(snapshot([make_event("reset-9", [post], title="预告")]))[0]
         self.assertEqual(notice.original_text, "And it's done. See you tomorrow for some good news.")
         self.assertEqual(notice.contexts[0]["relation"], "quote")
-        caption = build_caption(notice, 1024, (2026, 10))
+        caption = build_caption(notice, 1024, (2026, 10), timezone_name="Asia/Shanghai")
         self.assertLessEqual(_parsed_len(caption), 1024)
         self.assertIn("<code>重置（形式未明确，默认额度重置）</code> <code>预告</code>", caption)
         self.assertIn("搞定了。明天见，会有好消息。", caption)
         self.assertIn("帖子未明确适用范围", caption)
-        self.assertIn("帖子发布 · 2026-10-28 14:29:38（北京时间）", caption)
+        self.assertIn("帖子发布 · 2026-10-28 14:29:38 UTC+8", caption)
         self.assertIn("<blockquote>", caption)
         self.assertIn("原帖 · Tibo @thsottiaux", caption)
         self.assertIn("And it's done. See you tomorrow for some good news.", caption)
         self.assertIn("引用 @thsottiaux", caption)
         self.assertIn("Lands by midnight PST.", caption)
-        self.assertIn("2026-10-28 14:29:38 · 北京时间", caption)
+        self.assertIn("2026-10-28 14:29:38 UTC+8", caption)
         self.assertIn('href="https://x.com/thsottiaux/status/p9"', caption)
         self.assertIn("重置日历 · 2026 年 10 月", caption)
         self.assertNotIn("重置确认：形式未明确", caption)
@@ -206,12 +210,12 @@ class TelegramRequestTest(unittest.TestCase):
                 },
             ),
         )
-        caption = build_caption(notice, 1024, (2026, 10))
+        caption = build_caption(notice, 1024, (2026, 10), timezone_name="Asia/Shanghai")
         self.assertLessEqual(_parsed_len(caption), 1024)
         self.assertIn("…", caption)
         self.assertIn("<code>重置（形式未明确，默认额度重置）</code>", caption)
         self.assertIn("<code>预告</code>", caption)
-        self.assertIn("帖子发布 · 2026-10-28 14:29:38（北京时间）", caption)
+        self.assertIn("帖子发布 · 2026-10-28 14:29:38 UTC+8", caption)
         self.assertIn("查看原帖", caption)
         self.assertIn("重置日历 · 2026 年 10 月", caption)
 
@@ -253,7 +257,7 @@ class TelegramRequestTest(unittest.TestCase):
             products_zh="Codex",
             type_name="reset_credit",
         )
-        other_text = build_caption(other, 1024)
+        other_text = build_caption(other, 1024, timezone_name="Asia/Shanghai")
         self.assertIn("<b>@someone</b>", other_text)
         self.assertIn("<i>X</i>", other_text)
         self.assertIn("<code>重置卡</code>", other_text)
@@ -300,7 +304,7 @@ class TelegramRequestTest(unittest.TestCase):
         event = make_event("reset-9", [post], title="预告")
         event["presentation"]["productsZh"] = "Codex、ChatGPT"
         notice = extract_notices(snapshot([event]))[0]
-        caption = build_caption(notice, 1024, (2026, 10), "en")
+        caption = build_caption(notice, 1024, (2026, 10), "en", "Asia/Shanghai")
         self.assertLessEqual(_parsed_len(caption), 1024)
         self.assertIn("And it's done. See you tomorrow for some good news.", caption)
         self.assertNotIn("搞定了", caption)
@@ -311,7 +315,8 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertIn("<code>Reset (form unspecified, defaults to quota reset)</code> <code>Preview</code>", caption)
         self.assertIn("Scope not specified in the post", caption)
         self.assertIn("Codex, ChatGPT", caption)
-        self.assertIn("Posted · 2026-10-28 14:29:38 (Beijing time)", caption)
+        self.assertIn("Posted · 2026-10-28 14:29:38 UTC+8", caption)
+        self.assertNotIn("Beijing", caption)
         self.assertIn(">View original post</a>", caption)
         self.assertIn("Reset calendar · October 2026", caption)
         self.assertNotIn("查看原帖", caption)
@@ -374,6 +379,20 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertIn("Reset cards are out.", rendered["caption"])
         self.assertIn("View original post", rendered["text"])
         self.assertNotIn("中文译文", rendered["text"])
+        seen = []
+
+        def provider(language, timezone_name):
+            seen.append((language, timezone_name))
+            return b"\x89PNG\r\ncalendar"
+
+        channel.bind_calendar(provider, month=lambda timezone_name: (2026, 7) if timezone_name == "America/Los_Angeles" else (2026, 10))
+        shanghai = Target("telegram", "cn", "personal", "111", {"language": "zh", "timezone": "Asia/Shanghai"})
+        angeles = Target("telegram", "us", "personal", "222", {"language": "en", "timezone": "America/Los_Angeles"})
+        channel.render(card, shanghai)
+        channel.render(card, angeles)
+        self.assertEqual(seen, [("zh", "Asia/Shanghai"), ("en", "America/Los_Angeles")])
+        self.assertIn("UTC-7", channel.render(card, angeles)["caption"])
+        self.assertIn("UTC+8", channel.render(card, shanghai)["caption"])
 
     def test_error_codes(self):
         transport = FakeTransport(

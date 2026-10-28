@@ -208,6 +208,70 @@ class ConfigTest(unittest.TestCase):
             self.assertIn('$.channels.webhook.language must be "zh" or "en"', text)
             self.assertIn('$.channels.telegram.targets[0].language must be "zh" or "en"', text)
 
+    def test_timezone_cascades_and_rejects_unknown_names(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = load_config(
+                _write(
+                    root,
+                    {
+                        "timezone": "America/Los_Angeles",
+                        "channels": {
+                            "feishu": {
+                                "enabled": True,
+                                "timezone": "Asia/Shanghai",
+                                "app_id": "cli_example",
+                                "app_secret_env": "TIBO_FEISHU_APP_SECRET",
+                                "targets": [
+                                    {"name": "ops", "kind": "group", "receive_id": "oc_example", "receive_id_type": "chat_id"},
+                                    {
+                                        "name": "me",
+                                        "kind": "personal",
+                                        "receive_id": "ou_example",
+                                        "receive_id_type": "open_id",
+                                        "timezone": "Asia/Kolkata",
+                                    },
+                                ],
+                            },
+                            "telegram": {
+                                "enabled": True,
+                                "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+                                "targets": [{"name": "ops", "kind": "group", "chat_id": "-100123"}],
+                            },
+                        },
+                    },
+                )
+            )
+            by_name = {channel.name: channel for channel in config.channels}
+            self.assertEqual(config.timezone, "America/Los_Angeles")
+            self.assertFalse(config.timezone_fallback)
+            self.assertEqual(by_name["feishu"].targets[0].options["timezone"], "Asia/Shanghai")
+            self.assertEqual(by_name["feishu"].targets[1].options["timezone"], "Asia/Kolkata")
+            self.assertEqual(by_name["telegram"].targets[0].options["timezone"], "America/Los_Angeles")
+
+            with self.assertRaises(ConfigError) as raised:
+                load_config(_write(root, {"timezone": "Not/AZone", "channels": {}}))
+            self.assertIn("$.timezone must be an IANA time zone name like Asia/Shanghai", str(raised.exception))
+            self.assertIn("Not/AZone", str(raised.exception))
+
+            with self.assertRaises(ConfigError):
+                load_config(
+                    _write(
+                        root,
+                        {
+                            "channels": {
+                                "webhook": {
+                                    "enabled": False,
+                                    "timezone": "Beijing",
+                                    "targets": [],
+                                }
+                            }
+                        },
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -39,6 +39,7 @@ class TelegramChannel:
         self._api_base = spec.settings.get("api_base", "https://api.telegram.org").rstrip("/")
         self._token_env = spec.settings.get("bot_token_env", "TIBO_TELEGRAM_BOT_TOKEN")
         self._language = normalize_language(spec.settings.get("language"))
+        self._timezone = spec.settings.get("timezone") or "UTC"
         self._timeout = 20.0
         self._calendar_png: Callable[[], bytes | None] | None = None
         self._calendar_month: Callable[[], tuple[int, int]] | None = None
@@ -53,13 +54,14 @@ class TelegramChannel:
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
         language = _target_language(target, self._language)
-        photo = self._load_photo(language)
-        year_month = self._calendar_month() if self._calendar_month else None
+        zone_name = _target_timezone(target, self._timezone)
+        photo = self._load_photo(language, zone_name)
+        year_month = _call_month(self._calendar_month, zone_name)
         return {
             "chat_id": target.address,
             "photo": photo,
-            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT, year_month, language),
-            "text": build_caption(notice, _TEXT_LIMIT, year_month, language),
+            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT, year_month, language, zone_name),
+            "text": build_caption(notice, _TEXT_LIMIT, year_month, language, zone_name),
             "parse_mode": "HTML",
         }
 
@@ -101,11 +103,11 @@ class TelegramChannel:
             return receipt_from_transport(exc, sent=True)
         return _receipt(response.status, response.body, response.headers)
 
-    def _load_photo(self, language: str) -> bytes | None:
+    def _load_photo(self, language: str, timezone_name: str) -> bytes | None:
         if self._calendar_png is None:
             return None
         try:
-            photo = _call_calendar(self._calendar_png, language)
+            photo = _call_calendar(self._calendar_png, language, timezone_name)
         except Exception as exc:
             log.warning("calendar image unavailable: %s", exc)
             return None
@@ -119,10 +121,31 @@ def _target_language(target: Target, default: str) -> str:
     return normalize_language(target.options.get("language"), default)
 
 
-def _call_calendar(provider: Callable[..., bytes | None], language: str) -> bytes | None:
-    """Pass the language when the provider accepts it. Older callables take no argument."""
+def _target_timezone(target: Target, default: str) -> str:
+    name = (target.options.get("timezone") or default or "UTC").strip()
+    return name or "UTC"
+
+
+def _call_calendar(provider: Callable[..., bytes | None], language: str, timezone_name: str) -> bytes | None:
+    """Pass language and time zone when the provider accepts them."""
     try:
-        return provider(language)
+        return provider(language, timezone_name)
+    except TypeError as exc:
+        if "argument" not in str(exc):
+            raise
+        try:
+            return provider(language)
+        except TypeError as inner:
+            if "argument" not in str(inner):
+                raise
+            return provider()
+
+
+def _call_month(provider: Callable[..., tuple[int, int]] | None, timezone_name: str) -> tuple[int, int] | None:
+    if provider is None:
+        return None
+    try:
+        return provider(timezone_name)
     except TypeError as exc:
         if "argument" not in str(exc):
             raise
@@ -134,6 +157,7 @@ def build_caption(
     limit: int,
     year_month: tuple[int, int] | None = None,
     language: str = "zh",
+    timezone_name: str = "UTC",
 ) -> str:
     """HTML caption whose parsed text length is at most ``limit`` UTF-16 code units.
 
@@ -161,6 +185,7 @@ def build_caption(
             body=_cut(main_src, main_n),
             preview=_cut(preview_src, preview_n),
             quote_bodies=tuple(_cut(source, size) for source, size in zip(quote_srcs, quote_ns)),
+            timezone_name=timezone_name,
         )
         return _html(message)
 

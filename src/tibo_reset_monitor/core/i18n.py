@@ -9,13 +9,13 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, tzinfo
 from urllib.parse import urlparse
 
 from tibo_reset_monitor.core.model import CONFIRMATION, MANUAL, Notice, notice_lines
+from tibo_reset_monitor.core.timeutil import format_local, zone_for
 
 LANGUAGES = frozenset({"zh", "en"})
-_BEIJING = timezone(timedelta(hours=8))
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
 _X_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com", "www.x.com", "www.twitter.com"}
 
@@ -103,6 +103,7 @@ class OutboundMessage:
     detail_lines: tuple[str, ...]
     link_label: str
     link_url: str
+    posted_line: str
     calendar_line: str
     quote_line: str
     preview_lines: tuple[str, ...]
@@ -135,6 +136,7 @@ def compose(
     body: str | None = None,
     preview: str | None = None,
     quote_bodies: tuple[str, ...] | None = None,
+    timezone_name: str | None = None,
 ) -> OutboundMessage:
     """Fill every user-facing string for ``language``.
 
@@ -142,15 +144,16 @@ def compose(
     passes already-shortened strings so a caption can stay under the API limit.
     """
     language = "en" if language == "en" else "zh"
+    zone = zone_for(timezone_name)
     author_name, author_caption = _author_lines(notice)
     text = _body(notice, language) if body is None else body
     scope = "" if notice.stage == MANUAL else _scope(notice, language)
     products = "" if notice.stage == MANUAL else _products(notice, language)
-    posted = "" if notice.stage == MANUAL else _posted(notice, language)
+    posted = "" if notice.stage == MANUAL else _posted(notice, language, zone)
     details = tuple(line for line in (scope, products, posted) if line)
     link_url = notice.url if notice.url.startswith(("https://", "http://")) else ""
-    calendar_line = calendar_caption(year_month, language)
-    quote_line, preview_lines = _context_copy(notice, language, preview, quote_bodies)
+    calendar_line = calendar_caption(year_month, language, zone)
+    quote_line, preview_lines = _context_copy(notice, language, preview, quote_bodies, zone)
     manual_heading = "Manual reminder" if language == "en" else "手动提醒"
     manual_note = "Sent manually" if language == "en" else "手动发送"
     if notice.stage == MANUAL:
@@ -162,13 +165,14 @@ def compose(
     message = OutboundMessage(
         language=language,
         title=title,
-        subtitle=_subtitle(notice, language),
+        subtitle=_subtitle(notice, language, zone),
         tags=tags,
         text=text,
         scope=scope,
         detail_lines=details,
         link_label="View original post" if language == "en" else "查看原帖",
         link_url=link_url,
+        posted_line=posted,
         calendar_line=calendar_line,
         quote_line=quote_line,
         preview_lines=preview_lines,
@@ -235,9 +239,9 @@ def month_title(year: int, month: int, language: str = "zh") -> str:
     return f"{year} 年 {month} 月"
 
 
-def calendar_caption(year_month: tuple[int, int] | None, language: str = "zh") -> str:
+def calendar_caption(year_month: tuple[int, int] | None, language: str = "zh", zone: tzinfo | None = None) -> str:
     if year_month is None:
-        local = datetime.now(_BEIJING)
+        local = datetime.now(timezone.utc).astimezone(zone or timezone.utc)
         year_month = (local.year, local.month)
     year, month = year_month
     title = month_title(year, month, "en" if language == "en" else "zh")
@@ -334,24 +338,23 @@ def _products(notice: Notice, language: str) -> str:
     return converted
 
 
-def _posted(notice: Notice, language: str) -> str:
-    stamp = _beijing_stamp(notice.published_at)
+def _posted(notice: Notice, language: str, zone: tzinfo) -> str:
+    stamp = format_local(notice.published_at, zone)
     if not stamp:
         return ""
     if language == "en":
-        return f"Posted · {stamp} (Beijing time)"
-    return f"帖子发布 · {stamp}（北京时间）"
+        return f"Posted · {stamp}"
+    return f"帖子发布 · {stamp}"
 
 
-def _subtitle(notice: Notice, language: str) -> str:
+def _subtitle(notice: Notice, language: str, zone: tzinfo) -> str:
+    del language
     author = f"@{notice.author}" if notice.author else "@thsottiaux"
-    if language != "en":
-        if notice.published_at:
-            return f"{author} · {notice.published_at}"
-        return author
-    stamp = _beijing_stamp(notice.published_at)
+    stamp = format_local(notice.published_at, zone)
     if stamp:
-        return f"{author} · {stamp} (Beijing time)"
+        return f"{author} · {stamp}"
+    if notice.published_at:
+        return f"{author} · {notice.published_at}"
     return author
 
 
@@ -371,6 +374,7 @@ def _context_copy(
     language: str,
     preview: str | None,
     quote_bodies: tuple[str, ...] | None,
+    zone: tzinfo,
 ) -> tuple[str, tuple[str, ...]]:
     if notice.stage == MANUAL:
         return "", ()
@@ -385,7 +389,7 @@ def _context_copy(
         preview = notice.original_text or ""
     if quote_bodies is None:
         quote_bodies = tuple(_context_body(item) for item in notice.contexts)
-    return "", _preview_lines(notice, preview, quote_bodies)
+    return "", _preview_lines(notice, preview, quote_bodies, zone)
 
 
 def _quote_line(item: dict[str, str], body: str) -> str:
@@ -404,7 +408,7 @@ def _quote_line(item: dict[str, str], body: str) -> str:
     return prefix
 
 
-def _preview_lines(notice: Notice, preview: str, quote_bodies: tuple[str, ...]) -> tuple[str, ...]:
+def _preview_lines(notice: Notice, preview: str, quote_bodies: tuple[str, ...], zone: tzinfo) -> tuple[str, ...]:
     contexts = notice.contexts
     if not preview and not any(quote_bodies):
         return ()
@@ -429,9 +433,9 @@ def _preview_lines(notice: Notice, preview: str, quote_bodies: tuple[str, ...]) 
             lines.append(f"@{author}")
         if body:
             lines.append(body)
-    stamp = _beijing_stamp(notice.published_at)
+    stamp = format_local(notice.published_at, zone)
     if stamp:
-        lines.append(f"{stamp} · 北京时间")
+        lines.append(stamp)
     return tuple(lines)
 
 
@@ -466,19 +470,6 @@ def _identity(url: str) -> tuple[str, str]:
         if parts and parts[0].lower() != "i":
             handle = parts[0]
     return host, handle
-
-
-def _beijing_stamp(value: str) -> str:
-    text = (value or "").strip()
-    if not text:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return ""
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=_BEIJING)
-    return parsed.astimezone(_BEIJING).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _replace_fragments(text: str) -> str:

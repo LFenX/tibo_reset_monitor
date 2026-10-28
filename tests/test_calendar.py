@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from tests.support import FakeClock, ScriptedSource, TempStoreTest, failure, ok, snapshot
 from tibo_reset_monitor.core.calendar import (
@@ -18,6 +19,9 @@ from tibo_reset_monitor.core.calendar import (
 from tibo_reset_monitor.core.history import HistoryCalendar
 
 NOW = datetime(2026, 10, 28, 4, 0, tzinfo=timezone.utc)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+KOLKATA = ZoneInfo("Asia/Kolkata")
+LOS_ANGELES = ZoneInfo("America/Los_Angeles")
 
 
 def _event(event_id, **overrides):
@@ -267,8 +271,8 @@ class CalendarModelTest(unittest.TestCase):
         self.assertGreaterEqual(footnote_y, image.height - 8)
 
 
-class BeijingMonthTest(unittest.TestCase):
-    def test_month_follows_beijing_across_midnight_and_utc(self):
+class TimezoneMonthTest(unittest.TestCase):
+    def test_shanghai_month_crosses_at_utc_plus_8(self):
         cases = [
             (datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc), 2026, 10, "2026-10-31"),
             (datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc), 2026, 11, "2026-11-01"),
@@ -279,11 +283,95 @@ class BeijingMonthTest(unittest.TestCase):
             (datetime(2026, 12, 31, 16, 0, tzinfo=timezone.utc), 2027, 1, "2027-01-01"),
         ]
         for now, year, month, today in cases:
-            model = calendar_model(None, {"events": []}, now)
+            model = calendar_model(None, {"events": []}, now, SHANGHAI)
             self.assertEqual((model["year"], model["month"], model["today"]), (year, month, today), now.isoformat())
             self.assertEqual(model["totals"], {"额度重置": 0, "发重置卡": 0, "补充确认": 0})
 
-    def test_header_counts_only_the_beijing_month(self):
+    def test_other_zones_do_not_share_shanghais_month_boundary(self):
+        instant = datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc)
+        shanghai = calendar_model(None, {"events": []}, instant, SHANGHAI)
+        utc = calendar_model(None, {"events": []}, instant, timezone.utc)
+        los_angeles = calendar_model(None, {"events": []}, instant, LOS_ANGELES)
+        self.assertEqual(shanghai["today"], "2026-11-01")
+        self.assertEqual(utc["today"], "2026-10-31")
+        self.assertEqual(los_angeles["today"], "2026-10-31")
+
+    def test_kolkata_uses_the_half_hour_offset(self):
+        # 2026-10-31 18:30 UTC is 2026-11-01 00:00 in Asia/Kolkata (UTC+5:30).
+        before = calendar_model(None, {"events": []}, datetime(2026, 10, 31, 18, 29, tzinfo=timezone.utc), KOLKATA)
+        after = calendar_model(None, {"events": []}, datetime(2026, 10, 31, 18, 30, tzinfo=timezone.utc), KOLKATA)
+        self.assertEqual(before["today"], "2026-10-31")
+        self.assertEqual(after["today"], "2026-11-01")
+
+    def test_date_only_fields_stay_put_and_timestamps_move(self):
+        recent = {
+            "historyFrom": "2026-01-01T00:00:00Z",
+            "events": [
+                _event(
+                    "dated",
+                    confirmationBasis="source_post",
+                    confirmedAt="2026-10-31T20:00:00Z",
+                    occurredOn="2026-10-31",
+                    presentation={"kindExplicit": True, "status": "confirmed"},
+                ),
+                _event(
+                    "stamped",
+                    confirmationBasis="source_post",
+                    confirmedAt="2026-10-31T20:00:00Z",
+                    occurredOn=None,
+                    presentation={"kindExplicit": True, "status": "confirmed"},
+                ),
+            ],
+        }
+        now = datetime(2026, 11, 1, 4, tzinfo=timezone.utc)
+        shanghai = calendar_model(None, recent, now, SHANGHAI)
+        utc = calendar_model(None, recent, now, timezone.utc)
+        self.assertEqual(shanghai["days"]["2026-10-31"][0]["id"], "dated")
+        self.assertEqual(shanghai["days"]["2026-11-01"][0]["id"], "stamped")
+        self.assertEqual(utc["days"]["2026-10-31"][0]["id"], "dated")
+        self.assertEqual({item["id"] for item in utc["days"]["2026-10-31"]}, {"dated", "stamped"})
+        self.assertNotIn("2026-11-01", utc["days"])
+
+    def test_los_angeles_daylight_saving_offset_changes(self):
+        from tibo_reset_monitor.core.i18n import compose
+        from tibo_reset_monitor.core.model import Notice
+
+        summer = Notice(
+            dedupe_key="s",
+            post_key="s",
+            stage="announcement",
+            stage_label="预告",
+            title="",
+            display_label="",
+            author="thsottiaux",
+            text="译",
+            original_text="summer",
+            url="https://x.com/thsottiaux/status/1",
+            published_at="2026-07-15T19:00:00Z",
+            tag_label="重置（形式未明确）",
+        )
+        winter = Notice(
+            dedupe_key="w",
+            post_key="w",
+            stage="announcement",
+            stage_label="预告",
+            title="",
+            display_label="",
+            author="thsottiaux",
+            text="译",
+            original_text="winter",
+            url="https://x.com/thsottiaux/status/2",
+            published_at="2026-12-15T20:00:00Z",
+            tag_label="重置（形式未明确）",
+        )
+        summer_line = compose(summer, "en", timezone_name="America/Los_Angeles").posted_line
+        winter_line = compose(winter, "en", timezone_name="America/Los_Angeles").posted_line
+        self.assertEqual(summer_line, "Posted · 2026-07-15 12:00:00 UTC-7")
+        self.assertEqual(winter_line, "Posted · 2026-12-15 12:00:00 UTC-8")
+        kolkata = compose(summer, "zh", timezone_name="Asia/Kolkata").posted_line
+        self.assertEqual(kolkata, "帖子发布 · 2026-07-16 00:30:00 UTC+5:30")
+
+    def test_header_counts_only_the_shanghai_month(self):
         recent = {
             "historyFrom": "2026-01-01T00:00:00.000+08:00",
             "events": [
@@ -292,9 +380,9 @@ class BeijingMonthTest(unittest.TestCase):
                 _event("dec", type="reset_credit", confirmationBasis="source_post", confirmedAt="2026-12-01T09:00:00+08:00", occurredOn="2026-12-01", presentation={"kindExplicit": True, "status": "confirmed"}),
             ],
         }
-        october = calendar_model(None, recent, datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc))
-        november = calendar_model(None, recent, datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc))
-        january = calendar_model(None, recent, datetime(2026, 12, 31, 16, 0, tzinfo=timezone.utc))
+        october = calendar_model(None, recent, datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc), SHANGHAI)
+        november = calendar_model(None, recent, datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc), SHANGHAI)
+        january = calendar_model(None, recent, datetime(2026, 12, 31, 16, 0, tzinfo=timezone.utc), SHANGHAI)
         self.assertEqual(october["totals"]["额度重置"], 1)
         self.assertEqual(november["totals"], {"额度重置": 1, "发重置卡": 0, "补充确认": 0})
         self.assertEqual(january["totals"], {"额度重置": 0, "发重置卡": 0, "补充确认": 0})
@@ -370,7 +458,7 @@ class BeijingMonthTest(unittest.TestCase):
                         presentation={"kindExplicit": True, "status": "confirmed"},
                     )
                 )
-            model = calendar_model(None, recent, today)
+            model = calendar_model(None, recent, today, SHANGHAI)
             png = render_calendar_png(model, fonts)
             image = Image.open(io.BytesIO(png))
             self.assertEqual(image.size, (1120, canvas_height(rows)))
@@ -442,8 +530,8 @@ class HistoryCacheTest(TempStoreTest):
         self.assertEqual(self.store.get_history()["etag"], 'W/"b"')
         self.assertEqual(self.store.get_history()["body"]["checkedAt"], "2026-10-02T00:00:00.000+08:00")
 
-    def test_beijing_new_month_waits_ten_minutes_then_refetches(self):
-        # 2026-10-31 15:55 UTC is 23:55 in Beijing, still October.
+    def test_shanghai_new_month_waits_ten_minutes_then_refetches(self):
+        # 2026-10-31 15:55 UTC is 23:55 in Asia/Shanghai, still October.
         self.clock.now_value = datetime(2026, 10, 31, 15, 55, tzinfo=timezone.utc)
         source = ScriptedSource(
             [
@@ -451,9 +539,9 @@ class HistoryCacheTest(TempStoreTest):
                 ok(snapshot([], checked_at="2026-11-01T00:05:00.000+08:00"), etag='W/"nov"'),
             ]
         )
-        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=30 * 24 * 3600)
+        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=30 * 24 * 3600, timezones=("Asia/Shanghai",))
         calendar.refresh()
-        # 2026-11-01 00:00 Beijing is five minutes later, and UTC is still 31 October.
+        # 2026-11-01 00:00 in Asia/Shanghai is five minutes later, and UTC is still 31 October.
         self.clock.now_value = datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc)
         calendar.refresh()
         self.assertEqual(len(source.etags), 1)
@@ -461,6 +549,25 @@ class HistoryCacheTest(TempStoreTest):
         # Ten minutes after the October fetch: a new-month pull is allowed.
         self.clock.now_value = datetime(2026, 10, 31, 16, 5, tzinfo=timezone.utc)
         calendar.refresh()
+        self.assertEqual(len(source.etags), 2)
+        self.assertEqual(self.store.get_history()["etag"], 'W/"nov"')
+
+    def test_each_timezone_refreshes_on_its_own_month(self):
+        self.clock.now_value = datetime(2026, 10, 31, 15, 55, tzinfo=timezone.utc)
+        source = ScriptedSource([ok(snapshot([]), etag='W/"oct"'), ok(snapshot([]), etag='W/"nov"')])
+        los_angeles = HistoryCalendar(
+            self.store, source, self.clock, refresh_seconds=30 * 24 * 3600, timezones=("America/Los_Angeles",)
+        )
+        los_angeles.refresh()
+        self.clock.now_value = datetime(2026, 10, 31, 16, 30, tzinfo=timezone.utc)
+        los_angeles.refresh()
+        self.assertEqual(len(source.etags), 1)
+        self.assertEqual(los_angeles.month("America/Los_Angeles"), (2026, 10))
+        self.assertEqual(los_angeles.month("Asia/Shanghai"), (2026, 11))
+        shanghai = HistoryCalendar(
+            self.store, source, self.clock, refresh_seconds=30 * 24 * 3600, timezones=("Asia/Shanghai",)
+        )
+        shanghai.refresh()
         self.assertEqual(len(source.etags), 2)
         self.assertEqual(self.store.get_history()["etag"], 'W/"nov"')
 
@@ -472,9 +579,9 @@ class HistoryCacheTest(TempStoreTest):
                 failure("network", "history down"),
             ]
         )
-        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=30 * 24 * 3600)
+        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=30 * 24 * 3600, timezones=("Asia/Shanghai",))
         calendar.refresh()
-        # 2026-11-01 00:30 Beijing. The history request fails and must not raise.
+        # 2026-11-01 00:30 in Asia/Shanghai. The history request fails and must not raise.
         self.clock.now_value = datetime(2026, 10, 31, 16, 30, tzinfo=timezone.utc)
         calendar.refresh()
         self.assertEqual(self.store.get_history()["etag"], 'W/"oct"')

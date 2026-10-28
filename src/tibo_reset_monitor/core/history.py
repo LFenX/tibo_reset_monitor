@@ -12,15 +12,14 @@ from datetime import datetime
 from typing import Any
 
 from tibo_reset_monitor.core.calendar import (
-    BEIJING,
     CalendarImageUnavailable,
-    beijing_now,
     calendar_model,
     find_cjk_font,
     find_latin_font,
     render_calendar_png,
 )
 from tibo_reset_monitor.core.model import parse_utc
+from tibo_reset_monitor.core.timeutil import month_of, zone_for
 
 log = logging.getLogger("tibo_reset_monitor")
 
@@ -38,6 +37,7 @@ class HistoryCalendar:
         font_path: str | None = None,
         bold_path: str | None = None,
         font_index: int | None = None,
+        timezones: tuple[str, ...] | None = None,
     ) -> None:
         self.store = store
         self.source = source
@@ -46,6 +46,7 @@ class HistoryCalendar:
         self.font_path = font_path or None
         self.bold_path = bold_path or None
         self.font_index = font_index
+        self.timezones = tuple(dict.fromkeys(name for name in (timezones or ("UTC",)) if name)) or ("UTC",)
 
     def refresh(self) -> None:
         now = self.clock.now()
@@ -71,16 +72,18 @@ class HistoryCalendar:
         self.store.conn.commit()
         log.info("history snapshot stored events=%s", len(result.body.get("events") or []))
 
-    def month(self) -> tuple[int, int]:
-        local = beijing_now(self.clock.now())
-        return local.year, local.month
+    def month(self, timezone_name: str | None = None) -> tuple[int, int]:
+        zone = zone_for(timezone_name, self.timezones[0])
+        return month_of(self.clock.now(), zone)
 
-    def png(self, language: str = "zh") -> bytes | None:
-        """Render the current month. ``None`` means the caller should send text.
+    def png(self, language: str = "zh", timezone_name: str | None = None) -> bytes | None:
+        """Render the current month in one time zone. ``None`` means send text.
 
-        ``language="en"`` uses a Latin face, so a missing CJK font still yields an image.
+        Each zone gets its own image. ``language="en"`` uses a Latin face, so a
+        missing CJK font still yields an image.
         """
         language = "en" if language == "en" else "zh"
+        zone = zone_for(timezone_name, self.timezones[0])
         try:
             recent = self.store.get_snapshot()
             history = self.store.get_history()
@@ -88,6 +91,7 @@ class HistoryCalendar:
                 history["body"] if history else None,
                 recent["body"] if recent else None,
                 self.clock.now(),
+                zone,
             )
             if language == "en":
                 fonts = find_latin_font(self.font_path, self.bold_path, self.font_index)
@@ -113,7 +117,7 @@ class HistoryCalendar:
         fetched = parse_utc(cached["fetched_at"])
         if fetched is None:
             return True
-        if _month(fetched) != _month(now):
+        if any(month_of(fetched, zone_for(name)) != month_of(now, zone_for(name)) for name in self.timezones):
             return True
         return (now - fetched).total_seconds() >= self.refresh_seconds
 
@@ -122,8 +126,3 @@ class HistoryCalendar:
 
         self.store.set_meta("history_attempt_at", format_utc(now))
         self.store.conn.commit()
-
-
-def _month(value: datetime) -> tuple[int, int]:
-    local = value.astimezone(BEIJING)
-    return local.year, local.month

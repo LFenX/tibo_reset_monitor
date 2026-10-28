@@ -58,13 +58,13 @@ Telegram 的一条 `sendPhoto` 说明文字大致如下。日历图接在最后�
 搞定了。明天见，会有好消息。
 
 <i>帖子未明确适用范围</i>
-<i>帖子发布 · 2026-10-28 14:29:38（北京时间）</i>
+<i>帖子发布 · 2026-10-28 14:29:38 UTC+8</i>
 
 <blockquote>原帖 · Tibo @thsottiaux
 And it's done. See you tomorrow for some good news.
 引用 @thsottiaux
 Lands by midnight PST.
-2026-10-28 14:29:38 · 北京时间</blockquote>
+2026-10-28 14:29:38 UTC+8</blockquote>
 <a href="https://x.com/thsottiaux/status/123">查看原帖</a>
 
 重置日历 · 2026 年 10 月
@@ -83,7 +83,7 @@ Lands by midnight PST.
 And it's done. See you tomorrow for some good news.
 
 <i>Scope not specified in the post</i>
-<i>Posted · 2026-10-28 14:29:38 (Beijing time)</i>
+<i>Posted · 2026-10-28 14:29:38 UTC+8</i>
 
 Quoting @thsottiaux: Lands by midnight PST.
 <a href="https://x.com/thsottiaux/status/123">View original post</a>
@@ -91,7 +91,7 @@ Quoting @thsottiaux: Lands by midnight PST.
 Reset calendar · October 2026
 ```
 
-日历按北京时间取当前月。格子里 `reset_credit` 写成「发重置卡」，其余写成「额度重置」。形式不明确、且引用了其他事件「补充说明」的，仍标成「补充确认」。顶部数字只统计这个月已确认的事件。月初月末的灰色格子是相邻月份。下面是 2026 年 11 月的样图（6 行周）；12 月和 2027 年 2 月的样图也在 `docs/` 里。
+日历按每个目标自己的时区取「今天」和当前月。格子里 `reset_credit` 写成「发重置卡」，其余写成「额度重置」。形式不明确、且引用了其他事件「补充说明」的，仍标成「补充确认」。顶部数字只统计这个月已确认的事件。月初月末的灰色格子是相邻月份。下面是 2026 年 11 月的样图（6 行周）；12 月和 2027 年 2 月的样图也在 `docs/` 里。
 
 <p align="center">
   <img src="docs/calendar-sample-2026-11.png" alt="2026 年 11 月日历样图，灰色格子里有 10 月末的事件" width="100%">
@@ -188,14 +188,19 @@ PYTHONPATH=src python -m tibo_reset_monitor poll --config config.json
 | `calendar.font_index` | 可选。Noto / 思源 CJK 合集默认用 index 2（简体） |
 | `calendar.history_refresh_seconds` | 全量历史的刷新间隔。默认 21600（6 小时），最小 600 |
 | `language` | 全局默认语言，`zh` 或 `en`。省略时是 `zh` |
+| `timezone` | 全局 IANA 时区，如 `Asia/Shanghai`。省略时用运行环境的本地时区；读不到则用 UTC，并记一条日志 |
 | `channels.<name>.language` | 该渠道的默认语言，覆盖全局。飞书、Telegram、Webhook 用同一套语义 |
+| `channels.<name>.timezone` | 该渠道的默认时区，覆盖全局。三个渠道共用 |
 | `channels.<name>.targets[].language` | 单个目标的语言，覆盖渠道和全局 |
+| `channels.<name>.targets[].timezone` | 单个目标的时区，覆盖渠道和全局 |
 | `channels.<name>.enabled` | `false` 的渠道不会发送 |
 | `channels.<name>.targets[]` | `name` 加 `kind`：`group` 或 `personal` |
 
 密钥只写环境变量名，例如 `app_secret_env`、`bot_token_env`、`url_env`。配置里出现 `app_secret`、`bot_token` 这类字段会被拒绝。
 
-`language` 只能是 `zh` 或 `en`。写在根上、渠道上或某个 target 上都可以，后者覆盖前者。三个渠道读的是同一套结果：目标自己的值，否则渠道的值，否则全局，否则 `zh`。非法值会在启动时报出字段路径，例如 `$.channels.telegram.targets[0].language must be "zh" or "en"`。
+`language` 只能是 `zh` 或 `en`。`timezone` 只能是 IANA 时区名。两者都可以写在根上、渠道上或某个 target 上，后者覆盖前者。三个渠道读的是同一套结果。非法值会在启动时报出字段路径，例如 `$.channels.telegram.targets[0].language must be "zh" or "en"`，或 `$.timezone must be an IANA time zone name like Asia/Shanghai`。
+
+消息里的时间按该目标的时区显示，并带上那一刻的 UTC 偏移，例如 `帖子发布 · 2026-10-28 14:29:38 UTC+8`、`Posted · 2026-10-28 14:29:38 UTC+8`。夏令时用切换后的偏移，`Asia/Kolkata` 这类时区会写成 `UTC+5:30`。只给了日期、没有钟点的字段保持原来的日期。
 
 `zh` 保持现在的中文。`en` 用帖子原文（`fullOriginalText`，没有则 `originalText`），阶段、标签、适用范围、时间和日历都换成英文，并且不展示「原帖」卡片。引用或回复只留一行 `Quoting @handle: …` / `Replying to @handle: …`。
 
@@ -284,7 +289,7 @@ schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_mo
 5. 明确失败会退避重试。超时这类结果不确定的发送沿用同一个幂等键；距第一次不确定结果约 55 分钟后改为 `needs_review`，不再自动重试。确认对方没收到时，用 `manual --event` 重发。
 6. 事件被撤回时，还没发出去的投递会取消。已经发出的保留，撤回本身仍会通知。
 7. 拉取失败、限流或响应无法解析时，不覆盖上一份有效快照。
-8. 日历用全量接口 `/api/v1/codex-resets` 叠加上 recent。默认每 6 小时最多拉一次，北京时间换月后也会再拉，但两次尝试至少间隔 10 分钟。这次拉取失败不会挡住通知，也不会清掉已有缓存。
+8. 日历用全量接口 `/api/v1/codex-resets` 叠加上 recent。默认每 6 小时最多拉一次。某个目标的时区跨月后也会再拉，但两次尝试至少间隔 10 分钟。这次拉取失败不会挡住通知，也不会清掉已有缓存。不同时区各自画一张图。
 
 请只运行一个 `poll` 或 `run`。状态库里有一把短锁，用来跳过重叠的 cron。
 

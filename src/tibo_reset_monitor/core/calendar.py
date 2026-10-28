@@ -13,11 +13,10 @@ import calendar
 import glob
 import io
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
-BEIJING = timezone(timedelta(hours=8))
 _CANVAS_WIDTH = 1120
 _MARGIN = 30
 _GAP = 8
@@ -107,10 +106,8 @@ class FontChoice:
     index: int
 
 
-def beijing_now(now: datetime) -> datetime:
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    return now.astimezone(BEIJING)
+def _zone(zone: tzinfo | None) -> tzinfo:
+    return zone if zone is not None else timezone.utc
 
 
 def default_history_url(recent_url: str) -> str:
@@ -121,9 +118,21 @@ def default_history_url(recent_url: str) -> str:
     return "https://aihot.news/api/v1/codex-resets"
 
 
-def calendar_model(history: dict[str, Any] | None, recent: dict[str, Any] | None, now: datetime) -> dict[str, Any]:
-    """Qualified reset forms and confirmation dates. An estimate is never stored as a confirmation."""
-    today = beijing_now(now).date()
+def calendar_model(
+    history: dict[str, Any] | None,
+    recent: dict[str, Any] | None,
+    now: datetime,
+    zone: tzinfo | None = None,
+) -> dict[str, Any]:
+    """Qualified reset forms and confirmation dates. An estimate is never stored as a confirmation.
+
+    ``zone`` chooses "today", the visible month, and the local date of each timestamp.
+    A date-only field such as ``occurredOn: 2026-10-31`` stays on that calendar day.
+    """
+    zone = _zone(zone)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    today = now.astimezone(zone).date()
     history = history or {}
     recent = recent or {}
     cutoff = str(recent.get("historyFrom") or "9999")
@@ -153,7 +162,7 @@ def calendar_model(history: dict[str, Any] | None, recent: dict[str, Any] | None
     days: dict[str, list[dict[str, str]]] = {}
     totals = {"额度重置": 0, "发重置卡": 0, "补充确认": 0}
     for event in events.values():
-        placed = _place_event(event, owners)
+        placed = _place_event(event, owners, zone)
         if placed is None:
             continue
         day, label, state = placed
@@ -172,21 +181,23 @@ def calendar_model(history: dict[str, Any] | None, recent: dict[str, Any] | None
 def _place_event(
     event: dict[str, Any],
     owners: dict[str, tuple[dict[str, Any], dict[str, Any]]],
+    zone: tzinfo,
 ) -> tuple[str, str, str] | None:
+    from tibo_reset_monitor.core.timeutil import local_day
+
     presentation = event.get("presentation") if isinstance(event.get("presentation"), dict) else {}
     confirmed = event.get("confirmationBasis") in ("source_post", "receipt_review") and bool(event.get("confirmedAt"))
     if confirmed:
-        raw_day = event.get("occurredOn") or str(event.get("confirmedAt") or "")[:10]
+        raw_day = event.get("occurredOn") or event.get("confirmedAt")
         state = "confirmed"
     else:
         window = event.get("estimate") or event.get("schedule") or {}
         if not isinstance(window, dict):
             window = {}
-        raw_day = str(window.get("through") or event.get("createdAt") or "")[:10]
+        raw_day = window.get("through") or event.get("createdAt")
         state = "expected" if presentation.get("status") == "likely_completed" else "waiting"
-    try:
-        day = date.fromisoformat(str(raw_day)[:10]).isoformat()
-    except (ValueError, TypeError):
+    day = local_day(raw_day, zone)
+    if day is None:
         return None
     event_type = event.get("type")
     label = "发重置卡" if event_type == "reset_credit" else "额度重置"

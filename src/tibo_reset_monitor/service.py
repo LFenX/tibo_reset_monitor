@@ -62,6 +62,15 @@ def build_runtime(config: AppConfig, *, transport: Any = None, clock: Any = None
         user_agent=config.user_agent,
         timeout=config.timeout_seconds,
     )
+    if config.timezone_fallback:
+        log.warning("could not read an IANA local timezone; using UTC")
+    zones = tuple(
+        dict.fromkeys(
+            target.options.get("timezone") or channel.settings.get("timezone") or config.timezone
+            for channel in config.channels
+            for target in channel.targets
+        )
+    ) or (config.timezone,)
     calendar = HistoryCalendar(
         store,
         history,
@@ -70,6 +79,7 @@ def build_runtime(config: AppConfig, *, transport: Any = None, clock: Any = None
         font_path=config.font_path,
         bold_path=config.font_bold_path,
         font_index=config.font_index,
+        timezones=zones,
     )
     for channel in channels:
         if hasattr(channel, "bind_calendar"):

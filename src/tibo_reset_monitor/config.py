@@ -12,6 +12,7 @@ from typing import Any
 from tibo_reset_monitor import __version__
 from tibo_reset_monitor.core.calendar import default_history_url
 from tibo_reset_monitor.core.model import Target
+from tibo_reset_monitor.core.timeutil import is_valid_zone, system_timezone
 
 DEFAULT_SOURCE_URL = "https://aihot.news/api/v1/codex-resets/recent"
 DEFAULT_USER_AGENT = f"tibo-reset-monitor/{__version__} (+https://github.com/LFenX/tibo_reset_monitor)"
@@ -22,20 +23,20 @@ TELEGRAM_PERSONAL = re.compile(r"^[1-9]\d{0,18}$")
 TELEGRAM_GROUP_ID = re.compile(r"^-[1-9]\d{0,18}$")
 TELEGRAM_GROUP_NAME = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
 
-_ROOT_KEYS = {"language", "source", "state", "logging", "channels", "calendar"}
+_ROOT_KEYS = {"language", "timezone", "source", "state", "logging", "channels", "calendar"}
 _SOURCE_KEYS = {"url", "poll_interval_seconds", "timeout_seconds", "user_agent", "history_url"}
 _CALENDAR_KEYS = {"font_path", "font_bold_path", "font_index", "history_refresh_seconds"}
 _STATE_KEYS = {"path"}
 _LOGGING_KEYS = {"level", "file"}
 _CHANNEL_KEYS = {
-    "feishu": {"enabled", "api_base", "app_id", "app_id_env", "app_secret_env", "language", "targets"},
-    "telegram": {"enabled", "api_base", "bot_token_env", "language", "targets"},
-    "webhook": {"enabled", "language", "targets"},
+    "feishu": {"enabled", "api_base", "app_id", "app_id_env", "app_secret_env", "language", "timezone", "targets"},
+    "telegram": {"enabled", "api_base", "bot_token_env", "language", "timezone", "targets"},
+    "webhook": {"enabled", "language", "timezone", "targets"},
 }
-_FEISHU_TARGET_KEYS = {"name", "kind", "receive_id", "receive_id_type", "language"}
-_TELEGRAM_TARGET_KEYS = {"name", "kind", "chat_id", "language"}
+_FEISHU_TARGET_KEYS = {"name", "kind", "receive_id", "receive_id_type", "language", "timezone"}
+_TELEGRAM_TARGET_KEYS = {"name", "kind", "chat_id", "language", "timezone"}
 _LANGUAGES = {"zh", "en"}
-_WEBHOOK_TARGET_KEYS = {"name", "kind", "url_env", "language"}
+_WEBHOOK_TARGET_KEYS = {"name", "kind", "url_env", "language", "timezone"}
 _FORBIDDEN_KEYS = {"app_secret", "bot_token", "token", "secret", "password", "access_token", "webhook_url"}
 _PERSONAL_ID_TYPES = {"open_id", "user_id", "email"}
 _LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR"}
@@ -71,6 +72,8 @@ class AppConfig:
     font_bold_path: str = ""
     font_index: int | None = None
     language: str = "zh"
+    timezone: str = "UTC"
+    timezone_fallback: bool = False
 
     @property
     def stale_lock_seconds(self) -> float:
@@ -94,6 +97,11 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         global_language = _language(loaded.get("language"), "$.language", errors)
     else:
         global_language = "zh"
+    if "timezone" in loaded:
+        global_timezone = _timezone_name(loaded.get("timezone"), "$.timezone", errors) or "UTC"
+        timezone_fallback = False
+    else:
+        global_timezone, timezone_fallback = system_timezone()
     source = _object(loaded.get("source", {}), "$.source", errors)
     state = _object(loaded.get("state", {}), "$.state", errors)
     logging_block = _object(loaded.get("logging", {}), "$.logging", errors)
@@ -171,7 +179,7 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         if not isinstance(enabled, bool):
             errors.append(f"{path_prefix}.enabled must be true or false")
             enabled = False
-        settings, targets = _channel(name, raw_channel, path_prefix, global_language, errors)
+        settings, targets = _channel(name, raw_channel, path_prefix, global_language, global_timezone, errors)
         channels.append(ChannelSpec(name=name, enabled=enabled, settings=settings, targets=targets))
 
     if errors:
@@ -191,6 +199,8 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         font_bold_path=font_bold_path,
         font_index=font_index,
         language=global_language if global_language in _LANGUAGES else "zh",
+        timezone=global_timezone,
+        timezone_fallback=timezone_fallback,
     )
 
 
@@ -199,6 +209,7 @@ def _channel(
     raw: dict[str, Any],
     prefix: str,
     inherited: str,
+    inherited_timezone: str,
     errors: list[str],
 ) -> tuple[dict[str, str], list[Target]]:
     settings: dict[str, str] = {}
@@ -229,6 +240,10 @@ def _channel(
         settings["language"] = _language(raw.get("language"), f"{prefix}.language", errors)
     else:
         settings["language"] = inherited if inherited in _LANGUAGES else "zh"
+    if "timezone" in raw:
+        settings["timezone"] = _timezone_name(raw.get("timezone"), f"{prefix}.timezone", errors) or inherited_timezone
+    else:
+        settings["timezone"] = inherited_timezone
     targets_raw = raw.get("targets", [])
     if not isinstance(targets_raw, list):
         errors.append(f"{prefix}.targets must be an array")
@@ -259,6 +274,12 @@ def _channel(
             options["language"] = _language(item.get("language"), f"{item_path}.language", errors)
         else:
             options["language"] = settings.get("language", "zh")
+        if "timezone" in item:
+            options["timezone"] = _timezone_name(item.get("timezone"), f"{item_path}.timezone", errors) or settings.get(
+                "timezone", inherited_timezone
+            )
+        else:
+            options["timezone"] = settings.get("timezone", inherited_timezone)
         targets.append(Target(channel=name, key=target_name, kind=kind, address=address, options=options))
     return settings, targets
 
@@ -339,6 +360,19 @@ def _int(value: Any, path: str, errors: list[str]) -> int:
         errors.append(f"{path} must be an integer")
         return 0
     return value
+
+
+def _timezone_name(value: Any, path: str, errors: list[str]) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        errors.append(f"{path} must be an IANA time zone name like Asia/Shanghai")
+        return None
+    name = value.strip()
+    if name.upper() == "UTC":
+        return "UTC"
+    if not is_valid_zone(name):
+        errors.append(f"{path} must be an IANA time zone name like Asia/Shanghai (unknown {name!r})")
+        return None
+    return name
 
 
 def _language(value: Any, path: str, errors: list[str]) -> str:

@@ -43,6 +43,7 @@ class FeishuChannel:
         self._app_id_env = spec.settings.get("app_id_env", "")
         self._secret_env = spec.settings.get("app_secret_env", "TIBO_FEISHU_APP_SECRET")
         self._language = normalize_language(spec.settings.get("language"))
+        self._timezone = spec.settings.get("timezone") or "UTC"
         self._timeout = 20.0
         self._token: str | None = None
         self._token_until = None
@@ -59,15 +60,16 @@ class FeishuChannel:
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
         language = normalize_language(target.options.get("language"), self._language)
-        year_month = self._calendar_month() if self._calendar_month else None
-        message = compose(notice, language, year_month)
+        zone_name = (target.options.get("timezone") or self._timezone or "UTC").strip() or "UTC"
+        year_month = _call_month(self._calendar_month, zone_name)
+        message = compose(notice, language, year_month, timezone_name=zone_name)
         card = _card(message)
         return {
             "receive_id": target.address,
             "receive_id_type": target.options.get("receive_id_type", "chat_id"),
             "msg_type": "interactive",
             "content": json.dumps(card, ensure_ascii=False, separators=(",", ":")),
-            "photo": self._load_photo(language),
+            "photo": self._load_photo(language, zone_name),
             "photo_alt": message.calendar_line,
         }
 
@@ -164,16 +166,21 @@ class FeishuChannel:
         self._token_until = now + timedelta(seconds=max(30, expire - skew))
         return token
 
-    def _load_photo(self, language: str) -> bytes | None:
+    def _load_photo(self, language: str, timezone_name: str) -> bytes | None:
         if self._calendar_png is None:
             return None
         try:
             try:
-                photo = self._calendar_png(language)
+                photo = self._calendar_png(language, timezone_name)
             except TypeError as exc:
                 if "argument" not in str(exc):
                     raise
-                photo = self._calendar_png()
+                try:
+                    photo = self._calendar_png(language)
+                except TypeError as inner:
+                    if "argument" not in str(inner):
+                        raise
+                    photo = self._calendar_png()
         except Exception as exc:
             log.warning("calendar image unavailable: %s", exc)
             return None
@@ -203,6 +210,17 @@ class FeishuChannel:
             return image_key
         log.warning("calendar image upload failed: %s", payload.get("msg") or response.status)
         return None
+
+
+def _call_month(provider: Callable[..., tuple[int, int]] | None, timezone_name: str) -> tuple[int, int] | None:
+    if provider is None:
+        return None
+    try:
+        return provider(timezone_name)
+    except TypeError as exc:
+        if "argument" not in str(exc):
+            raise
+        return provider()
 
 
 def _card(message: Any) -> dict[str, Any]:

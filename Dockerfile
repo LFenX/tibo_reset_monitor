@@ -9,9 +9,10 @@ ENV PYTHONUNBUFFERED=1
 ENV TIBO_STATE_PATH=/data/monitor.sqlite3
 
 # Calendar images need Pillow. Chinese grids use a CJK font. English grids use DejaVu.
+# tzdata supplies IANA zones for Python's zoneinfo, including on Python 3.10.
 # Without Pillow, Telegram still sends one text message and Feishu sends the card without an image.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fonts-wqy-microhei fonts-dejavu-core \
+    && apt-get install -y --no-install-recommends fonts-wqy-microhei fonts-dejavu-core tzdata \
     && pip install --no-cache-dir 'Pillow>=10' \
     && rm -rf /var/lib/apt/lists/*
 
