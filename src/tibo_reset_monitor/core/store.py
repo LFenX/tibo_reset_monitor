@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable
@@ -129,16 +130,39 @@ class StateStore:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA foreign_keys=ON")
-        self.conn.execute("PRAGMA busy_timeout=30000")
-        self.conn.executescript(_SCHEMA)
-        self.conn.commit()
+        # One connection per thread. SQLite rejects a connection used from any
+        # thread but the one that opened it (check_same_thread). The poll loop
+        # and the chat listener share this store, so each thread opens its own
+        # connection to the same file. WAL lets them read and write together.
+        self._local = threading.local()
+        conn = self._open()
+        conn.executescript(_SCHEMA)
+        self._local.conn = conn
+
+    def _open(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        return conn
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        existing = getattr(self._local, "conn", None)
+        if existing is not None:
+            return existing
+        conn = self._open()
+        self._local.conn = conn
+        return conn
 
     def close(self) -> None:
-        self.conn.close()
+        """Close the connection that belongs to the calling thread."""
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            return
+        conn.close()
+        self._local.conn = None
 
     def transaction(self):
         return _Transaction(self.conn)

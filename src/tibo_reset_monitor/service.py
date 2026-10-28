@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import socket
 import threading
 import time
@@ -17,6 +18,7 @@ from tibo_reset_monitor.config import AppConfig
 from tibo_reset_monitor.core.history import HistoryCalendar
 from tibo_reset_monitor.core.http import UrllibTransport
 from tibo_reset_monitor.core.model import MANUAL, CycleReport, Notice, Target, format_utc
+from tibo_reset_monitor.logutil import redact
 from tibo_reset_monitor.core.scheduler import deliver_due, run_cycle
 from tibo_reset_monitor.core.source import SourceClient
 from tibo_reset_monitor.core.store import StateStore
@@ -186,16 +188,12 @@ def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
                 issue_pairing_code(pairing, runtime.clock.now())
             inbox = TelegramInbox(channel, controller, channel._transport)
             inbox.register_commands()
-
-            def loop(inbox: TelegramInbox = inbox) -> None:
-                while not stop.is_set():
-                    try:
-                        inbox.poll_once()
-                    except Exception as exc:
-                        log.warning("telegram chat control failed: %s", type(exc).__name__)
-                    stop.wait(1)
-
-            threading.Thread(target=loop, name="telegram-chat", daemon=True).start()
+            threading.Thread(
+                target=run_telegram_chat_loop,
+                args=(inbox, stop),
+                name="telegram-chat",
+                daemon=True,
+            ).start()
         else:
             client = start_feishu_listener(channel, controller)
             if client is None:
@@ -208,6 +206,44 @@ def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
                     log.warning("feishu chat control stopped: %s", type(exc).__name__)
 
             threading.Thread(target=feishu_loop, name="feishu-chat", daemon=True).start()
+
+
+def run_telegram_chat_loop(inbox: Any, stop: threading.Event, sleep: Any = None) -> None:
+    """Poll Telegram updates until ``stop`` is set.
+
+    A failure waits, then doubles the wait up to 60 seconds, so a broken
+    listener does not log once a second. The next success starts the wait over.
+    """
+    pause = sleep or stop.wait
+    delay = 1.0
+    try:
+        while not stop.is_set():
+            try:
+                inbox.poll_once()
+            except Exception as exc:
+                log.warning("telegram chat control failed: %s", _chat_error(exc))
+                if pause(delay):
+                    return
+                delay = min(delay * 2, 60.0)
+                continue
+            delay = 1.0
+            if pause(1):
+                return
+    finally:
+        store = getattr(getattr(inbox, "controller", None), "store", None)
+        closer = getattr(store, "close", None)
+        if closer is not None:
+            closer()
+
+
+_PAIRING_CODE = re.compile(r"(?i)(pairing code\b[^:\n]*:\s*)([0-9a-f]{6})")
+
+
+def _chat_error(exc: BaseException) -> str:
+    """Exception text safe to log: no bot token and no pairing code."""
+    text = redact(str(exc)).replace("\n", " ")
+    text = _PAIRING_CODE.sub(r"\1<redacted>", text)
+    return text[:500]
 
 
 def status_text(runtime: Runtime, *, as_json: bool) -> str:
