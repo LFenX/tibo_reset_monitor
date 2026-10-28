@@ -12,6 +12,11 @@
     "level": "INFO",
     "file": "logs/monitor.log"
   },
+  "calendar": {
+    "font_path": "",
+    "font_bold_path": "",
+    "history_refresh_seconds": 21600
+  },
   "channels": {
     "feishu": {
       "enabled": true,

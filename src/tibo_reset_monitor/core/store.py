@@ -75,6 +75,12 @@ CREATE TABLE IF NOT EXISTS process_lock (
     owner TEXT NOT NULL,
     acquired_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS history_snapshot (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    etag TEXT,
+    body_json TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 """
 
 
@@ -147,6 +153,53 @@ class StateStore:
             """,
             (etag, payload, format_utc(fetched_at), checked),
         )
+
+    def get_history(self) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT etag, body_json, fetched_at FROM history_snapshot WHERE id = 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "etag": row["etag"],
+            "body": json.loads(row["body_json"]),
+            "fetched_at": row["fetched_at"],
+        }
+
+    def get_history_etag(self) -> str | None:
+        row = self.conn.execute("SELECT etag FROM history_snapshot WHERE id = 1").fetchone()
+        if row is None or row["etag"] is None:
+            return None
+        return str(row["etag"])
+
+    def save_history(self, body: dict[str, Any], etag: str | None, fetched_at: datetime) -> None:
+        payload = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+        self.conn.execute(
+            """
+            INSERT INTO history_snapshot(id, etag, body_json, fetched_at)
+            VALUES (1, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                etag = excluded.etag,
+                body_json = excluded.body_json,
+                fetched_at = excluded.fetched_at
+            """,
+            (etag, payload, format_utc(fetched_at)),
+        )
+        self.set_meta("history_attempt_at", format_utc(fetched_at))
+
+    def touch_history(self, fetched_at: datetime, etag: str | None = None) -> None:
+        """Record a 304 without replacing the cached history body."""
+        if etag is None:
+            self.conn.execute(
+                "UPDATE history_snapshot SET fetched_at = ? WHERE id = 1",
+                (format_utc(fetched_at),),
+            )
+        else:
+            self.conn.execute(
+                "UPDATE history_snapshot SET fetched_at = ?, etag = ? WHERE id = 1",
+                (format_utc(fetched_at), etag),
+            )
+        self.set_meta("history_attempt_at", format_utc(fetched_at))
 
     def acquire_lock(self, owner: str, now: datetime, stale_seconds: float) -> bool:
         row = self.conn.execute("SELECT owner, acquired_at FROM process_lock WHERE id = 1").fetchone()

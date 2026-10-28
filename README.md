@@ -97,6 +97,50 @@ Webhook 可选。把 URL 放在 `url_env` 指向的环境变量里，请求会�
 
 403（被拉黑或无权发言）和 400 `chat not found` 记为永久失败，并在 `status` / `list` 里给出可读原因。429 会按 `retry_after` 退避。
 
+### Telegram 消息长什么样
+
+每条通知、每个目标只发**一条**消息。日历画得出来时用 `sendPhoto`：HTML 说明在上，日历 PNG 在下。原帖链接写在说明末尾，不会再发第二条纯链接消息。也不放头像，因为一张图片只能用来放日历。
+
+说明文字：
+
+- 粗体作者。帖子在 x.com / twitter.com 上且作者是 `thsottiaux` 时写 **Tibo**，其他 X 账号写 `@handle`，其他链接写主机名。
+- 斜体一行：`@thsottiaux · X`，或者其他情况下的 `X` / 主机名。
+- `【事件标签】【阶段】`。标签优先用事件的 `displayLabel`；没有时，`reset_credit` 用「重置卡」，否则用「重置（形式未明确）」。阶段仍是预告、确认、补充、撤回。
+- 正文（`fullText`，否则 `text`）。Telegram 图片说明在解析 HTML 之后最多 1024 个字符，正文过长会截断并加上「…」，标签、时间和原帖链接会留下来。
+- 适用范围（`audienceZh`，否则 `scopeLabel`，都没有则写「帖子未明确适用范围」；事件类型是 `activity` 时不写这一行）、`productsZh`、以及 `帖子发布 · YYYY-MM-DD HH:MM:SS（北京时间）`。
+- 最后是「查看原帖」链接。
+
+手动文本用同一套外壳：标题「手动提醒」，说明行「手动发送」，再加上日历。
+
+日历数据来自全量接口 `https://aihot.news/api/v1/codex-resets`（和 `recent` 同一个响应形状，OpenAPI 里的 `codexResets`），再叠加上最近 7 天的 `recent`。默认每 6 小时最多拉一次全量，北京时间换月时也会更新，并且两次尝试至少间隔 10 分钟（接口要求）。全量拉取失败不会挡住通知，也不会覆盖已经缓存的历史；这时日历只用 `recent`。确认日来自 `occurredOn` / `confirmedAt`，估计窗口不会被画成已确认。
+
+画图是可选的：
+
+```bash
+pip install '.[calendar]'
+```
+
+这会安装 Pillow。中文字体按这个顺序找：`calendar.font_path`（以及可选的 `font_bold_path`）、Windows 微软雅黑 `msyh.ttc` / `msyhbd.ttc`、macOS 苹方或冬青黑体、Linux 的 Noto Sans CJK、文泉驿、思源黑体。Noto CJK 的合集字体默认用第 3 个字面（简体，index 2），可以用 `calendar.font_index` 改。找不到字体、没装 Pillow，或绘图出错时，改发**一条**纯文本（上限 4096，同样会截断正文），并写一条警告日志。通知不会因为画不出图而失败。
+
+假数据画出来的 2026 年 10 月示例：[`docs/calendar-sample.png`](docs/calendar-sample.png)。
+
+一条说明文字的例子：
+
+```text
+Tibo
+@thsottiaux · X
+
+【重置（形式未明确）】【预告】
+
+开玩笑的，今天是重置。
+
+帖子未明确适用范围
+Codex、ChatGPT
+帖子发布 · 2026-10-28 10:42:53（北京时间）
+
+查看原帖
+```
+
 ## 命令
 
 | 命令 | 作用 |
@@ -147,7 +191,7 @@ docker build -t tibo-reset-monitor .
 docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
 ```
 
-镜像默认执行 `run`。状态库在 `/data`（由 `TIBO_STATE_PATH` 指定）。
+镜像默认执行 `run`。状态库在 `/data`（由 `TIBO_STATE_PATH` 指定）。镜像里已经装了 Pillow 和文泉驿微米黑，所以 Telegram 日历图可以画出来。自己构建时如果去掉这两样，通知会退回纯文本。
 
 ## 增加一个渠道
 

@@ -49,36 +49,155 @@ class TelegramRequestTest(unittest.TestCase):
             snapshot([make_event("reset-1", [make_post("p1", "预告", text="a <b>bold</b> & more", original="Just kidding")])])
         )[0]
 
-    def test_group_and_personal_html(self):
+    def test_group_and_personal_are_one_photo_message(self):
+        png = b"\x89PNG\r\n\x1a\ncalendar"
         transport = FakeTransport(
             [
-                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 10}}).encode(), "https://api.telegram.org/bot<redacted>/sendMessage"),
-                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 11}}).encode(), "https://api.telegram.org/bot<redacted>/sendMessage"),
+                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 10}}).encode(), "u"),
+                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 11}}).encode(), "u"),
             ]
         )
         channel = _channel(transport)
+        channel.bind_calendar(lambda: png)
         group = Target("telegram", "ops", "group", "-1001234567890")
         person = Target("telegram", "me", "personal", "424242")
         for target in (group, person):
+            before = len(transport.calls)
             receipt = channel.send(channel.render(self.notice, target), target, "ignored-by-telegram")
             self.assertEqual(receipt.outcome, "sent")
-        self.assertEqual(transport.calls[0]["method"], "POST")
-        self.assertTrue(transport.calls[0]["url"].endswith("/bot123456789:example-token-value-not-real/sendMessage"))
-        group_body = json.loads(transport.calls[0]["body"].decode())
-        person_body = json.loads(transport.calls[1]["body"].decode())
-        self.assertEqual(group_body["chat_id"], "-1001234567890")
-        self.assertEqual(person_body["chat_id"], "424242")
-        self.assertEqual(group_body["parse_mode"], "HTML")
-        self.assertEqual(group_body["link_preview_options"]["url"], "https://x.com/thsottiaux/status/p1")
-        self.assertFalse(group_body["link_preview_options"]["is_disabled"])
-        text = group_body["text"]
-        self.assertIn("&lt;b&gt;bold&lt;/b&gt;", text)
-        self.assertIn("&amp; more", text)
-        self.assertIn("<b>", text)
-        self.assertIn("查看原帖", text)
-        self.assertIn("来源帖子的发布时间", text)
-        self.assertIn(escape_html("Just kidding"), text)
-        self.assertNotIn("<b>bold</b>", text)
+            self.assertEqual(len(transport.calls), before + 1)
+        self.assertTrue(transport.calls[0]["url"].endswith("/sendPhoto"))
+        self.assertTrue(transport.calls[1]["url"].endswith("/sendPhoto"))
+        self.assertNotIn("sendMessage", transport.calls[0]["url"])
+        group_parts = _form(transport.calls[0])
+        person_parts = _form(transport.calls[1])
+        self.assertEqual(group_parts["chat_id"], "-1001234567890")
+        self.assertEqual(person_parts["chat_id"], "424242")
+        self.assertEqual(group_parts["parse_mode"], "HTML")
+        self.assertEqual(group_parts["show_caption_above_media"], "true")
+        self.assertTrue(group_parts["photo"].startswith(b"\x89PNG"))
+        caption = group_parts["caption"]
+        self.assertLessEqual(_parsed_len(caption), 1024)
+        self.assertIn("<b>Tibo</b>", caption)
+        self.assertIn("@thsottiaux · X", caption)
+        self.assertIn("【重置（形式未明确）】【预告】", caption)
+        self.assertIn("&lt;b&gt;bold&lt;/b&gt;", caption)
+        self.assertIn("&amp; more", caption)
+        self.assertIn("帖子发布 · 2026-10-28 10:00:00（北京时间）", caption)
+        self.assertIn("帖子未明确适用范围", caption)
+        self.assertIn('href="https://x.com/thsottiaux/status/p1"', caption)
+        self.assertIn("查看原帖", caption)
+        self.assertNotIn("<b>bold</b>", caption)
+        self.assertNotIn(escape_html("Just kidding"), caption)
+
+    def test_long_body_is_truncated_inside_the_caption_limit(self):
+        from tibo_reset_monitor.channels.telegram import build_caption, parsed_length
+        from tibo_reset_monitor.core.model import Notice
+
+        notice = Notice(
+            dedupe_key="k",
+            post_key="p",
+            stage="announcement",
+            stage_label="预告",
+            title="标题",
+            display_label="重置（形式未明确）",
+            author="thsottiaux",
+            text="测" * 5000 + " <end>",
+            original_text="",
+            url="https://x.com/thsottiaux/status/999",
+            published_at="2026-10-28T10:00:00+08:00",
+            tag_label="重置（形式未明确）",
+        )
+        caption = build_caption(notice, 1024)
+        self.assertLessEqual(parsed_length(caption), 1024)
+        self.assertIn("…", caption)
+        self.assertIn("查看原帖", caption)
+        self.assertNotIn("<end>", caption)
+
+    def test_missing_calendar_falls_back_to_one_text_message(self):
+        transport = FakeTransport(
+            [
+                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 12}}).encode(), "u"),
+            ]
+        )
+        channel = _channel(transport)
+        channel.bind_calendar(lambda: None)
+        target = Target("telegram", "me", "personal", "424242")
+        with self.assertLogs("tibo_reset_monitor", level="WARNING") as captured:
+            receipt = channel.send(channel.render(self.notice, target), target, "k")
+        self.assertEqual(receipt.outcome, "sent")
+        self.assertEqual(len(transport.calls), 1)
+        self.assertTrue(transport.calls[0]["url"].endswith("/sendMessage"))
+        body = json.loads(transport.calls[0]["body"].decode())
+        self.assertEqual(body["chat_id"], "424242")
+        self.assertEqual(body["parse_mode"], "HTML")
+        self.assertLessEqual(_parsed_len(body["text"]), 4096)
+        self.assertIn("<b>Tibo</b>", body["text"])
+        self.assertIn("&amp; more", body["text"])
+        self.assertEqual(body["link_preview_options"]["url"], "https://x.com/thsottiaux/status/p1")
+        self.assertTrue(any("calendar" in line for line in captured.output))
+
+    def test_manual_and_other_authors(self):
+        from tibo_reset_monitor.channels.telegram import build_caption
+        from tibo_reset_monitor.core.model import MANUAL, Notice
+
+        manual = Notice(
+            dedupe_key="m",
+            post_key="m",
+            stage=MANUAL,
+            stage_label="手动",
+            title="别的标题",
+            display_label="x",
+            author="tibo-reset-monitor",
+            text="hello <b>",
+            original_text="",
+            url="https://aihot.news/codex-reset",
+            published_at="2026-10-28T00:00:00Z",
+        )
+        text = build_caption(manual, 4096)
+        self.assertIn("<b>手动提醒</b>", text)
+        self.assertIn("手动发送", text)
+        self.assertIn("hello &lt;b&gt;", text)
+        self.assertNotIn("帖子未明确适用范围", text)
+        other = Notice(
+            dedupe_key="o",
+            post_key="o",
+            stage="confirmation",
+            stage_label="确认",
+            title="",
+            display_label="",
+            author="someone",
+            text="hi",
+            original_text="",
+            url="https://x.com/someone/status/5",
+            published_at="2026-10-28T01:02:03Z",
+            tag_label="重置卡",
+            products_zh="Codex",
+            type_name="reset_credit",
+        )
+        other_text = build_caption(other, 1024)
+        self.assertIn("<b>@someone</b>", other_text)
+        self.assertIn("<i>X</i>", other_text)
+        self.assertIn("【重置卡】【确认】", other_text)
+        self.assertIn("Codex", other_text)
+        self.assertIn("2026-10-28 09:02:03", other_text)
+        host = Notice(
+            dedupe_key="h",
+            post_key="h",
+            stage="announcement",
+            stage_label="预告",
+            title="",
+            display_label="",
+            author="",
+            text="hi",
+            original_text="",
+            url="https://example.com/post",
+            published_at="",
+            tag_label="重置（形式未明确）",
+        )
+        host_text = build_caption(host, 1024)
+        self.assertIn("<b>example.com</b>", host_text)
+        self.assertIn("<i>example.com</i>", host_text)
 
     def test_error_codes(self):
         transport = FakeTransport(
@@ -138,6 +257,27 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertEqual(receipt.outcome, "retryable")
         self.assertIn("TIBO_TELEGRAM_BOT_TOKEN", receipt.detail)
         self.assertEqual(transport.calls, [])
+
+
+def _parsed_len(html: str) -> int:
+    from tibo_reset_monitor.channels.telegram import parsed_length
+
+    return parsed_length(html)
+
+
+def _form(call: dict) -> dict:
+    content_type = call["headers"]["Content-Type"]
+    boundary = content_type.split("boundary=", 1)[1].strip().encode()
+    parts: dict = {}
+    for chunk in call["body"].split(b"--" + boundary):
+        if b"Content-Disposition" not in chunk:
+            continue
+        header, _, data = chunk.partition(b"\r\n\r\n")
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        name = header.split(b'name="', 1)[1].split(b'"', 1)[0].decode()
+        parts[name] = data if name == "photo" else data.decode("utf-8")
+    return parts
 
 
 if __name__ == "__main__":

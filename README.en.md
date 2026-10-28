@@ -97,6 +97,33 @@ The monitor calls the Feishu Open API directly. It does not use `lark-cli`. Mess
 
 403 (blocked, or not allowed to post) and 400 `chat not found` are stored as permanent failures with a readable reason. 429 follows `retry_after`.
 
+### What a Telegram message looks like
+
+Each notice is **one** message per target. When the calendar image can be drawn, that message is `sendPhoto`: the HTML caption is above the PNG. The original post is a link at the end of the caption. There is no second message that only contains the URL, and there is no avatar. A photo message can carry only one image, and that image is the calendar.
+
+The caption is:
+
+- A bold author. Posts on x.com / twitter.com by `thsottiaux` say **Tibo**. Other X accounts say `@handle`. Any other link says the hostname.
+- An italic line: `@thsottiaux · X`, or just `X` / the hostname.
+- `【event label】【stage】`. The label is the event `displayLabel`, or `重置卡` for `reset_credit` when that label is absent, or `重置（形式未明确）` otherwise. The stage is still 预告 / 确认 / 补充 / 撤回.
+- The body (`fullText`, otherwise `text`). A photo caption is at most 1024 characters after HTML is parsed. A long body is cut and ends with `…`, leaving the tags, the time, and the post link in place.
+- Audience (`audienceZh`, otherwise `scopeLabel`, otherwise `帖子未明确适用范围`; omitted when the event type is `activity`), `productsZh` when present, and `帖子发布 · YYYY-MM-DD HH:MM:SS（北京时间）`.
+- A “查看原帖” link.
+
+A manual text uses the same shell: title `手动提醒`, caption line `手动发送`, and the calendar when it can be drawn.
+
+Calendar marks come from the full snapshot `https://aihot.news/api/v1/codex-resets` (the same `CodexResetsResponse` as `recent`; OpenAPI operation `codexResets`) overlaid with the recent feed. The full snapshot is fetched at most every 6 hours by default, also when the Beijing month changes, and never more often than once per 10 minutes. A failed history fetch does not block the notification and does not erase a cached copy. The grid then uses the recent feed alone. A day is confirmed from `occurredOn` / `confirmedAt`. An estimate is not drawn as a confirmation.
+
+Drawing is optional:
+
+```bash
+pip install '.[calendar]'
+```
+
+That installs Pillow. Fonts are searched in this order: `calendar.font_path` (and optional `font_bold_path`), Windows Microsoft YaHei `msyh.ttc` / `msyhbd.ttc`, macOS PingFang or Hiragino, then Linux Noto Sans CJK, WenQuanYi, and Source Han Sans. A Noto CJK collection uses face index 2 (Simplified Chinese) unless `calendar.font_index` is set. If no font is found, Pillow is missing, or drawing fails, Telegram sends **one** text message instead (limit 4096, same truncation) and logs a warning. The notification is not failed because the image could not be produced.
+
+Sample grid for October 2026, drawn from fake events: [`docs/calendar-sample.png`](docs/calendar-sample.png).
+
 ## Commands
 
 | Command | Purpose |
@@ -147,7 +174,7 @@ docker build -t tibo-reset-monitor .
 docker run --rm -v "$PWD/config.json:/config/config.json:ro" -v tibo-state:/data --env-file .env tibo-reset-monitor
 ```
 
-The image runs `run` by default. The database is `/data` via `TIBO_STATE_PATH`.
+The image runs `run` by default. The database is `/data` via `TIBO_STATE_PATH`. The image installs Pillow and WenQuanYi Micro Hei so the Telegram calendar can be drawn. Without those, notifications fall back to a single text message.
 
 ## Adding a channel
 

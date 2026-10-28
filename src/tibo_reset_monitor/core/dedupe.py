@@ -177,6 +177,9 @@ def _build_notice(
     confirmed_at = ""
     scope_label = _as_text(presentation.get("scopeLabel"))
     presentation_status = _as_text(presentation.get("status"))
+    audience_zh = _as_text(presentation.get("audienceZh"))
+    products_zh = _as_text(presentation.get("productsZh"))
+    qualified_scope = _as_text(presentation.get("scopeLabel"))
     if event:
         display_label = _as_text(event.get("displayLabel")) or _as_text(event.get("label"))
         title = _as_text(event.get("title"))
@@ -207,6 +210,10 @@ def _build_notice(
         scope_label=scope_label,
         event_url=event_url,
         confirmed_at=confirmed_at,
+        audience_zh=audience_zh,
+        products_zh=products_zh,
+        qualified_scope=qualified_scope,
+        tag_label=_event_tag(event),
     )
 
 
@@ -233,7 +240,22 @@ def _merge(existing: Notice, incoming: Notice) -> Notice:
         scope_label=existing.scope_label or incoming.scope_label,
         event_url=existing.event_url or incoming.event_url,
         confirmed_at=existing.confirmed_at or incoming.confirmed_at,
+        audience_zh=existing.audience_zh or incoming.audience_zh,
+        products_zh=existing.products_zh or incoming.products_zh,
+        qualified_scope=existing.qualified_scope or incoming.qualified_scope,
+        tag_label=existing.tag_label or incoming.tag_label,
     )
+
+
+def _event_tag(event: dict[str, Any] | None) -> str:
+    """Tag text for a card: displayLabel, else 重置卡 for an explicit credit grant."""
+    if event:
+        display = _as_text(event.get("displayLabel"))
+        if display:
+            return display
+        if event.get("type") == "reset_credit":
+            return "重置卡"
+    return "重置（形式未明确）"
 
 
 def _post_text(post: dict[str, Any]) -> tuple[str, str]:

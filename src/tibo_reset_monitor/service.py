@@ -13,6 +13,7 @@ from typing import Any
 
 from tibo_reset_monitor.channels import build_channels
 from tibo_reset_monitor.config import AppConfig
+from tibo_reset_monitor.core.history import HistoryCalendar
 from tibo_reset_monitor.core.http import UrllibTransport
 from tibo_reset_monitor.core.model import MANUAL, CycleReport, Notice, Target, format_utc
 from tibo_reset_monitor.core.scheduler import deliver_due, run_cycle
@@ -35,6 +36,7 @@ class Runtime:
     channels: list[Any]
     clock: Any
     owner: str
+    calendar: HistoryCalendar | None = None
 
     def close(self) -> None:
         self.store.close()
@@ -54,8 +56,34 @@ def build_runtime(config: AppConfig, *, transport: Any = None, clock: Any = None
     for channel in channels:
         if hasattr(channel, "_timeout"):
             channel._timeout = config.timeout_seconds
+    history = SourceClient(
+        config.history_url,
+        transport=transport,
+        user_agent=config.user_agent,
+        timeout=config.timeout_seconds,
+    )
+    calendar = HistoryCalendar(
+        store,
+        history,
+        clock,
+        refresh_seconds=config.history_refresh_seconds,
+        font_path=config.font_path,
+        bold_path=config.font_bold_path,
+        font_index=config.font_index,
+    )
+    for channel in channels:
+        if getattr(channel, "name", "") == "telegram" and hasattr(channel, "bind_calendar"):
+            channel.bind_calendar(calendar.png)
     identity = owner or f"{os.getpid()}@{socket.gethostname()}"
-    return Runtime(config=config, store=store, source=source, channels=channels, clock=clock, owner=identity)
+    return Runtime(
+        config=config,
+        store=store,
+        source=source,
+        channels=channels,
+        clock=clock,
+        owner=identity,
+        calendar=calendar,
+    )
 
 
 def poll(runtime: Runtime) -> int:
@@ -64,6 +92,7 @@ def poll(runtime: Runtime) -> int:
         log.warning("another monitor process is running; skipping this poll")
         return 0
     try:
+        _refresh_history(runtime)
         report = run_cycle(
             store=runtime.store,
             source=runtime.source,
@@ -85,6 +114,7 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
     try:
         while True:
             runtime.store.acquire_lock(runtime.owner, runtime.clock.now(), runtime.config.stale_lock_seconds)
+            _refresh_history(runtime)
             report = run_cycle(
                 store=runtime.store,
                 source=runtime.source,
@@ -266,10 +296,22 @@ def _resolve(runtime: Runtime, channel_name: str, target_name: str) -> tuple[Any
     raise KeyError(f"channel {channel_name!r} is not enabled; enabled channels: {names}")
 
 
+def _refresh_history(runtime: Runtime) -> None:
+    if runtime.calendar is None:
+        return
+    try:
+        runtime.calendar.refresh()
+    except Exception as exc:
+        log.warning("history refresh failed: %s", exc)
+
+
 def _preview(rendered: dict[str, Any]) -> str:
     import json
 
     printable = dict(rendered)
+    photo = printable.get("photo")
+    if isinstance(photo, (bytes, bytearray)):
+        printable["photo"] = f"<{len(photo)} bytes PNG>"
     content = printable.get("content")
     if isinstance(content, str):
         try:

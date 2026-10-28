@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from tibo_reset_monitor import __version__
+from tibo_reset_monitor.core.calendar import default_history_url
 from tibo_reset_monitor.core.model import Target
 
 DEFAULT_SOURCE_URL = "https://aihot.news/api/v1/codex-resets/recent"
@@ -21,8 +22,9 @@ TELEGRAM_PERSONAL = re.compile(r"^[1-9]\d{0,18}$")
 TELEGRAM_GROUP_ID = re.compile(r"^-[1-9]\d{0,18}$")
 TELEGRAM_GROUP_NAME = re.compile(r"^@[A-Za-z][A-Za-z0-9_]{4,31}$")
 
-_ROOT_KEYS = {"source", "state", "logging", "channels"}
-_SOURCE_KEYS = {"url", "poll_interval_seconds", "timeout_seconds", "user_agent"}
+_ROOT_KEYS = {"source", "state", "logging", "channels", "calendar"}
+_SOURCE_KEYS = {"url", "poll_interval_seconds", "timeout_seconds", "user_agent", "history_url"}
+_CALENDAR_KEYS = {"font_path", "font_bold_path", "font_index", "history_refresh_seconds"}
 _STATE_KEYS = {"path"}
 _LOGGING_KEYS = {"level", "file"}
 _CHANNEL_KEYS = {
@@ -62,6 +64,11 @@ class AppConfig:
     log_level: str
     log_file: str | None
     channels: list[ChannelSpec]
+    history_url: str = ""
+    history_refresh_seconds: int = 6 * 60 * 60
+    font_path: str = ""
+    font_bold_path: str = ""
+    font_index: int | None = None
 
     @property
     def stale_lock_seconds(self) -> float:
@@ -88,9 +95,11 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
     if not isinstance(channels_block, dict):
         errors.append("$.channels must be an object")
         channels_block = {}
+    calendar_block = _object(loaded.get("calendar", {}), "$.calendar", errors)
     _unknown(source, _SOURCE_KEYS, "$.source", errors)
     _unknown(state, _STATE_KEYS, "$.state", errors)
     _unknown(logging_block, _LOGGING_KEYS, "$.logging", errors)
+    _unknown(calendar_block, _CALENDAR_KEYS, "$.calendar", errors)
 
     source_url = str(source.get("url") or DEFAULT_SOURCE_URL)
     if not source_url.startswith("https://"):
@@ -121,6 +130,27 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         errors.append("$.logging.file must be a string or omitted")
         log_file = None
 
+    history_url = str(source.get("history_url") or default_history_url(source_url))
+    if not history_url.startswith("https://"):
+        errors.append("$.source.history_url must be an https URL")
+    refresh_raw = calendar_block.get("history_refresh_seconds", 6 * 60 * 60)
+    history_refresh_seconds = _int(refresh_raw, "$.calendar.history_refresh_seconds", errors)
+    if history_refresh_seconds < 600:
+        errors.append("$.calendar.history_refresh_seconds must be at least 600")
+    font_path = calendar_block.get("font_path") or ""
+    font_bold_path = calendar_block.get("font_bold_path") or ""
+    if not isinstance(font_path, str):
+        errors.append("$.calendar.font_path must be a string")
+        font_path = ""
+    if not isinstance(font_bold_path, str):
+        errors.append("$.calendar.font_bold_path must be a string")
+        font_bold_path = ""
+    font_index: int | None = None
+    if "font_index" in calendar_block and calendar_block.get("font_index") is not None:
+        font_index = _int(calendar_block.get("font_index"), "$.calendar.font_index", errors)
+        if font_index < 0:
+            errors.append("$.calendar.font_index must be zero or greater")
+
     channels: list[ChannelSpec] = []
     for name, raw_channel in channels_block.items():
         path_prefix = f"$.channels.{name}"
@@ -149,6 +179,11 @@ def load_config(path: str | Path, *, environ: dict[str, str] | None = None) -> A
         log_level=log_level,
         log_file=log_file if isinstance(log_file, str) and log_file else None,
         channels=channels,
+        history_url=history_url,
+        history_refresh_seconds=history_refresh_seconds,
+        font_path=font_path,
+        font_bold_path=font_bold_path,
+        font_index=font_index,
     )
 
 

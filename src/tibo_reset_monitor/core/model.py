@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -117,6 +117,10 @@ class Notice:
     scope_label: str = ""
     event_url: str = ""
     confirmed_at: str = ""
+    audience_zh: str = ""
+    products_zh: str = ""
+    qualified_scope: str = ""
+    tag_label: str = ""
     id: int | None = None
 
     def headline(self) -> str:
@@ -130,8 +134,8 @@ class Notice:
 
     @classmethod
     def from_json(cls, payload: dict[str, Any], notice_id: int | None = None) -> Notice:
-        data = dict(payload)
-        data.pop("id", None)
+        known = {item.name for item in fields(cls)} - {"id"}
+        data = {key: value for key, value in payload.items() if key in known}
         return cls(id=notice_id, **data)
 
 

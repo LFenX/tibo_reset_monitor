@@ -2,7 +2,7 @@
 
 Thanks for looking at tibo-reset-monitor.
 
-- Python 3.10 or newer. Keep the core and the built-in channels on the standard library.
+- Python 3.10 or newer. Keep the core and the built-in channels importable on the standard library. Pillow is an optional extra (`pip install '.[calendar]'`) used only to draw the calendar. Tests must pass with and without it.
 - Run tests before sending a change:
 
   ```bash

@@ -47,3 +47,5 @@ class ExampleChannel:
 Group and personal targets both go through this class. Put the difference in the request (chat id versus user id), not in a second code path in the core.
 
 `notice_lines(notice)` in `core/model.py` is the shared wording, including the note that the timestamp is the source post time. Reuse it so every channel says the same thing.
+
+The month grid lives in `core/calendar.py` (`calendar_model`, `render_calendar_png`). It is not part of the Telegram module, so another channel can attach the same PNG later. Rendering needs the optional `calendar` extra (`Pillow`) and a CJK font; if either is missing the function raises `CalendarImageUnavailable` and the channel should send text instead of failing the delivery.

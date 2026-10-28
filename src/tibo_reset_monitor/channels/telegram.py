@@ -1,17 +1,35 @@
-"""Telegram Bot API notifications. Group and personal chats both use sendMessage."""
+"""Telegram Bot API notifications.
+
+One notice is one message. When a calendar PNG is available it is sent with
+``sendPhoto`` and an HTML caption. Otherwise the same caption is a single
+``sendMessage``. There is no second message for the post link, and no avatar:
+a photo message can carry only the calendar image.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import os
-from typing import Any
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 from tibo_reset_monitor.channels.base import receipt_from_transport
 from tibo_reset_monitor.config import ChannelSpec
 from tibo_reset_monitor.core.http import TransportError
-from tibo_reset_monitor.core.model import Notice, Receipt, Target, notice_lines
+from tibo_reset_monitor.core.model import MANUAL, Notice, Receipt, Target
 
-_HTML_LIMIT = 3900
+log = logging.getLogger("tibo_reset_monitor")
+
+_PHOTO_CAPTION_LIMIT = 1024
+_TEXT_LIMIT = 4096
+_BODY_CAP = 6000
+_BEIJING = timezone(timedelta(hours=8))
+_X_HOSTS = {"x.com", "twitter.com", "mobile.twitter.com", "www.x.com", "www.twitter.com"}
+_TAG_RE = re.compile(r"<[^>]+>")
 
 
 class TelegramChannel:
@@ -24,54 +42,102 @@ class TelegramChannel:
         self._api_base = spec.settings.get("api_base", "https://api.telegram.org").rstrip("/")
         self._token_env = spec.settings.get("bot_token_env", "TIBO_TELEGRAM_BOT_TOKEN")
         self._timeout = 20.0
+        self._calendar_png: Callable[[], bytes | None] | None = None
+
+    def bind_calendar(self, provider: Callable[[], bytes | None]) -> None:
+        self._calendar_png = provider
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
-        preview_url = notice.url if notice.url.startswith("https://") or notice.url.startswith("http://") else ""
-        payload: dict[str, Any] = {
+        photo = self._load_photo()
+        return {
             "chat_id": target.address,
-            "text": render_html(notice),
+            "photo": photo,
+            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT),
+            "text": build_caption(notice, _TEXT_LIMIT),
             "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": not bool(preview_url), "url": preview_url} if preview_url else {"is_disabled": True},
         }
-        return payload
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
         del target, idempotency_key  # Telegram has no uuid; the outbox row is the idempotency record.
         token = os.environ.get(self._token_env, "").strip()
         if not token:
             return Receipt("retryable", detail=f"{self._token_env} is not set")
-        url = f"{self._api_base}/bot{token}/sendMessage"
-        try:
-            response = self._transport.send(
-                "POST",
-                url,
-                {"Content-Type": "application/json; charset=utf-8"},
-                json.dumps(message, ensure_ascii=False).encode("utf-8"),
-                self._timeout,
+        photo = message.get("photo")
+        if isinstance(photo, (bytes, bytearray)) and photo:
+            body, content_type = _multipart(
+                [
+                    ("chat_id", str(message["chat_id"])),
+                    ("caption", message["caption"]),
+                    ("parse_mode", "HTML"),
+                    ("show_caption_above_media", "true"),
+                ],
+                bytes(photo),
             )
+            url = f"{self._api_base}/bot{token}/sendPhoto"
+            headers = {"Content-Type": content_type}
+        else:
+            payload: dict[str, Any] = {
+                "chat_id": message["chat_id"],
+                "text": message["text"],
+                "parse_mode": "HTML",
+            }
+            link = _href_from_html(message.get("text") or "")
+            if link:
+                payload["link_preview_options"] = {"is_disabled": False, "url": link}
+            else:
+                payload["link_preview_options"] = {"is_disabled": True}
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            url = f"{self._api_base}/bot{token}/sendMessage"
+            headers = {"Content-Type": "application/json; charset=utf-8"}
+        try:
+            response = self._transport.send("POST", url, headers, body, self._timeout)
         except TransportError as exc:
             return receipt_from_transport(exc, sent=True)
         return _receipt(response.status, response.body, response.headers)
 
+    def _load_photo(self) -> bytes | None:
+        if self._calendar_png is None:
+            return None
+        try:
+            photo = self._calendar_png()
+        except Exception as exc:
+            log.warning("calendar image unavailable: %s", exc)
+            return None
+        if not photo:
+            log.warning("calendar image unavailable; sending a text message")
+            return None
+        return photo
 
-def render_html(notice: Notice) -> str:
-    text = _clip(notice.text, 1500)
-    original = _clip(notice.original_text, 1000)
-    lines = [f"<b>{escape_html(notice.headline())}</b>"]
-    subtitle = f"@{notice.author}" if notice.author else "@thsottiaux"
-    if notice.published_at:
-        subtitle += f" · {notice.published_at}"
-    lines.append(escape_html(subtitle))
-    lines.append("")
-    body_notice = Notice(**{**notice.__dict__, "text": text, "original_text": original})
-    for line in notice_lines(body_notice):
-        lines.append(escape_html(line))
-    if notice.url:
-        lines.append(f'<a href="{escape_attr(notice.url)}">查看原帖</a>')
-    rendered = "\n".join(lines)
-    if len(rendered) > _HTML_LIMIT:
-        rendered = rendered[: _HTML_LIMIT - 1] + "…"
-    return rendered
+
+def build_caption(notice: Notice, limit: int) -> str:
+    """HTML caption whose parsed text length is at most ``limit`` UTF-16 code units."""
+    source = notice.text or ""
+    if len(source) > _BODY_CAP:
+        source = source[:_BODY_CAP]
+    best = _assemble(notice, "")
+    if parsed_length(best) > limit:
+        return _hard_trim(best, limit)
+    lo = 0
+    hi = len(source)
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        body = source[:mid]
+        if mid < len(source):
+            body = body.rstrip() + "…"
+        candidate = _assemble(notice, body)
+        if parsed_length(candidate) <= limit:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
+def parsed_length(html: str) -> int:
+    """Length Telegram counts after HTML entities are parsed, in UTF-16 code units."""
+    text = _TAG_RE.sub("", html)
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&amp;", "&")
+    return len(text.encode("utf-16-le")) // 2
 
 
 def escape_html(value: str) -> str:
@@ -82,10 +148,124 @@ def escape_attr(value: str) -> str:
     return escape_html(value).replace('"', "&quot;")
 
 
-def _clip(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    return value[: limit - 1] + "…"
+def _assemble(notice: Notice, body: str) -> str:
+    if notice.stage == MANUAL:
+        lines = ["<b>手动提醒</b>", "<i>手动发送</i>", ""]
+        if body:
+            lines.append(escape_html(body))
+        return "\n".join(lines).strip()
+    name, caption = _author_lines(notice)
+    lines = [f"<b>{escape_html(name)}</b>", f"<i>{escape_html(caption)}</i>", ""]
+    tag = notice.tag_label or "重置（形式未明确）"
+    stage = notice.stage_label or notice.stage
+    lines.append(escape_html(f"【{tag}】【{stage}】"))
+    lines.append("")
+    if body:
+        lines.append(escape_html(body))
+        lines.append("")
+    for detail in _detail_lines(notice):
+        lines.append(f"<i>{escape_html(detail)}</i>")
+    link = notice.url if notice.url.startswith(("https://", "http://")) else ""
+    if link:
+        lines.append("")
+        lines.append(f'<a href="{escape_attr(link)}">查看原帖</a>')
+    return "\n".join(lines).strip()
+
+
+def _author_lines(notice: Notice) -> tuple[str, str]:
+    host, handle = _identity(notice.url)
+    if host in _X_HOSTS and handle:
+        if handle.lower() == "thsottiaux":
+            return "Tibo", "@thsottiaux · X"
+        return f"@{handle}", "X"
+    if host:
+        return host, host
+    author = (notice.author or "").strip()
+    if author.lower() == "thsottiaux":
+        return "Tibo", "@thsottiaux · X"
+    if author:
+        return f"@{author.lstrip('@')}", "X"
+    return "Tibo", "@thsottiaux · X"
+
+
+def _detail_lines(notice: Notice) -> list[str]:
+    lines: list[str] = []
+    if notice.type_name != "activity":
+        audience = notice.audience_zh or notice.qualified_scope or "帖子未明确适用范围"
+        lines.append(audience)
+    if notice.products_zh:
+        lines.append(notice.products_zh)
+    stamp = _beijing_stamp(notice.published_at)
+    if stamp:
+        lines.append(f"帖子发布 · {stamp}（北京时间）")
+    return lines
+
+
+def _beijing_stamp(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=_BEIJING)
+    return parsed.astimezone(_BEIJING).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _identity(url: str) -> tuple[str, str]:
+    if not url:
+        return "", ""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    handle = ""
+    if host in _X_HOSTS:
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts and parts[0].lower() != "i":
+            handle = parts[0]
+    return host, handle
+
+
+def _href_from_html(html: str) -> str:
+    match = re.search(r'href="([^"]+)"', html)
+    if not match:
+        return ""
+    return match.group(1).replace("&amp;", "&").replace("&quot;", '"')
+
+
+def _hard_trim(html: str, limit: int) -> str:
+    """Last resort when the shell itself is over the limit."""
+    text = _TAG_RE.sub("", html)
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&amp;", "&")
+    trimmed = text
+    while trimmed and len(trimmed.encode("utf-16-le")) // 2 > limit - 1:
+        trimmed = trimmed[:-1]
+    return escape_html(trimmed + "…") if trimmed else "…"
+
+
+def _multipart(fields: list[tuple[str, str]], photo: bytes) -> tuple[bytes, str]:
+    boundary = "tibo" + uuid.uuid4().hex
+    chunks: list[bytes] = []
+    for name, value in fields:
+        chunks.append(
+            (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+    chunks.append(
+        (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="photo"; filename="calendar.png"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+        + photo
+        + b"\r\n"
+    )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
 def _receipt(status: int, body: bytes, headers: dict[str, str]) -> Receipt:
@@ -146,3 +326,4 @@ def _json_object(body: bytes) -> dict[str, Any]:
     except (UnicodeDecodeError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
