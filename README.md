@@ -53,7 +53,7 @@ Telegram 的一条 `sendPhoto` 说明文字大致如下。日历图接在最后�
 <b>Tibo</b>
 <i>@thsottiaux · X</i>
 
-<code>重置（形式未明确）</code> <code>预告</code>
+<code>重置（形式未明确，默认额度重置）</code> <code>预告</code>
 
 搞定了。明天见，会有好消息。
 
@@ -70,7 +70,7 @@ Lands by midnight PST.
 重置日历 · 2026 年 10 月
 ```
 
-原帖英文来自 `fullOriginalText`（没有则用 `originalText`）。`context` 里 `relation` 为 `quote` 的写成「引用 @作者」，`reply` 写成「回复 @作者」。引用帖没有单独的发布时间，时间用主帖的 `publishedAt`。没有原文也没有 `context` 时，引用块省略。
+标签原文是「重置（形式未明确）」时，Telegram 显示为「重置（形式未明确，默认额度重置）」。「重置（额度重置）」「发重置卡」等其他标签保持原样。原帖英文来自 `fullOriginalText`（没有则用 `originalText`）。`context` 里 `relation` 为 `quote` 的写成「引用 @作者」，`reply` 写成「回复 @作者」。引用帖没有单独的发布时间，时间用主帖的 `publishedAt`。没有原文也没有 `context` 时，引用块省略。
 
 日历按北京时间取当前月。格子里 `reset_credit` 写成「发重置卡」，其余写成「额度重置」。形式不明确、且引用了其他事件「补充说明」的，仍标成「补充确认」。顶部数字只统计这个月已确认的事件。月初月末的灰色格子是相邻月份。下面是 2026 年 11 月的样图（6 行周）；12 月和 2027 年 2 月的样图也在 `docs/` 里。
 

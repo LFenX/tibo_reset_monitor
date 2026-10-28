@@ -216,7 +216,7 @@ def _assemble(
         return "\n".join(lines).strip()
     name, caption = _author_lines(notice)
     lines = [f"<b>{escape_html(name)}</b>", f"<i>{escape_html(caption)}</i>", ""]
-    tag = notice.tag_label or "重置（形式未明确）"
+    tag = _caption_tag(notice.tag_label or "重置（形式未明确）")
     stage = notice.stage_label or notice.stage
     lines.append(f"<code>{escape_html(tag)}</code> <code>{escape_html(stage)}</code>")
     lines.append("")
@@ -235,6 +235,13 @@ def _assemble(
     lines.append("")
     lines.append(escape_html(_calendar_line(year_month)))
     return "\n".join(lines).strip()
+
+
+def _caption_tag(tag: str) -> str:
+    """Telegram-only display tweak. Other tag strings are left as stored."""
+    if tag == "重置（形式未明确）":
+        return "重置（形式未明确，默认额度重置）"
+    return tag
 
 
 def _calendar_line(year_month: tuple[int, int] | None) -> str:

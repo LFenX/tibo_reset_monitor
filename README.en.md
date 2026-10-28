@@ -53,7 +53,7 @@ A Telegram `sendPhoto` caption looks like this. The calendar image follows the l
 <b>Tibo</b>
 <i>@thsottiaux · X</i>
 
-<code>重置（形式未明确）</code> <code>预告</code>
+<code>重置（形式未明确，默认额度重置）</code> <code>预告</code>
 
 搞定了。明天见，会有好消息。
 
@@ -70,7 +70,7 @@ Lands by midnight PST.
 重置日历 · 2026 年 10 月
 ```
 
-The English original comes from `fullOriginalText`, or `originalText` when that field is absent. A `context` item with `relation: quote` is shown as `引用 @author`; `reply` is `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The blockquote is omitted when both the original text and `context` are empty.
+When the stored tag is 「重置（形式未明确）」, Telegram shows 「重置（形式未明确，默认额度重置）」. Other tags, such as 「重置（额度重置）」 and 「发重置卡」, stay as they are. The English original comes from `fullOriginalText`, or `originalText` when that field is absent. A `context` item with `relation: quote` is shown as `引用 @author`; `reply` is `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The blockquote is omitted when both the original text and `context` are empty.
 
 The calendar month is Beijing time. A `reset_credit` cell says 发重置卡; every other event says 额度重置. 补充确认 is still used when the form was not explicit and the post quotes another event's 补充说明. The header counts only confirmed events in that month. Grey cells at the edges belong to the neighboring month. November 2026 below is six week rows. December 2026 and February 2027 are in `docs/` as well.
 
