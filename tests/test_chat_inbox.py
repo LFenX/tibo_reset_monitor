@@ -137,6 +137,54 @@ class InboxPollTest(TempStoreTest):
         self.assertEqual(channel._transport.calls, 1)
         self.assertIn("webhook", "\n".join(captured.output).lower())
 
+    def test_a_broken_update_still_advances_the_offset(self):
+        os.environ["TIBO_TELEGRAM_BOT_TOKEN"] = "123456:AAAAAAAAAAAAAAAAAAAA"
+        self.addCleanup(os.environ.pop, "TIBO_TELEGRAM_BOT_TOKEN", None)
+
+        class Boom:
+            def handle(self, inbound):
+                raise RuntimeError("boom 123456:AAAAAAAAAAAAAAAAAAAA")
+
+        class Transport:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def send(self, method, url, headers, body, timeout):
+                self.calls += 1
+                payload = {
+                    "ok": True,
+                    "result": [
+                        {
+                            "update_id": 9,
+                            "message": {
+                                "text": "/help",
+                                "from": {"id": 42},
+                                "chat": {"id": 42, "type": "private"},
+                            },
+                        }
+                    ],
+                }
+                return HttpResponse(200, {}, json.dumps(payload).encode(), url)
+
+        channel = TelegramChannel(
+            ChannelSpec(
+                name="telegram",
+                enabled=True,
+                settings={"api_base": "https://api.telegram.org", "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN"},
+                targets=[],
+            ),
+            Transport(),
+            clock=None,
+        )
+        inbox = TelegramInbox(channel, Boom(), channel._transport)
+        inbox.controller.store = self.store
+        with self.assertLogs("tibo_reset_monitor", level="WARNING") as captured:
+            inbox.poll_once()
+        self.assertEqual(self.store.get_meta("telegram_update_offset"), "10")
+        text = "\n".join(captured.output)
+        self.assertNotIn("123456:AAAAAAAAAAAAAAAAAAAA", text)
+        self.assertIn("<redacted-token>", text)
+
 
 class FeishuInboxTest(unittest.TestCase):
     def test_keeps_only_needed_fields(self):

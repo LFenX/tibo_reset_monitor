@@ -7,7 +7,9 @@ changes live here so every channel shares them.
 
 from __future__ import annotations
 
+import hmac
 import logging
+import re
 import secrets
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -25,6 +27,9 @@ PAIR_SECONDS = 10 * 60
 PAIR_ATTEMPTS = 5
 COMMAND_LIMIT = 20
 COMMAND_WINDOW = 60
+
+# Telegram user ids are positive decimals. Feishu open_ids start with ou_.
+_ADMIN_ID = re.compile(r"^(?:[1-9]\d{0,18}|ou_[A-Za-z0-9_]{1,120})$")
 
 _COMMANDS = {
     "/start": "help",
@@ -96,7 +101,7 @@ class PairingGate:
         fresh = (
             not self.used
             and bool(self.code)
-            and offered.strip() == self.code
+            and _codes_match(offered, self.code)
             and self.expires_at is not None
             and now <= self.expires_at
         )
@@ -272,8 +277,8 @@ class ChatController:
             self.store.clear_session(self.channel, inbound.user_id)
             return Reply(inbound.chat_id, self._t("expired"))
         candidates = session["candidates"]
-        if text.isdigit():
-            index = int(text)
+        index = _list_index(text)
+        if index is not None:
             if not 1 <= index <= len(candidates):
                 return Reply(inbound.chat_id, self._t("bad_choice"))
             chosen = candidates[index - 1]
@@ -321,10 +326,7 @@ class ChatController:
 
     def _add_admin(self, inbound: Inbound, argument: str, now: datetime) -> Reply:
         user_id = argument.strip()
-        if not user_id or not user_id.lstrip("-").isdigit() and not user_id.startswith("ou_"):
-            if not user_id:
-                return Reply(inbound.chat_id, self._t("admin_usage"))
-        if not user_id:
+        if _ADMIN_ID.fullmatch(user_id) is None:
             return Reply(inbound.chat_id, self._t("admin_usage"))
         self.store.add_chat_admin(self.channel, user_id, now)
         return Reply(inbound.chat_id, self._t("admin_added"))
@@ -386,6 +388,22 @@ def normalize_command_text(text: str) -> str:
     if "@" in token:
         token = token.split("@", 1)[0]
     return (token + (" " + rest if rest else "")).strip()
+
+
+def _codes_match(offered: str, code: str) -> bool:
+    """Compare a pairing attempt without leaking the code through equality timing."""
+    left = offered.strip().lower().encode("utf-8")
+    right = code.strip().lower().encode("utf-8")
+    if len(left) > 64 or len(right) > 64:
+        return False
+    return hmac.compare_digest(left, right)
+
+
+def _list_index(text: str) -> int | None:
+    """A short ASCII number. Unicode digits are not indexes; ``int('²')`` would throw."""
+    if not text.isascii() or not text.isdigit() or len(text) > 6:
+        return None
+    return int(text)
 
 
 def _opened_with_start(text: str) -> bool:

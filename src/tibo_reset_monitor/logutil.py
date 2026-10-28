@@ -48,4 +48,8 @@ def configure_logging(level: str, log_file: str | None = None) -> None:
         file_handler = logging.FileHandler(path, encoding="utf-8")
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
     root.propagate = False

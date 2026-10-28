@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -166,6 +167,44 @@ class ChatFlowTest(TempStoreTest):
         limited = guest.handle(_inbound(event_id=f"lim-{index}", user_id="8", chat_id="8", text="/pair nope"))
         assert limited is not None
         self.assertIn("过多", limited.text)
+        stranger = self._controller()
+        refused = stranger.handle(_inbound(event_id="e9", user_id="7", chat_id="7", text="/addadmin 16"))
+        assert refused is not None
+        self.assertIn("管理员", refused.text)
+        self.assertFalse(self.store.is_chat_admin("telegram", "16"))
+        junk = guest.handle(_inbound(event_id="e10", user_id="9", chat_id="9", text="/addadmin not-an-id"))
+        assert junk is not None
+        self.assertIn("用法", junk.text)
+        self.assertFalse(self.store.is_chat_admin("telegram", "not-an-id"))
+        negative = guest.handle(_inbound(event_id="e11", user_id="9", chat_id="9", text="/addadmin -100"))
+        assert negative is not None
+        self.assertIn("用法", negative.text)
+        self.assertFalse(self.store.is_chat_admin("telegram", "-100"))
+        feishu_admin = guest.handle(_inbound(event_id="e12", user_id="9", chat_id="9", text="/addadmin ou_abc_1"))
+        assert feishu_admin is not None
+        self.assertTrue(self.store.is_chat_admin("telegram", "ou_abc_1"))
+
+    def test_pairing_accepts_the_code_in_either_case_once(self):
+        gate = PairingGate()
+        code = gate.issue(NOW)
+        guest = self._controller(admins=(), pairing=gate)
+        ok = guest.handle(_inbound(event_id="e2", user_id="9", chat_id="9", text=f"/pair {code.upper()}"))
+        assert ok is not None
+        self.assertIn("已成为", ok.text)
+        replay = guest.handle(_inbound(event_id="e3", user_id="9", chat_id="9", text=f"/pair {code}"))
+        assert replay is not None
+        self.assertIn("无效", replay.text)
+
+    def test_unicode_digit_does_not_crash_the_picker(self):
+        self.controller.handle(_inbound(event_id="e2", text="#添加群聊"))
+        reply = self.controller.handle(_inbound(event_id="e3", text="²"))
+        assert reply is not None
+        self.assertIn("没有这个选项", reply.text)
+        self.assertIsNotNone(self.store.load_session("telegram", "42"))
+
+    def test_state_file_is_owner_only(self):
+        mode = os.stat(self.store.path).st_mode
+        self.assertEqual(mode & 0o077, 0)
 
     def test_english_copy_and_every_chat_channel(self):
         english = self._controller(language="en")

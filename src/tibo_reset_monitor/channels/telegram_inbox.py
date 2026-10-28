@@ -12,6 +12,7 @@ import os
 from typing import Any
 
 from tibo_reset_monitor.core.chat import Inbound, Reply
+from tibo_reset_monitor.logutil import redact
 
 log = logging.getLogger("tibo_reset_monitor")
 
@@ -109,9 +110,16 @@ class TelegramInbox:
             inbound = parse_update(update)
             if inbound is None or not inbound.chat_id and not inbound.migrate_to:
                 continue
-            reply = self.controller.handle(inbound)
+            try:
+                reply = self.controller.handle(inbound)
+            except Exception as exc:
+                log.warning("telegram update could not be handled: %s", redact(str(exc)).replace("\n", " ")[:300])
+                continue
             if reply is not None:
-                self._reply(token, reply)
+                try:
+                    self._reply(token, reply)
+                except Exception as exc:
+                    log.warning("telegram reply failed: %s", redact(str(exc)).replace("\n", " ")[:300])
         if latest is not None:
             self.channel_store_offset(latest + 1)
 

@@ -158,6 +158,7 @@ class StateStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=30000")
+        _owner_only(self.path)
         return conn
 
     @property
@@ -1018,6 +1019,16 @@ class StateStore:
             """,
             (reason[:300], format_utc(now), channel, target_key, *statuses),
         )
+
+
+def _owner_only(path: Path) -> None:
+    """Keep the state file, and its WAL sidecars, unreadable by other users."""
+    for candidate in (path, Path(str(path) + "-wal"), Path(str(path) + "-shm")):
+        try:
+            if candidate.exists():
+                candidate.chmod(0o600)
+        except OSError:
+            return
 
 
 def _subscription_key(channel: str, kind: str, address: str) -> str:
