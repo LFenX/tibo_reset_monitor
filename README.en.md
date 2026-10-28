@@ -367,7 +367,7 @@ Install `pip install -e '.[calendar]'`. Chinese images need a CJK font, or `cale
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions runs Python 3.10, 3.11, 3.12, and 3.13 twice: once without Pillow, and once with Pillow, WenQuanYi Micro Hei, and DejaVu Sans. Tests use a fake HTTP transport. They do not call Feishu or Telegram. Every registered channel is rendered in both `zh` and `en`, so a new channel that skips a language fails CI.
+GitHub Actions runs Python 3.10, 3.11, 3.12, and 3.13 twice: once without Pillow, and once with Pillow, WenQuanYi Micro Hei, and DejaVu Sans. A separate Python 3.12 job installs `lark-oapi` and runs the same suite. Tests use a fake HTTP transport. They do not call Feishu or Telegram. Every registered channel is rendered in both `zh` and `en`, so a new channel that skips a language fails CI.
 
 To add a channel, see [docs/adding-a-channel.md](docs/adding-a-channel.md). `src/tibo_reset_monitor/core/` does not import any channel.
 

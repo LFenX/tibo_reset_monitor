@@ -21,7 +21,7 @@
 | 首次成为管理员 | `/pair <配对码>` | 见下方飞书管理员 |
 | 添加其他管理员 | `/addadmin <用户 id>` | `/addadmin <open_id>` |
 
-选择群时回复编号或完整群名，1 分钟内有效，一次一个群。超时要重新发指令。重名必须用编号。只有最新一次列出的名单有效。
+选择群时要在私聊里回复编号或完整群名，1 分钟内有效，一次一个群。在群里发数字不会选中。超时要重新发指令。重名必须用编号。只有最新一次列出的名单有效；如果这次列群失败，上一份名单作废。
 
 `allow_self_subscribe` 默认 `false`：只有管理员能给自己开单聊。设为 `true` 后，任何人都能给自己开单聊，但不能管理群。
 
@@ -81,7 +81,7 @@ The smallest file is [`config.minimal.example.json`](../config.minimal.example.j
 | Become the first admin | `/pair <code>` | see Feishu admins below |
 | Add another admin | `/addadmin <user id>` | `/addadmin <open_id>` |
 
-Reply with a number or the full group name. The choice lasts one minute and selects one group. When it expires, send the command again. Duplicate names require the number. Only the latest list counts.
+Reply in the direct chat with a number or the full group name. A number sent inside a group does not select anything. The choice lasts one minute and selects one group. When it expires, send the command again. Duplicate names require the number. Only the latest list counts. If that list fails to load, the previous list is discarded.
 
 `allow_self_subscribe` defaults to `false`, so only an admin can turn on their own direct messages. Set it to `true` to let anyone do that. They still cannot manage groups.
 

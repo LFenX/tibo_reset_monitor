@@ -367,7 +367,7 @@ schtasks /Create /TN TiboResetMonitor /SC MINUTE /MO 10 /TR "py -m tibo_reset_mo
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-GitHub Actions 在 Python 3.10、3.11、3.12、3.13 上各跑两遍：一遍不安装 Pillow，一遍安装 Pillow、文泉驿微米黑和 DejaVu Sans。测试使用假的 HTTP，不访问飞书或 Telegram。已注册的渠道都会在 `zh` 和 `en` 下渲染一次，新渠道漏掉语言时 CI 会失败。
+GitHub Actions 在 Python 3.10、3.11、3.12、3.13 上各跑两遍：一遍不安装 Pillow，一遍安装 Pillow、文泉驿微米黑和 DejaVu Sans。另外有一个 Python 3.12 任务会安装 `lark-oapi` 再跑同一套测试。测试使用假的 HTTP，不访问飞书或 Telegram。已注册的渠道都会在 `zh` 和 `en` 下渲染一次，新渠道漏掉语言时 CI 会失败。
 
 新增渠道见 [docs/adding-a-channel.md](docs/adding-a-channel.md)。`src/tibo_reset_monitor/core/` 不导入任何渠道。
 
