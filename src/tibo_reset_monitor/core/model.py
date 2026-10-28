@@ -121,6 +121,7 @@ class Notice:
     products_zh: str = ""
     qualified_scope: str = ""
     tag_label: str = ""
+    contexts: tuple[dict[str, str], ...] = ()
     id: int | None = None
 
     def headline(self) -> str:
@@ -136,6 +137,9 @@ class Notice:
     def from_json(cls, payload: dict[str, Any], notice_id: int | None = None) -> Notice:
         known = {item.name for item in fields(cls)} - {"id"}
         data = {key: value for key, value in payload.items() if key in known}
+        contexts = data.get("contexts")
+        if isinstance(contexts, list):
+            data["contexts"] = tuple(item for item in contexts if isinstance(item, dict))
         return cls(id=notice_id, **data)
 
 

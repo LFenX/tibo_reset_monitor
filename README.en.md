@@ -105,10 +105,14 @@ The caption is:
 
 - A bold author. Posts on x.com / twitter.com by `thsottiaux` say **Tibo**. Other X accounts say `@handle`. Any other link says the hostname.
 - An italic line: `@thsottiaux · X`, or just `X` / the hostname.
-- `【event label】【stage】`. The label is the event `displayLabel`, or `重置卡` for `reset_credit` when that label is absent, or `重置（形式未明确）` otherwise. The stage is still 预告 / 确认 / 补充 / 撤回.
-- The body (`fullText`, otherwise `text`). A photo caption is at most 1024 characters after HTML is parsed. A long body is cut and ends with `…`, leaving the tags, the time, and the post link in place.
+- Two separate `<code>` chips: the event `displayLabel` (or `重置卡` for `reset_credit`, otherwise `重置（形式未明确）`) and the stage (预告 / 确认 / 补充 / 撤回).
+- The body (`fullText`, otherwise `text`).
 - Audience (`audienceZh`, otherwise `scopeLabel`, otherwise `帖子未明确适用范围`; omitted when the event type is `activity`), `productsZh` when present, and `帖子发布 · YYYY-MM-DD HH:MM:SS（北京时间）`.
+- An original-post preview in the same caption, inside `<blockquote>`. The original wording is `fullOriginalText`, or `originalText` when that is absent. Each `context` item with `relation: quote` is shown as `引用 @author` plus that item's `originalText`; `reply` uses `回复 @author`. Context posts have no publish time of their own, so the time is the main post's `publishedAt`. The block is omitted when both the original text and `context` are empty.
 - A “查看原帖” link.
+- A final line `重置日历 · YYYY 年 M 月`, directly above the calendar image. The month is the current Beijing month.
+
+A photo caption is at most 1024 characters after HTML is parsed. A long main body or preview is cut and ends with `…`. Tags, times, and the link stay. The text fallback uses the same layout with a 4096 limit.
 
 A manual text uses the same shell: title `手动提醒`, caption line `手动发送`, and the calendar when it can be drawn.
 

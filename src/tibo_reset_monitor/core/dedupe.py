@@ -127,6 +127,7 @@ def _notice_from_post(event: dict[str, Any], post: dict[str, Any], stage: str, r
         published_at=_as_text(post.get("publishedAt")),
         event=event,
         source_event_id=_as_text(event.get("id")) or None,
+        contexts=_contexts(post.get("context")),
     )
 
 
@@ -149,6 +150,7 @@ def _notice_from_activity(
         published_at=_as_text(activity.get("publishedAt")),
         event=event,
         source_event_id=event_id,
+        contexts=_contexts(activity.get("context")),
     )
 
 
@@ -163,6 +165,7 @@ def _build_notice(
     published_at: str,
     event: dict[str, Any] | None,
     source_event_id: str | None,
+    contexts: tuple[dict[str, str], ...] = (),
 ) -> Notice:
     presentation = event.get("presentation") if event else None
     if not isinstance(presentation, dict):
@@ -214,6 +217,7 @@ def _build_notice(
         products_zh=products_zh,
         qualified_scope=qualified_scope,
         tag_label=_event_tag(event),
+        contexts=contexts,
     )
 
 
@@ -244,6 +248,7 @@ def _merge(existing: Notice, incoming: Notice) -> Notice:
         products_zh=existing.products_zh or incoming.products_zh,
         qualified_scope=existing.qualified_scope or incoming.qualified_scope,
         tag_label=existing.tag_label or incoming.tag_label,
+        contexts=existing.contexts or incoming.contexts,
     )
 
 
@@ -256,6 +261,29 @@ def _event_tag(event: dict[str, Any] | None) -> str:
         if event.get("type") == "reset_credit":
             return "重置卡"
     return "重置（形式未明确）"
+
+
+def _contexts(raw: Any) -> tuple[dict[str, str], ...]:
+    """Keep quote/reply context using the live CodexResetContextPost fields."""
+    found: list[dict[str, str]] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        author = _as_text(item.get("author"))
+        original = _as_text(item.get("originalText"))
+        text = _as_text(item.get("text"))
+        if not (author or original or text):
+            continue
+        found.append(
+            {
+                "relation": _as_text(item.get("relation")),
+                "author": author,
+                "original_text": original,
+                "text": text,
+                "url": _http_url(item.get("url")),
+            }
+        )
+    return tuple(found)
 
 
 def _post_text(post: dict[str, Any]) -> tuple[str, str]:

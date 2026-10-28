@@ -80,15 +80,17 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertLessEqual(_parsed_len(caption), 1024)
         self.assertIn("<b>Tibo</b>", caption)
         self.assertIn("@thsottiaux · X", caption)
-        self.assertIn("【重置（形式未明确）】【预告】", caption)
+        self.assertIn("<code>重置（形式未明确）</code>", caption)
+        self.assertIn("<code>预告</code>", caption)
         self.assertIn("&lt;b&gt;bold&lt;/b&gt;", caption)
         self.assertIn("&amp; more", caption)
         self.assertIn("帖子发布 · 2026-10-28 10:00:00（北京时间）", caption)
         self.assertIn("帖子未明确适用范围", caption)
         self.assertIn('href="https://x.com/thsottiaux/status/p1"', caption)
         self.assertIn("查看原帖", caption)
+        self.assertIn("<blockquote>", caption)
+        self.assertIn("Just kidding", caption)
         self.assertNotIn("<b>bold</b>", caption)
-        self.assertNotIn(escape_html("Just kidding"), caption)
 
     def test_long_body_is_truncated_inside_the_caption_limit(self):
         from tibo_reset_monitor.channels.telegram import build_caption, parsed_length
@@ -137,6 +139,82 @@ class TelegramRequestTest(unittest.TestCase):
         self.assertEqual(body["link_preview_options"]["url"], "https://x.com/thsottiaux/status/p1")
         self.assertTrue(any("calendar" in line for line in captured.output))
 
+    def test_caption_includes_original_post_preview(self):
+        from tests.support import make_event, make_post, snapshot
+        from tibo_reset_monitor.channels.telegram import build_caption
+        from tibo_reset_monitor.core.dedupe import extract_notices
+
+        post = make_post("p9", "预告", text="短译", original="short")
+        post["text"] = "搞定了。明天见，会有好消息。"
+        post["fullText"] = post["text"]
+        post["originalText"] = "And it's done."
+        post["fullOriginalText"] = "And it's done. See you tomorrow for some good news."
+        post["publishedAt"] = "2026-10-28T14:29:38.000+08:00"
+        post["context"] = [
+            {
+                "id": "quoted",
+                "author": "thsottiaux",
+                "relation": "quote",
+                "text": "太平洋时间午夜前落地。",
+                "originalText": "Lands by midnight PST.",
+                "url": "https://x.com/thsottiaux/status/quoted",
+            }
+        ]
+        notice = extract_notices(snapshot([make_event("reset-9", [post], title="预告")]))[0]
+        self.assertEqual(notice.original_text, "And it's done. See you tomorrow for some good news.")
+        self.assertEqual(notice.contexts[0]["relation"], "quote")
+        caption = build_caption(notice, 1024, (2026, 10))
+        self.assertLessEqual(_parsed_len(caption), 1024)
+        self.assertIn("<code>重置（形式未明确）</code> <code>预告</code>", caption)
+        self.assertIn("搞定了。明天见，会有好消息。", caption)
+        self.assertIn("帖子未明确适用范围", caption)
+        self.assertIn("帖子发布 · 2026-10-28 14:29:38（北京时间）", caption)
+        self.assertIn("<blockquote>", caption)
+        self.assertIn("原帖 · Tibo @thsottiaux", caption)
+        self.assertIn("And it's done. See you tomorrow for some good news.", caption)
+        self.assertIn("引用 @thsottiaux", caption)
+        self.assertIn("Lands by midnight PST.", caption)
+        self.assertIn("2026-10-28 14:29:38 · 北京时间", caption)
+        self.assertIn('href="https://x.com/thsottiaux/status/p9"', caption)
+        self.assertIn("重置日历 · 2026 年 10 月", caption)
+        self.assertNotIn("重置确认：形式未明确", caption)
+
+    def test_long_preview_is_truncated_before_tags_and_link(self):
+        from tibo_reset_monitor.channels.telegram import build_caption
+        from tibo_reset_monitor.core.model import Notice
+
+        notice = Notice(
+            dedupe_key="k",
+            post_key="p",
+            stage="announcement",
+            stage_label="预告",
+            title="",
+            display_label="",
+            author="thsottiaux",
+            text="主" * 3000,
+            original_text="orig " * 800,
+            url="https://x.com/thsottiaux/status/1",
+            published_at="2026-10-28T14:29:38+08:00",
+            tag_label="重置（形式未明确）",
+            contexts=(
+                {
+                    "relation": "quote",
+                    "author": "thsottiaux",
+                    "original_text": "quote " * 400,
+                    "text": "",
+                    "url": "",
+                },
+            ),
+        )
+        caption = build_caption(notice, 1024, (2026, 10))
+        self.assertLessEqual(_parsed_len(caption), 1024)
+        self.assertIn("…", caption)
+        self.assertIn("<code>重置（形式未明确）</code>", caption)
+        self.assertIn("<code>预告</code>", caption)
+        self.assertIn("帖子发布 · 2026-10-28 14:29:38（北京时间）", caption)
+        self.assertIn("查看原帖", caption)
+        self.assertIn("重置日历 · 2026 年 10 月", caption)
+
     def test_manual_and_other_authors(self):
         from tibo_reset_monitor.channels.telegram import build_caption
         from tibo_reset_monitor.core.model import MANUAL, Notice
@@ -178,7 +256,8 @@ class TelegramRequestTest(unittest.TestCase):
         other_text = build_caption(other, 1024)
         self.assertIn("<b>@someone</b>", other_text)
         self.assertIn("<i>X</i>", other_text)
-        self.assertIn("【重置卡】【确认】", other_text)
+        self.assertIn("<code>重置卡</code>", other_text)
+        self.assertIn("<code>确认</code>", other_text)
         self.assertIn("Codex", other_text)
         self.assertIn("2026-10-28 09:02:03", other_text)
         host = Notice(

@@ -105,10 +105,14 @@ Webhook 可选。把 URL 放在 `url_env` 指向的环境变量里，请求会�
 
 - 粗体作者。帖子在 x.com / twitter.com 上且作者是 `thsottiaux` 时写 **Tibo**，其他 X 账号写 `@handle`，其他链接写主机名。
 - 斜体一行：`@thsottiaux · X`，或者其他情况下的 `X` / 主机名。
-- `【事件标签】【阶段】`。标签优先用事件的 `displayLabel`；没有时，`reset_credit` 用「重置卡」，否则用「重置（形式未明确）」。阶段仍是预告、确认、补充、撤回。
-- 正文（`fullText`，否则 `text`）。Telegram 图片说明在解析 HTML 之后最多 1024 个字符，正文过长会截断并加上「…」，标签、时间和原帖链接会留下来。
+- 两个分开的 `<code>` 标签。一个是事件的 `displayLabel`（没有时，`reset_credit` 用「重置卡」，否则用「重置（形式未明确）」），另一个是阶段（预告、确认、补充、撤回）。
+- 正文（`fullText`，否则 `text`）。
 - 适用范围（`audienceZh`，否则 `scopeLabel`，都没有则写「帖子未明确适用范围」；事件类型是 `activity` 时不写这一行）、`productsZh`、以及 `帖子发布 · YYYY-MM-DD HH:MM:SS（北京时间）`。
-- 最后是「查看原帖」链接。
+- 原帖预览，放在同一个 caption 的 `<blockquote>` 里。原文用接口的 `fullOriginalText`，没有则用 `originalText`。`context` 里 `relation` 为 `quote` 的写成「引用 @作者」并带上该条的 `originalText`；`reply` 写成「回复 @作者」。引用帖没有单独的发布时间字段，所以时间只用主帖的 `publishedAt`。没有原文也没有 context 时，这一段省略。
+- 「查看原帖」链接。
+- 最后一行 `重置日历 · YYYY 年 M 月`，紧挨着下面的日历图片。月份是北京时间的当月。
+
+图片说明在解析 HTML 之后最多 1024 个字符。超长时先截断主正文和原帖预览（末尾加「…」），标签、时间和链接保留。纯文本降级用同一版式，上限 4096。
 
 手动文本用同一套外壳：标题「手动提醒」，说明行「手动发送」，再加上日历。
 
@@ -126,19 +130,25 @@ pip install '.[calendar]'
 
 一条说明文字的例子：
 
-```text
-Tibo
-@thsottiaux · X
+```html
+<b>Tibo</b>
+<i>@thsottiaux · X</i>
 
-【重置（形式未明确）】【预告】
+<code>重置（形式未明确）</code> <code>预告</code>
 
-开玩笑的，今天是重置。
+搞定了。明天见，会有好消息。
 
-帖子未明确适用范围
-Codex、ChatGPT
-帖子发布 · 2026-10-28 10:42:53（北京时间）
+<i>帖子未明确适用范围</i>
+<i>帖子发布 · 2026-10-28 14:29:38（北京时间）</i>
 
-查看原帖
+<blockquote>原帖 · Tibo @thsottiaux
+And it's done. See you tomorrow for some good news.
+引用 @thsottiaux
+Lands by midnight PST.
+2026-10-28 14:29:38 · 北京时间</blockquote>
+<a href="https://x.com/thsottiaux/status/123">查看原帖</a>
+
+重置日历 · 2026 年 10 月
 ```
 
 ## 命令

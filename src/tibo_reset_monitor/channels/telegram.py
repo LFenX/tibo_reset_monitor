@@ -43,17 +43,24 @@ class TelegramChannel:
         self._token_env = spec.settings.get("bot_token_env", "TIBO_TELEGRAM_BOT_TOKEN")
         self._timeout = 20.0
         self._calendar_png: Callable[[], bytes | None] | None = None
+        self._calendar_month: Callable[[], tuple[int, int]] | None = None
 
-    def bind_calendar(self, provider: Callable[[], bytes | None]) -> None:
+    def bind_calendar(
+        self,
+        provider: Callable[[], bytes | None],
+        month: Callable[[], tuple[int, int]] | None = None,
+    ) -> None:
         self._calendar_png = provider
+        self._calendar_month = month
 
     def render(self, notice: Notice, target: Target) -> dict[str, Any]:
         photo = self._load_photo()
+        year_month = self._calendar_month() if self._calendar_month else None
         return {
             "chat_id": target.address,
             "photo": photo,
-            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT),
-            "text": build_caption(notice, _TEXT_LIMIT),
+            "caption": build_caption(notice, _PHOTO_CAPTION_LIMIT, year_month),
+            "text": build_caption(notice, _TEXT_LIMIT, year_month),
             "parse_mode": "HTML",
         }
 
@@ -109,28 +116,73 @@ class TelegramChannel:
         return photo
 
 
-def build_caption(notice: Notice, limit: int) -> str:
-    """HTML caption whose parsed text length is at most ``limit`` UTF-16 code units."""
-    source = notice.text or ""
-    if len(source) > _BODY_CAP:
-        source = source[:_BODY_CAP]
-    best = _assemble(notice, "")
-    if parsed_length(best) > limit:
-        return _hard_trim(best, limit)
+def build_caption(notice: Notice, limit: int, year_month: tuple[int, int] | None = None) -> str:
+    """HTML caption whose parsed text length is at most ``limit`` UTF-16 code units.
+
+    When the caption is too long, the main body and the original-post preview are
+    shortened first. Tags, times, and the post link stay.
+    """
+    main_src = _clip(notice.text, _BODY_CAP)
+    preview_src = _clip(notice.original_text, _BODY_CAP)
+    quote_srcs = tuple(_clip(_context_body(item), 2000) for item in notice.contexts)
+
+    def render(main_n: int, preview_n: int, quote_ns: tuple[int, ...]) -> str:
+        return _assemble(
+            notice,
+            _cut(main_src, main_n),
+            _cut(preview_src, preview_n),
+            tuple(_cut(source, size) for source, size in zip(quote_srcs, quote_ns)),
+            year_month,
+        )
+
+    full_quotes = tuple(len(source) for source in quote_srcs)
+    if parsed_length(render(len(main_src), len(preview_src), full_quotes)) <= limit:
+        return render(len(main_src), len(preview_src), full_quotes)
+    main_n = _largest_fit(lambda size: render(size, len(preview_src), full_quotes), len(main_src), limit)
+    if parsed_length(render(main_n, len(preview_src), full_quotes)) <= limit:
+        return render(main_n, len(preview_src), full_quotes)
+    preview_n = _largest_fit(lambda size: render(main_n, size, full_quotes), len(preview_src), limit)
+    quote_ns = full_quotes
+    while parsed_length(render(main_n, preview_n, quote_ns)) > limit and any(quote_ns):
+        longest = max(range(len(quote_ns)), key=lambda index: quote_ns[index])
+        shrunk = max(0, int(quote_ns[longest] * 0.6) - 1)
+        if shrunk == quote_ns[longest]:
+            shrunk = 0
+        quote_ns = tuple(shrunk if index == longest else size for index, size in enumerate(quote_ns))
+    candidate = render(main_n, preview_n, quote_ns)
+    if parsed_length(candidate) <= limit:
+        return candidate
+    return _hard_trim(render(0, 0, tuple(0 for _ in quote_srcs)), limit)
+
+
+def _largest_fit(render, hi: int, limit: int) -> int:
+    if parsed_length(render(0)) > limit:
+        return 0
     lo = 0
-    hi = len(source)
+    best = 0
     while lo <= hi:
         mid = (lo + hi) // 2
-        body = source[:mid]
-        if mid < len(source):
-            body = body.rstrip() + "…"
-        candidate = _assemble(notice, body)
-        if parsed_length(candidate) <= limit:
-            best = candidate
+        if parsed_length(render(mid)) <= limit:
+            best = mid
             lo = mid + 1
         else:
             hi = mid - 1
     return best
+
+
+def _cut(source: str, size: int) -> str:
+    if size >= len(source):
+        return source
+    if size <= 1:
+        return ""
+    return source[: size - 1].rstrip() + "…"
+
+
+def _clip(value: str, limit: int) -> str:
+    text = value or ""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def parsed_length(html: str) -> int:
@@ -148,28 +200,86 @@ def escape_attr(value: str) -> str:
     return escape_html(value).replace('"', "&quot;")
 
 
-def _assemble(notice: Notice, body: str) -> str:
+def _assemble(
+    notice: Notice,
+    body: str,
+    preview: str,
+    quote_bodies: tuple[str, ...],
+    year_month: tuple[int, int] | None,
+) -> str:
     if notice.stage == MANUAL:
         lines = ["<b>手动提醒</b>", "<i>手动发送</i>", ""]
         if body:
             lines.append(escape_html(body))
+        lines.append("")
+        lines.append(escape_html(_calendar_line(year_month)))
         return "\n".join(lines).strip()
     name, caption = _author_lines(notice)
     lines = [f"<b>{escape_html(name)}</b>", f"<i>{escape_html(caption)}</i>", ""]
     tag = notice.tag_label or "重置（形式未明确）"
     stage = notice.stage_label or notice.stage
-    lines.append(escape_html(f"【{tag}】【{stage}】"))
+    lines.append(f"<code>{escape_html(tag)}</code> <code>{escape_html(stage)}</code>")
     lines.append("")
     if body:
         lines.append(escape_html(body))
         lines.append("")
     for detail in _detail_lines(notice):
         lines.append(f"<i>{escape_html(detail)}</i>")
+    preview_html = _preview_html(notice, preview, quote_bodies)
+    if preview_html:
+        lines.append("")
+        lines.append(preview_html)
     link = notice.url if notice.url.startswith(("https://", "http://")) else ""
     if link:
-        lines.append("")
         lines.append(f'<a href="{escape_attr(link)}">查看原帖</a>')
+    lines.append("")
+    lines.append(escape_html(_calendar_line(year_month)))
     return "\n".join(lines).strip()
+
+
+def _calendar_line(year_month: tuple[int, int] | None) -> str:
+    if year_month is None:
+        local = datetime.now(_BEIJING)
+        year_month = (local.year, local.month)
+    year, month = year_month
+    return f"重置日历 · {year} 年 {month} 月"
+
+
+def _preview_html(notice: Notice, preview: str, quote_bodies: tuple[str, ...]) -> str:
+    """Original-post quote card. Omitted when the feed has no original text and no context."""
+    contexts = notice.contexts
+    if not preview and not any(quote_bodies):
+        return ""
+    name, _caption = _author_lines(notice)
+    _host, handle = _identity(notice.url)
+    if not handle:
+        handle = (notice.author or "").strip().lstrip("@")
+    header = f"原帖 · {name}"
+    if handle:
+        header += f" @{handle}"
+    lines = [header]
+    if preview:
+        lines.append(preview)
+    for item, body in zip(contexts, quote_bodies):
+        relation = item.get("relation") or ""
+        author = item.get("author") or ""
+        if relation == "quote":
+            lines.append(f"引用 @{author}" if author else "引用")
+        elif relation == "reply":
+            lines.append(f"回复 @{author}" if author else "回复")
+        elif author:
+            lines.append(f"@{author}")
+        if body:
+            lines.append(body)
+    stamp = _beijing_stamp(notice.published_at)
+    if stamp:
+        lines.append(f"{stamp} · 北京时间")
+    inner = "\n".join(escape_html(line) for line in lines)
+    return f"<blockquote>{inner}</blockquote>"
+
+
+def _context_body(item: dict[str, str]) -> str:
+    return item.get("original_text") or item.get("text") or ""
 
 
 def _author_lines(notice: Notice) -> tuple[str, str]:

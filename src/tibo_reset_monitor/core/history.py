@@ -14,6 +14,7 @@ from typing import Any
 from tibo_reset_monitor.core.calendar import (
     BEIJING,
     CalendarImageUnavailable,
+    beijing_now,
     calendar_model,
     find_cjk_font,
     render_calendar_png,
@@ -68,6 +69,10 @@ class HistoryCalendar:
         self.store.save_history(result.body, result.etag, now)
         self.store.conn.commit()
         log.info("history snapshot stored events=%s", len(result.body.get("events") or []))
+
+    def month(self) -> tuple[int, int]:
+        local = beijing_now(self.clock.now())
+        return local.year, local.month
 
     def png(self) -> bytes | None:
         """Render the current month. ``None`` means the caller should send text."""
