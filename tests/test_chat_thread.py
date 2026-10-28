@@ -54,8 +54,11 @@ class RoutingTransport:
 
     def _feed(self, headers, url):
         runtime = self.runtime_holder["runtime"]
+        # Serve the new post only after the first poll has baselined. If it
+        # arrives on that first response, the baseline records it and nothing is sent.
+        baselined = runtime.store.get_meta("baseline_completed_at")
         active = [item for item in runtime.store.subscriptions("telegram") if item["status"] == "active"]
-        if active:
+        if baselined and active:
             body = snapshot(
                 [make_event("old", [make_post("old", "预告")]), make_event("new", [make_post("new", "确认", text="brand new")])]
             )
