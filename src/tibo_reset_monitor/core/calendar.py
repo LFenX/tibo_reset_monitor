@@ -16,6 +16,21 @@ from pathlib import Path
 from typing import Any
 
 BEIJING = timezone(timedelta(hours=8))
+_CANVAS_WIDTH = 1120
+_MARGIN = 30
+_GAP = 8
+_CELL_HEIGHT = 90
+
+
+def month_weeks(year: int, month: int) -> list[list[date]]:
+    """Monday-first weeks covering the month, including leading and trailing days."""
+    return calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
+
+
+def canvas_height(week_count: int) -> int:
+    """Pixel height for a month grid. Grows with 4, 5, or 6 week rows and stays below the legend."""
+    legend_y = 176 + week_count * (_CELL_HEIGHT + _GAP)
+    return legend_y + 24 + 22
 
 # (regular, bold). Bold may be missing; the regular face is used for both weights.
 _FONT_CANDIDATES: tuple[tuple[str, str | None], ...] = (
@@ -205,13 +220,11 @@ def render_calendar_png(model: dict[str, Any], fonts: FontChoice | None = None) 
             return ImageFont.truetype(path, size=size)
 
     try:
-        weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(model["year"], model["month"])
-        width, margin, gap, cell_height = 1120, 30, 8, 90
+        weeks = month_weeks(model["year"], model["month"])
+        width, margin, gap, cell_height = _CANVAS_WIDTH, _MARGIN, _GAP, _CELL_HEIGHT
         cell_width = (width - 2 * margin - 6 * gap) // 7
         legend_y = 176 + len(weeks) * (cell_height + gap)
-        # Legend dots are 13px tall and sit 5px below legend_y. Keep a short pad, then stop.
-        image_height = legend_y + 24 + 22
-        image = Image.new("RGB", (width, image_height), "white")
+        image = Image.new("RGB", (width, canvas_height(len(weeks))), "white")
         draw = ImageDraw.Draw(image)
         draw.rounded_rectangle((1, 1, image.width - 2, image.height - 2), radius=20, outline="#dbe3e5", width=2)
         draw.text((margin, 25), f'{model["year"]} 年 {model["month"]} 月', font=face(30, True), fill="#20333f")

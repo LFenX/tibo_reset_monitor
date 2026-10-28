@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from tests.support import FakeClock, ScriptedSource, TempStoreTest, failure, ok, snapshot
 from tibo_reset_monitor.core.calendar import (
     CalendarImageUnavailable,
     calendar_model,
+    canvas_height,
     default_history_url,
     find_cjk_font,
+    month_weeks,
     render_calendar_png,
 )
 from tibo_reset_monitor.core.history import HistoryCalendar
@@ -246,6 +248,150 @@ class CalendarModelTest(unittest.TestCase):
         self.assertGreaterEqual(footnote_y, image.height - 8)
 
 
+class BeijingMonthTest(unittest.TestCase):
+    def test_month_follows_beijing_across_midnight_and_utc(self):
+        cases = [
+            (datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc), 2026, 10, "2026-10-31"),
+            (datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc), 2026, 11, "2026-11-01"),
+            (datetime(2026, 10, 31, 23, 59, tzinfo=timezone.utc), 2026, 11, "2026-11-01"),
+            (datetime(2026, 11, 30, 15, 59, tzinfo=timezone.utc), 2026, 11, "2026-11-30"),
+            (datetime(2026, 11, 30, 16, 0, tzinfo=timezone.utc), 2026, 12, "2026-12-01"),
+            (datetime(2026, 12, 31, 15, 59, tzinfo=timezone.utc), 2026, 12, "2026-12-31"),
+            (datetime(2026, 12, 31, 16, 0, tzinfo=timezone.utc), 2027, 1, "2027-01-01"),
+        ]
+        for now, year, month, today in cases:
+            model = calendar_model(None, {"events": []}, now)
+            self.assertEqual((model["year"], model["month"], model["today"]), (year, month, today), now.isoformat())
+            self.assertEqual(model["totals"], {"额度重置": 0, "发重置卡": 0, "补充确认": 0})
+
+    def test_header_counts_only_the_beijing_month(self):
+        recent = {
+            "historyFrom": "2026-01-01T00:00:00.000+08:00",
+            "events": [
+                _event("oct", confirmationBasis="source_post", confirmedAt="2026-10-31T09:00:00+08:00", occurredOn="2026-10-31", presentation={"kindExplicit": True, "status": "confirmed"}),
+                _event("nov", confirmationBasis="source_post", confirmedAt="2026-11-02T09:00:00+08:00", occurredOn="2026-11-02", presentation={"kindExplicit": True, "status": "confirmed"}),
+                _event("dec", type="reset_credit", confirmationBasis="source_post", confirmedAt="2026-12-01T09:00:00+08:00", occurredOn="2026-12-01", presentation={"kindExplicit": True, "status": "confirmed"}),
+            ],
+        }
+        october = calendar_model(None, recent, datetime(2026, 10, 31, 15, 59, tzinfo=timezone.utc))
+        november = calendar_model(None, recent, datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc))
+        january = calendar_model(None, recent, datetime(2026, 12, 31, 16, 0, tzinfo=timezone.utc))
+        self.assertEqual(october["totals"]["额度重置"], 1)
+        self.assertEqual(november["totals"], {"额度重置": 1, "发重置卡": 0, "补充确认": 0})
+        self.assertEqual(january["totals"], {"额度重置": 0, "发重置卡": 0, "补充确认": 0})
+        self.assertIn("2026-10-31", november["days"])
+        self.assertEqual(november["days"]["2026-10-31"][0]["id"], "oct")
+
+    def test_week_rows_resize_from_four_through_six(self):
+        expected = {
+            (2026, 11): 6,
+            (2026, 12): 5,
+            (2027, 1): 5,
+            (2027, 2): 4,
+            (2028, 2): 5,
+        }
+        heights = {}
+        for (year, month), rows in expected.items():
+            weeks = month_weeks(year, month)
+            self.assertEqual(len(weeks), rows)
+            last_bottom = 160 + (rows - 1) * 98 + 90
+            legend_y = 176 + rows * 98
+            self.assertLess(last_bottom, legend_y)
+            self.assertGreater(canvas_height(rows), legend_y + 18)
+            heights[rows] = canvas_height(rows)
+        self.assertLess(heights[4], heights[5])
+        self.assertLess(heights[5], heights[6])
+        leap = {day.isoformat() for week in month_weeks(2028, 2) for day in week}
+        plain = {day.isoformat() for week in month_weeks(2027, 2) for day in week}
+        self.assertIn("2028-02-29", leap)
+        self.assertIn("2028-01-31", leap)
+        self.assertNotIn("2027-02-29", plain)
+        self.assertNotIn("2027-01-31", plain)
+        self.assertEqual(month_weeks(2027, 2)[0][0].isoformat(), "2027-02-01")
+
+    def test_rendered_months_keep_every_week_row(self):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("Pillow is not installed")
+        fonts = find_cjk_font()
+        if fonts is None:
+            self.skipTest("no CJK font")
+        import io
+
+        from PIL import Image
+
+        previous = None
+        for year, month, today, rows in (
+            (2026, 11, datetime(2026, 11, 18, 4, tzinfo=timezone.utc), 6),
+            (2026, 12, datetime(2026, 12, 20, 4, tzinfo=timezone.utc), 5),
+            (2027, 1, datetime(2026, 12, 31, 16, tzinfo=timezone.utc), 5),
+            (2027, 2, datetime(2027, 2, 14, 4, tzinfo=timezone.utc), 4),
+            (2028, 2, datetime(2028, 2, 29, 4, tzinfo=timezone.utc), 5),
+        ):
+            recent = {
+                "historyFrom": "2026-01-01T00:00:00.000+08:00",
+                "events": [
+                    _event(
+                        f"edge-{year}-{month}",
+                        confirmationBasis="source_post",
+                        confirmedAt="2026-10-31T09:00:00+08:00",
+                        occurredOn="2026-10-31",
+                        presentation={"kindExplicit": True, "status": "confirmed"},
+                    )
+                ],
+            }
+            if month == 2 and year == 2028:
+                recent["events"].append(
+                    _event(
+                        "leap",
+                        confirmationBasis="source_post",
+                        confirmedAt="2028-02-29T09:00:00+08:00",
+                        occurredOn="2028-02-29",
+                        presentation={"kindExplicit": True, "status": "confirmed"},
+                    )
+                )
+            model = calendar_model(None, recent, today)
+            png = render_calendar_png(model, fonts)
+            image = Image.open(io.BytesIO(png))
+            self.assertEqual(image.size, (1120, canvas_height(rows)))
+            self.assertNotEqual(png, previous)
+            previous = png
+            if (year, month) == (2026, 11):
+                self._assert_cell_fill(image, 2026, 11, date(2026, 10, 31), (0xFA, 0xFB, 0xFB))
+                self._assert_today_outline(image, 2026, 11, date(2026, 11, 18))
+
+    def _assert_cell_fill(self, image, view_year, view_month, cell_date, expected) -> None:
+        x, y, cell_width, cell_height = _cell_box(view_year, view_month, cell_date)
+        pixel = image.getpixel((x + cell_width - 10, y + cell_height // 2))
+        self.assertTrue(all(abs(pixel[channel] - expected[channel]) <= 4 for channel in range(3)), pixel)
+
+    def _assert_today_outline(self, image, view_year, view_month, cell_date) -> None:
+        x, y, cell_width, _cell_height = _cell_box(view_year, view_month, cell_date)
+        target = (0x26, 0x74, 0x7B)
+        found = False
+        for dx in range(8, cell_width - 8):
+            pixel = image.getpixel((x + dx, y + 1))
+            if all(abs(pixel[channel] - target[channel]) <= 18 for channel in range(3)):
+                found = True
+                break
+        self.assertTrue(found)
+
+
+def _cell_box(view_year: int, view_month: int, cell_date: date) -> tuple[int, int, int, int]:
+    weeks = month_weeks(view_year, view_month)
+    width, margin, gap, cell_height = 1120, 30, 8, 90
+    cell_width = (width - 2 * margin - 6 * gap) // 7
+    for row, week in enumerate(weeks):
+        if cell_date not in week:
+            continue
+        column = week.index(cell_date)
+        x = margin + column * (cell_width + gap)
+        y = 160 + row * (cell_height + gap)
+        return x, y, cell_width, cell_height
+    raise AssertionError(f"{cell_date} is not on the {view_year}-{view_month} grid")
+
+
 class HistoryCacheTest(TempStoreTest):
     def test_failure_keeps_the_previous_snapshot_and_does_not_raise(self):
         body = snapshot([], checked_at="2026-10-01T00:00:00.000+08:00")
@@ -276,6 +422,60 @@ class HistoryCacheTest(TempStoreTest):
         calendar.refresh()
         self.assertEqual(self.store.get_history()["etag"], 'W/"b"')
         self.assertEqual(self.store.get_history()["body"]["checkedAt"], "2026-10-02T00:00:00.000+08:00")
+
+    def test_beijing_new_month_waits_ten_minutes_then_refetches(self):
+        # 2026-10-31 15:55 UTC is 23:55 in Beijing, still October.
+        self.clock.now_value = datetime(2026, 10, 31, 15, 55, tzinfo=timezone.utc)
+        source = ScriptedSource(
+            [
+                ok(snapshot([]), etag='W/"oct"'),
+                ok(snapshot([], checked_at="2026-11-01T00:05:00.000+08:00"), etag='W/"nov"'),
+            ]
+        )
+        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=30 * 24 * 3600)
+        calendar.refresh()
+        # 2026-11-01 00:00 Beijing is five minutes later, and UTC is still 31 October.
+        self.clock.now_value = datetime(2026, 10, 31, 16, 0, tzinfo=timezone.utc)
+        calendar.refresh()
+        self.assertEqual(len(source.etags), 1)
+        self.assertEqual(self.store.get_history()["etag"], 'W/"oct"')
+        # Ten minutes after the October fetch: a new-month pull is allowed.
+        self.clock.now_value = datetime(2026, 10, 31, 16, 5, tzinfo=timezone.utc)
+        calendar.refresh()
+        self.assertEqual(len(source.etags), 2)
+        self.assertEqual(self.store.get_history()["etag"], 'W/"nov"')
+
+    def test_failed_new_month_fetch_still_draws_that_month(self):
+        self.clock.now_value = datetime(2026, 10, 15, 4, tzinfo=timezone.utc)
+        source = ScriptedSource(
+            [
+                ok(snapshot([]), etag='W/"oct"'),
+                failure("network", "history down"),
+            ]
+        )
+        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=30 * 24 * 3600)
+        calendar.refresh()
+        # 2026-11-01 00:30 Beijing. The history request fails and must not raise.
+        self.clock.now_value = datetime(2026, 10, 31, 16, 30, tzinfo=timezone.utc)
+        calendar.refresh()
+        self.assertEqual(self.store.get_history()["etag"], 'W/"oct"')
+        png = calendar.png()
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.assertIsNone(png)
+            return
+        if find_cjk_font() is None:
+            self.assertIsNone(png)
+            return
+        self.assertIsNotNone(png)
+        assert png is not None
+        import io
+
+        from PIL import Image
+
+        image = Image.open(io.BytesIO(png))
+        self.assertEqual(image.size[1], canvas_height(6))
 
 
 if __name__ == "__main__":
