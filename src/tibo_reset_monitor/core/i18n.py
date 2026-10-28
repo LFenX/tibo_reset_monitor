@@ -653,10 +653,14 @@ def _preamble(en: bool, allow_self_subscribe: bool) -> str:
             if allow_self_subscribe
             else "allow_self_subscribe is off: a non-admin cannot turn on their own direct messages."
         )
+        lead = (
+            "Only an admin can list subscriptions and add groups."
+            if allow_self_subscribe
+            else "Only an admin can turn notifications on or off, list subscriptions, and add groups."
+        )
         return (
             "Read this first\n"
-            "Only an admin can turn notifications on or off, list subscriptions, and add groups. "
-            f"{flag} "
+            f"{lead} {flag} "
             "Everyone in a subscribed group receives the notices. They still cannot manage them. "
             "Send /start, /help, #帮助, #指南, or #使用说明 any time."
         )
@@ -665,10 +669,14 @@ def _preamble(en: bool, allow_self_subscribe: bool) -> str:
         if allow_self_subscribe
         else "allow_self_subscribe 当前关闭：非管理员不能自己开单聊。"
     )
+    lead = (
+        "管理员能查看订阅和添加群。"
+        if allow_self_subscribe
+        else "只有管理员能开关通知、查看订阅和添加群。"
+    )
     return (
         "先读我\n"
-        "只有管理员能开关通知、查看订阅和添加群。"
-        f"{flag}"
+        f"{lead}{flag}"
         "群通知由管理员添加，群里所有人都会收到，但不能管理。"
         "随时发送 /start、/help、#帮助、#指南 或 #使用说明。"
     )
