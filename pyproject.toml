@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tibo-reset-monitor"
+version = "0.1.0"
+description = "Notify Feishu, Telegram, or a webhook when Tibo posts a Codex or ChatGPT quota reset."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "LFenX"}]
+keywords = ["codex", "chatgpt", "feishu", "telegram", "notifier"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "License :: OSI Approved :: MIT License",
+]
+
+[project.scripts]
+tibo-reset-monitor = "tibo_reset_monitor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/LFenX/tibo_reset_monitor"
+Source = "https://github.com/LFenX/tibo_reset_monitor"
+
+[tool.setuptools.packages.find]
+where = ["src"]

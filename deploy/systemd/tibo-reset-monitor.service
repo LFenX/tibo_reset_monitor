@@ -1,0 +1,10 @@
+[Unit]
+Description=Poll Tibo Codex/ChatGPT reset monitor once
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/tibo-reset-monitor
+EnvironmentFile=-/opt/tibo-reset-monitor/.env
+ExecStart=/opt/tibo-reset-monitor/.venv/bin/python -m tibo_reset_monitor poll --config /opt/tibo-reset-monitor/config.json

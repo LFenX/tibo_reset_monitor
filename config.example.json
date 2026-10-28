@@ -1,0 +1,64 @@
+{
+  "source": {
+    "url": "https://aihot.news/api/v1/codex-resets/recent",
+    "poll_interval_seconds": 600,
+    "timeout_seconds": 20,
+    "user_agent": "tibo-reset-monitor/0.1.0 (+https://github.com/LFenX/tibo_reset_monitor)"
+  },
+  "state": {
+    "path": "state/monitor.sqlite3"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/monitor.log"
+  },
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "api_base": "https://open.feishu.cn",
+      "app_id": "cli_example_not_a_real_app_id",
+      "app_secret_env": "TIBO_FEISHU_APP_SECRET",
+      "targets": [
+        {
+          "name": "example-group",
+          "kind": "group",
+          "receive_id": "oc_example_group_chat_id",
+          "receive_id_type": "chat_id"
+        },
+        {
+          "name": "example-person",
+          "kind": "personal",
+          "receive_id": "ou_example_open_id",
+          "receive_id_type": "open_id"
+        }
+      ]
+    },
+    "telegram": {
+      "enabled": true,
+      "api_base": "https://api.telegram.org",
+      "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
+      "targets": [
+        {
+          "name": "example-group",
+          "kind": "group",
+          "chat_id": "-1000000000000"
+        },
+        {
+          "name": "example-person",
+          "kind": "personal",
+          "chat_id": "100000000"
+        }
+      ]
+    },
+    "webhook": {
+      "enabled": false,
+      "targets": [
+        {
+          "name": "example-hook",
+          "kind": "group",
+          "url_env": "TIBO_WEBHOOK_EXAMPLE_URL"
+        }
+      ]
+    }
+  }
+}

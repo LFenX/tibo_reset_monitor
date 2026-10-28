@@ -1,0 +1,15 @@
+# Contributing
+
+Thanks for looking at tibo-reset-monitor.
+
+- Python 3.10 or newer. Keep the core and the built-in channels on the standard library.
+- Run tests before sending a change:
+
+  ```bash
+  PYTHONPATH=src python -m unittest discover -s tests -v
+  ```
+
+- Do not commit secrets, real app ids, chat ids, tokens, or a filled-in `config.json` / `.env`. `config.example.json` stays full of obvious placeholders.
+- Core code under `src/tibo_reset_monitor/core/` must not import a channel. New destinations go through the channel interface. See [docs/adding-a-channel.md](docs/adding-a-channel.md).
+- A fetch failure must not overwrite the last good snapshot. One target's failure must not resend a message that another target already accepted.
+- The confirmation time shown to people is the source post time from AIHOT, not an account credit time. Keep that visible in new channel formats.
