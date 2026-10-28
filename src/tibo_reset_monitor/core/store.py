@@ -281,20 +281,24 @@ class StateStore:
         self.set_meta("history_attempt_at", format_utc(fetched_at))
 
     def acquire_lock(self, owner: str, now: datetime, stale_seconds: float) -> bool:
-        row = self.conn.execute("SELECT owner, acquired_at FROM process_lock WHERE id = 1").fetchone()
-        if row is not None and row["owner"] != owner:
-            acquired = parse_utc(row["acquired_at"])
-            if acquired is not None and (now - acquired).total_seconds() < stale_seconds:
-                return False
-        self.conn.execute(
-            """
-            INSERT INTO process_lock(id, owner, acquired_at) VALUES (1, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, acquired_at = excluded.acquired_at
-            """,
-            (owner, format_utc(now)),
-        )
-        self.conn.commit()
-        return True
+        """Take the process lock. The check and the write are one transaction, so two processes cannot both win."""
+        try:
+            with self.transaction():
+                row = self.conn.execute("SELECT owner, acquired_at FROM process_lock WHERE id = 1").fetchone()
+                if row is not None and row["owner"] != owner:
+                    acquired = parse_utc(row["acquired_at"])
+                    if acquired is not None and (now - acquired).total_seconds() < stale_seconds:
+                        return False
+                self.conn.execute(
+                    """
+                    INSERT INTO process_lock(id, owner, acquired_at) VALUES (1, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET owner = excluded.owner, acquired_at = excluded.acquired_at
+                    """,
+                    (owner, format_utc(now)),
+                )
+                return True
+        except sqlite3.OperationalError:
+            return False
 
     def release_lock(self, owner: str) -> None:
         self.conn.execute("DELETE FROM process_lock WHERE id = 1 AND owner = ?", (owner,))
@@ -420,8 +424,13 @@ class StateStore:
             raise KeyError(row_id)
         return self._row(row)
 
-    def apply_state(self, row_id: int, state: DeliveryState, now: datetime) -> None:
-        self._write_state(row_id, state, now)
+    def apply_state(self, row_id: int, state: DeliveryState, now: datetime) -> bool:
+        """Record a receipt only while the row is still in flight.
+
+        Unsubscribe can cancel the row after it was claimed. That cancellation
+        must stick, or a failed send would put the message back in the queue.
+        """
+        return self._write_state(row_id, state, now, only_status=INFLIGHT) > 0
 
     def defer(self, row_id: int, when: datetime, detail: str) -> None:
         self.conn.execute(
@@ -603,9 +612,8 @@ class StateStore:
             ),
         )
 
-    def _write_state(self, row_id: int, state: DeliveryState, now: datetime) -> None:
-        self.conn.execute(
-            """
+    def _write_state(self, row_id: int, state: DeliveryState, now: datetime, *, only_status: str | None = None) -> int:
+        sql = """
             UPDATE outbox
             SET status = ?,
                 attempts = ?,
@@ -616,19 +624,23 @@ class StateStore:
                 receipt_detail = ?,
                 updated_at = ?
             WHERE id = ?
-            """,
-            (
-                state.status,
-                state.attempts,
-                format_utc(state.next_attempt_at) if state.next_attempt_at else None,
-                format_utc(state.first_ambiguous_at) if state.first_ambiguous_at else None,
-                state.last_error,
-                state.receipt_message_id,
-                state.receipt_detail,
-                format_utc(now),
-                row_id,
-            ),
-        )
+        """
+        params: list[Any] = [
+            state.status,
+            state.attempts,
+            format_utc(state.next_attempt_at) if state.next_attempt_at else None,
+            format_utc(state.first_ambiguous_at) if state.first_ambiguous_at else None,
+            state.last_error,
+            state.receipt_message_id,
+            state.receipt_detail,
+            format_utc(now),
+            row_id,
+        ]
+        if only_status is not None:
+            sql += " AND status = ?"
+            params.append(only_status)
+        cursor = self.conn.execute(sql, params)
+        return int(cursor.rowcount)
 
     def _row(self, row: sqlite3.Row) -> OutboxRow:
         payload_row = self.conn.execute(

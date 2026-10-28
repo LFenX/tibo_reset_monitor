@@ -129,7 +129,8 @@ def deliver_due(
         receipt = _send(channel, target, claimed)
         decided_at = clock.now()
         decision = on_receipt(claimed.state, receipt, decided_at)
-        store.apply_state(claimed.id, decision, decided_at)
+        if not store.apply_state(claimed.id, decision, decided_at):
+            continue
         if target is not None and target.options.get("subscription") == "1":
             if decision.status == SENT:
                 store.record_subscription_result(claimed.channel, claimed.target_key, ok=True, detail="", now=decided_at)

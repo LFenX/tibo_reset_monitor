@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +12,7 @@ from tests.support import FakeClock, TempStoreTest, make_event, make_post, snaps
 from tibo_reset_monitor.channels import REGISTRY
 from tibo_reset_monitor.core.chat import ChatController, Inbound, PairingGate
 from tibo_reset_monitor.core.dedupe import extract_notices
-from tibo_reset_monitor.core.model import Notice, Receipt, Target
+from tibo_reset_monitor.core.model import DeliveryState, Notice, Receipt, Target
 from tibo_reset_monitor.core.scheduler import effective_targets
 from tibo_reset_monitor.core.store import StateStore
 
@@ -201,6 +202,73 @@ class ChatFlowTest(TempStoreTest):
         assert reply is not None
         self.assertIn("没有这个选项", reply.text)
         self.assertIsNotNone(self.store.load_session("telegram", "42"))
+
+    def test_two_processes_cannot_both_hold_the_lock(self):
+        other = StateStore(self.store.path)
+        self.addCleanup(other.close)
+        self.assertTrue(self.store.acquire_lock("solo", NOW, 900))
+        self.assertTrue(self.store.acquire_lock("solo", NOW, 900))
+        self.assertFalse(other.acquire_lock("other", NOW, 900))
+        self.store.release_lock("solo")
+        barrier = threading.Barrier(2)
+        results: list[bool] = []
+
+        def grab(store: StateStore, owner: str) -> None:
+            barrier.wait()
+            try:
+                results.append(store.acquire_lock(owner, NOW, 900))
+            finally:
+                store.close()
+
+        threads = [
+            threading.Thread(target=grab, args=(self.store, "proc-a")),
+            threading.Thread(target=grab, args=(other, "proc-b")),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sorted(results), [False, True])
+        self.assertFalse(self.store.acquire_lock("proc-c", NOW, 900))
+
+    def test_unsubscribe_while_a_send_is_in_flight_is_not_queued_again(self):
+        self.store.subscribe(channel="telegram", kind="personal", address="42", display_name="42", now=NOW)
+        notice = Notice(
+            dedupe_key="p",
+            post_key="p",
+            stage="announcement",
+            stage_label="预告",
+            title="",
+            display_label="",
+            author="",
+            text="hi",
+            original_text="",
+            url="",
+            published_at="",
+        )
+        targets = self.store.subscription_targets("telegram", "zh", "UTC")
+        self.store.ingest([notice], targets, {"events": []}, None, NOW)
+        self.store.conn.commit()
+        row = self.store.due_rows(NOW)[0]
+        self.store.claim(row.id, NOW)
+        self.store.conn.commit()
+        self.store.unsubscribe("telegram", "personal", "42", NOW, reason="unsubscribed")
+        applied = self.store.apply_state(
+            row.id,
+            DeliveryState(
+                status="retryable",
+                attempts=1,
+                next_attempt_at=NOW,
+                first_ambiguous_at=None,
+                last_error="network",
+                receipt_message_id=None,
+                receipt_detail="network",
+            ),
+            NOW,
+        )
+        self.assertFalse(applied)
+        self.assertEqual(self.store.due_rows(NOW), [])
+        self.assertEqual(self.store.read_row(row.id).state.status, "cancelled")
 
     def test_state_file_is_owner_only(self):
         mode = os.stat(self.store.path).st_mode
