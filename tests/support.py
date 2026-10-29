@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import logging
+import json
+from types import SimpleNamespace
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
+from tibo_reset_monitor.core.chat import ChatController, Inbound
+from tibo_reset_monitor.core.scheduler import run_cycle
 from tibo_reset_monitor.core.model import FetchResult, Receipt, Target
 from tibo_reset_monitor.core.store import StateStore
 
 logging.getLogger("tibo_reset_monitor").setLevel(logging.CRITICAL)
 
 
-def utc(year=2026, month=10, day=28, hour=0, minute=0, second=0) -> datetime:
+def utc(year=2026, month=10, day=28, hour=2, minute=0, second=0) -> datetime:
     return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
 
 
@@ -162,7 +166,7 @@ def make_event(event_id: str, posts: list[dict], title: str = "Tibo 预告将重
         "scope": "",
         "createdAt": "2026-10-28T10:00:00.000+08:00",
         "updatedAt": "2026-10-28T10:00:00.000+08:00",
-        "confirmedAt": None if status != "confirmed" else "2026-10-28T11:00:00.000+08:00",
+        "confirmedAt": None if status != "confirmed" else "2026-10-28T10:00:00.000+08:00",
         "occurredOn": None,
         "confirmationBasis": None if status != "confirmed" else "source_post",
         "schedule": {
@@ -193,3 +197,48 @@ def make_activity(post_id: str, action: str | None, event_id: str | None, text: 
 
 def sent(message_id: str = "m1") -> Receipt:
     return Receipt("sent", provider_message_id=message_id, detail="sent")
+
+
+class SafetyFixture(TempStoreTest):
+    """Synthetic source, delivery and acknowledged-picker integration fixtures."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock.now_value = utc(hour=4)
+        self.channel = ScriptedChannel("fake", [target("fake", "virtual-destination")], lambda *_: sent())
+
+    def cycle(self, body):
+        return run_cycle(store=self.store, source=ScriptedSource([ok(body)]),
+                         channels=[self.channel], clock=self.clock)
+
+    def body(self, stage="预告", identity="virtual-post", published="2026-10-28T04:00:01Z"):
+        post = make_post(identity, stage)
+        post["publishedAt"] = published
+        return snapshot([make_event("virtual-event", [post])])
+
+    def baseline(self):
+        self.cycle(snapshot([]))
+        self.clock.advance(2)
+
+    def controller(self):
+        return ChatController(self.store, self.clock, channel="feishu", language="zh",
+                              admins=("ou_virtual_reviewer",),
+                              group_catalog=lambda: [("oc_virtual_group", "Virtual group")],
+                              group_membership=lambda *_: True, require_reply_ack=True)
+
+    def inbound(self, event_id, text):
+        return Inbound(channel="feishu", event_id=event_id, scope="personal",
+                       chat_id="oc_virtual_dm", user_id="ou_virtual_reviewer", text=text)
+
+    def feishu_event(self, event_id, text, created="1793160000000"):
+        return SimpleNamespace(event=SimpleNamespace(
+            message=SimpleNamespace(message_id=event_id, chat_id="oc_virtual_dm", chat_type="p2p",
+                                    content=json.dumps({"text": text}), create_time=created),
+            sender=SimpleNamespace(sender_type="user",
+                                   sender_id=SimpleNamespace(open_id="ou_virtual_reviewer"))))
+
+    def picker(self, controller):
+        reply = controller.handle(self.inbound("virtual-prompt", "/addgroup"))
+        self.assertTrue(controller.prepare_reply(reply))
+        controller.confirm_reply(reply)
+        return reply

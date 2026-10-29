@@ -110,13 +110,13 @@ def poll(runtime: Runtime) -> int:
     try:
         prepare_guides(runtime)
         deliver_guides(runtime.store, runtime.channels, runtime.clock)
-        _refresh_history(runtime)
         report = run_cycle(
             store=runtime.store,
             source=runtime.source,
             channels=runtime.channels,
             clock=runtime.clock,
             heartbeat=lambda: runtime.store.acquire_lock(runtime.owner, runtime.clock.now(), runtime.config.stale_lock_seconds),
+            before_delivery=lambda: _refresh_history(runtime),
         )
         log_report(report)
         return 1 if report.fetch_error else 0
@@ -136,7 +136,6 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
         while True:
             deliver_guides(runtime.store, runtime.channels, runtime.clock)
             runtime.store.acquire_lock(runtime.owner, runtime.clock.now(), runtime.config.stale_lock_seconds)
-            _refresh_history(runtime)
             report = run_cycle(
                 store=runtime.store,
                 source=runtime.source,
@@ -145,6 +144,7 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
                 heartbeat=lambda: runtime.store.acquire_lock(
                     runtime.owner, runtime.clock.now(), runtime.config.stale_lock_seconds
                 ),
+                before_delivery=lambda: _refresh_history(runtime),
             )
             log_report(report)
             delay = float(runtime.config.poll_interval_seconds)
@@ -161,7 +161,7 @@ def run_forever(runtime: Runtime, sleep: Any = time.sleep) -> int:
 
 def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
     """Listen for Telegram and Feishu commands without blocking the poll loop."""
-    from tibo_reset_monitor.channels.feishu_inbox import collaborator_open_ids, list_bot_chats, start_feishu_listener
+    from tibo_reset_monitor.channels.feishu_inbox import collaborator_open_ids, list_bot_chats, start_feishu_listener, user_in_chat
     from tibo_reset_monitor.channels.telegram_inbox import TelegramInbox
     from tibo_reset_monitor.core.chat import ChatController, PairingGate, issue_pairing_code
 
@@ -190,6 +190,8 @@ def _start_chat_control(runtime: Runtime, stop: threading.Event) -> None:
             pairing=pairing,
             extra_admins=extra,
             welcome=_welcome_opener(runtime, channel.name),
+            require_reply_ack=True,
+            group_membership=(lambda user, chat, channel=channel: user_in_chat(channel, user, chat)) if channel.name == "feishu" else None,
         )
         if channel.name == "telegram":
             if not admins and not runtime.store.chat_admin_ids("telegram"):
@@ -437,7 +439,7 @@ def manual_send(
         now = runtime.clock.now()
         row = runtime.store.enqueue_existing(notice, target, now, salt=f"manual:{uuid.uuid4().hex}")
         runtime.store.conn.commit()
-        deliver_due(runtime.store, runtime.channels, runtime.clock)
+        deliver_due(runtime.store, runtime.channels, runtime.clock, only_row_id=row.id)
         updated = runtime.store.read_row(row.id)
         print(f"{updated.state.status}: {updated.state.receipt_detail or updated.state.last_error or ''}")
         return 0 if updated.state.status == "sent" else 1
@@ -462,7 +464,7 @@ def _deliver_manual(runtime: Runtime, channel: Any, target: Target, notice: Noti
     now = runtime.clock.now()
     row = runtime.store.insert_manual(notice, target, now, salt=salt)
     runtime.store.conn.commit()
-    deliver_due(runtime.store, runtime.channels, runtime.clock)
+    deliver_due(runtime.store, runtime.channels, runtime.clock, only_row_id=row.id)
     updated = runtime.store.read_row(row.id)
     detail = updated.state.receipt_detail or updated.state.last_error or ""
     print(f"{updated.state.status}: {detail}")

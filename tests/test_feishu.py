@@ -6,13 +6,16 @@ import json
 import logging
 import os
 import unittest
+from types import SimpleNamespace
 
-from tests.support import FakeClock, make_event, make_post, snapshot, utc
+from tests.support import FakeClock, SafetyFixture, make_event, make_post, snapshot, utc
 from tibo_reset_monitor.channels.feishu import FeishuChannel
 from tibo_reset_monitor.config import ChannelSpec
 from tibo_reset_monitor.core.dedupe import extract_notices
 from tibo_reset_monitor.core.http import HttpResponse, TransportError
 from tibo_reset_monitor.core.model import Target
+from tibo_reset_monitor.core.scheduler import deliver_due
+from tibo_reset_monitor.core.store import StateStore
 from tibo_reset_monitor.logutil import configure_logging
 
 
@@ -31,15 +34,31 @@ class FakeTransport:
                 url,
             )
         if "receive_id_type=chat_id" in url and b"oc_group" in body:
-            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_group"}}).encode(), url)
+            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_group", "chat_id": "oc_group"}}).encode(), url)
         if "receive_id_type=email" in url:
-            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_mail"}}).encode(), url)
+            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_mail", "chat_id": "oc_virtual_dm"}}).encode(), url)
         if "receive_id_type=open_id" in url:
             return HttpResponse(400, {}, json.dumps({"code": 230002, "msg": "Bot/User can NOT be out of the chat."}).encode(), url)
         raise AssertionError(url)
 
 
 class FeishuRequestTest(unittest.TestCase):
+    def test_bad_success_receipts_are_ambiguous(self):
+        cases = [[], {}, {"message_id": 7, "chat_id": "oc_group"},
+                 {"message_id": "", "chat_id": "oc_group"},
+                 {"message_id": "om_virtual", "chat_id": "oc_other"}]
+        target = Target("feishu", "ops", "group", "oc_group", {"receive_id_type": "chat_id"})
+        for data in cases:
+            with self.subTest(data=data):
+                class BadReceiptTransport(FakeTransport):
+                    def send(inner, method, url, headers, body, timeout):
+                        if "/im/v1/messages?" in url:
+                            return HttpResponse(200, {}, json.dumps({"code": 0, "data": data}).encode(), url)
+                        return super().send(method, url, headers, body, timeout)
+                self.channel._transport = BadReceiptTransport()
+                receipt = self.channel.send(self.channel.render(self.notice, target), target, "same-virtual-key")
+                self.assertEqual(receipt.outcome, "ambiguous")
+
     def setUp(self) -> None:
         self._secret = "test-secret-not-real"
         os.environ["TIBO_FEISHU_APP_SECRET"] = self._secret
@@ -208,6 +227,93 @@ class FeishuRequestTest(unittest.TestCase):
         self.assertEqual(receipt.outcome, "retryable")
         self.assertIn("TIBO_FEISHU_APP_SECRET", receipt.detail)
         self.assertEqual(self.transport.calls, [])
+
+
+class FrozenImageDeliveryTest(SafetyFixture):
+    def _channel(self, responder):
+        destination = Target("feishu", "synthetic-group", "group", "oc_synthetic", {"receive_id_type": "chat_id"})
+        channel = FeishuChannel(ChannelSpec("feishu", True, {"language": "en"}, [destination]),
+                                SimpleNamespace(send=responder), self.clock)
+        channel._access_token = lambda **_: "synthetic-token"
+        channel.bind_calendar(lambda *_: b"synthetic PNG bytes", lambda *_: (2026, 10))
+        return channel
+
+    def _retry_after_restart(self, upload_ok):
+        uploads, requests = [], []
+        def responder(method, url, headers, body, timeout):
+            if url.endswith("/images"):
+                uploads.append(body)
+                payload = {"code": 0, "data": {"image_key": f"img_synthetic_{len(uploads)}"}} if upload_ok else {"code": 1}
+                return HttpResponse(200 if upload_ok else 503, {}, json.dumps(payload).encode(), url)
+            requests.append(json.loads(body))
+            if len(requests) == 1:
+                raise TransportError("synthetic accepted message, ACK lost", ambiguous=True)
+            return HttpResponse(200, {}, b'{"code":0,"data":{"message_id":"om_synthetic","chat_id":"oc_synthetic"}}', url)
+        self.channel = self._channel(responder)
+        self.baseline()
+        self.cycle(self.body())
+        original = self.store.read_row(1)
+        self.assertEqual(original.state.status, "ambiguous")
+        self.assertIsNone(original.message["photo"])
+        database = self.store.path
+        self.store.close()
+        self.store = StateStore(database)
+        self.addCleanup(self.store.close)
+        self.channel = self._channel(responder)
+        self.channel.bind_calendar(lambda *_: b"changed calendar after restart")
+        self.clock.advance(120)
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(len(uploads), 1)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(self.store.read_row(1).state.status, "sent")
+        self.assertEqual(self.store.read_row(1).idempotency_key, original.idempotency_key)
+
+    def test_uploaded_image_reference_and_body_survive_restart_retry(self):
+        self._retry_after_restart(True)
+
+    def test_failed_optional_upload_freezes_the_text_fallback(self):
+        self._retry_after_restart(False)
+
+    def test_legacy_attempted_image_without_original_key_is_not_reuploaded(self):
+        calls = []
+        def responder(*args):
+            calls.append(args)
+            raise AssertionError("legacy unknown message must not be submitted")
+        self.channel = self._channel(responder)
+        self.baseline()
+        render = self.channel.render
+        self.channel.render = lambda *_: (_ for _ in ()).throw(ValueError("synthetic hold"))
+        self.cycle(self.body())
+        self.channel.render = render
+        row = self.store.read_row(1)
+        self.store.save_message(row.id, render(row.notice, self.channel.targets[0]))
+        self.store.conn.execute("UPDATE outbox SET status = 'ambiguous', attempts = 1, next_attempt_at = NULL")
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+        self.assertEqual(self.store.read_row(1).idempotency_key, row.idempotency_key)
+
+    def test_target_change_during_upload_is_held_without_blocking_another_target(self):
+        from dataclasses import replace
+        uploads, messages = [], []
+        def responder(method, url, headers, body, timeout):
+            if url.endswith("/images"):
+                uploads.append(body)
+                if len(uploads) == 1:
+                    self.channel.targets[0] = replace(self.channel.targets[0], address="oc_synthetic_changed")
+                payload = {"code": 0, "data": {"image_key": "img_synthetic"}}
+            else:
+                messages.append(json.loads(body))
+                payload = {"code": 0, "data": {"message_id": "om_synthetic", "chat_id": messages[-1]["receive_id"]}}
+            return HttpResponse(200, {}, json.dumps(payload).encode(), url)
+        self.channel = self._channel(responder)
+        self.channel.targets.append(Target("feishu", "synthetic-other", "group", "oc_synthetic_other"))
+        self.baseline()
+        self.cycle(self.body())
+        self.assertEqual([item["receive_id"] for item in messages], ["oc_synthetic_other"])
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+        self.assertEqual(self.store.read_row(2).state.status, "sent")
 
 
 if __name__ == "__main__":

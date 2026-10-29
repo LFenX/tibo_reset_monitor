@@ -8,7 +8,11 @@ be stored over the last valid snapshot.
 from __future__ import annotations
 
 import json
+import re
+import math
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from tibo_reset_monitor.core.http import TransportError, UrllibTransport
 from tibo_reset_monitor.core.model import FetchResult, SourceFailure
@@ -32,41 +36,182 @@ def parse_retry_after(value: str | None, *, cap: float = 3600) -> float | None:
         seconds = float(text)
     except ValueError:
         return None
-    if seconds < 0:
+    if not math.isfinite(seconds) or seconds < 0:
         return None
     return min(seconds, cap)
 
 
-def validate_snapshot(body: Any) -> dict[str, Any]:
+def source_time(value: Any, field: str = "timestamp") -> datetime:
+    """Source timestamps must explicitly identify a time zone."""
+    if not isinstance(value, str) or not re.match(r"^\d{4}-\d{2}-\d{2}T", value):
+        raise SnapshotError(f"{field} must be a timestamp with a time zone")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("missing time zone")
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError) as exc:
+        raise SnapshotError(f"{field} is not a valid timestamp") from exc
+
+
+def validate_events(events: Any, now: datetime | None = None) -> None:
+    if not isinstance(events, list):
+        raise SnapshotError("events must be an array")
+    identities: set[str] = set()
+    for event in events:
+        _record(event, "event", now)
+        if not isinstance(event.get("type"), str) or not event["type"].strip():
+            raise SnapshotError("event type must be a nonempty string")
+        identity = event.get("id")
+        if not isinstance(identity, str) or not identity or identity in identities:
+            raise SnapshotError("event ids must be nonempty and unique")
+        identities.add(identity)
+        occurred = event.get("occurredOn")
+        if occurred is not None:
+            try:
+                if not isinstance(occurred, str) or date.fromisoformat(occurred).isoformat() != occurred:
+                    raise ValueError("not a standard date")
+            except ValueError as exc:
+                raise SnapshotError("occurredOn must be a valid YYYY-MM-DD date") from exc
+        for name in ("presentation", "estimate", "schedule"):
+            nested = event.get(name)
+            if nested is not None and not isinstance(nested, dict):
+                raise SnapshotError(f"{name} must be an object or null")
+            if name != "presentation" and nested:
+                for bound in ("from", "through"):
+                    if nested.get(bound) is not None:
+                        source_time(nested[bound], f"{name}.{bound}")
+                if nested.get("from") and nested.get("through") and source_time(nested["from"]) > source_time(nested["through"]):
+                    raise SnapshotError(f"{name} range is reversed")
+        _posts(event.get("posts"), "posts", now)
+
+
+def _record(record: Any, label: str, now: datetime | None) -> None:
+    if not isinstance(record, dict):
+        raise SnapshotError(f"{label} must be an object")
+    for name in ("id", "author", "relation", "stage", "type", "status", "title", "label", "displayLabel",
+                 "scope", "url", "text", "originalText", "fullText", "fullOriginalText"):
+        if name not in record:
+            continue
+        nullable = name in {"fullText", "fullOriginalText"} or (name == "text" and label in {"activities", "context"})
+        if not isinstance(record[name], str) and not (nullable and record[name] is None):
+            raise SnapshotError(f"{label}.{name} has an invalid string value")
+    if "url" in record:
+        _source_url(record["url"], label)
+    for name in ("publishedAt", "createdAt", "updatedAt", "confirmedAt"):
+        if name in record and record[name] is None and name != "confirmedAt":
+            raise SnapshotError(f"{label}.{name} must be a timestamp")
+        if record.get(name) is not None:
+            stamp = source_time(record[name], f"{label}.{name}")
+            if now is not None and stamp > now + timedelta(seconds=300):
+                raise SnapshotError(f"{label}.{name} exceeds the local clock tolerance")
+    context = record.get("context")
+    if context is not None:
+        if not isinstance(context, list):
+            raise SnapshotError(f"{label}.context must be an array or null")
+        for item in context:
+            _record(item, "context", now)
+            for name in ("id", "author", "relation", "originalText", "url"):
+                if not isinstance(item.get(name), str):
+                    raise SnapshotError(f"context.{name} must be a string")
+
+
+def _source_url(value: Any, label: str) -> None:
+    try:
+        parsed = urlsplit(value) if isinstance(value, str) else None
+        valid = (parsed is not None and parsed.scheme in {"http", "https"} and parsed.hostname
+                 and not any(character.isspace() for character in value))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SnapshotError(f"{label}.url must be an absolute HTTP URL")
+
+
+def _posts(posts: Any, label: str, now: datetime | None) -> None:
+    if not isinstance(posts, list):
+        raise SnapshotError(f"{label} must be an array")
+    identities: set[str] = set()
+    for post in posts:
+        _record(post, label, now)
+        source_time(post.get("publishedAt"), f"{label}.publishedAt")
+        identity = post.get("id")
+        if not isinstance(identity, str) or not identity or identity in identities:
+            raise SnapshotError(f"{label} ids must be nonempty and unique")
+        identities.add(identity)
+        required = ("text", "originalText", "url") if label == "posts" else ("originalText", "url")
+        for name in required:
+            if not isinstance(post.get(name), str) or (name != "originalText" and not post[name]):
+                raise SnapshotError(f"{label}.{name} must be a string")
+        if label == "activities" and not post["originalText"]:
+            raise SnapshotError("activity originalText must not be empty")
+        if label == "posts":
+            if not isinstance(post.get("stage"), str) or not post["stage"].strip():
+                raise SnapshotError("post stage must be a nonempty string")
+        else:
+            if not isinstance(post.get("kind"), str) or not post["kind"].strip():
+                raise SnapshotError("activity kind must be a nonempty string")
+            if post["kind"] == "event_update" and (not isinstance(post.get("action"), str) or not post["action"].strip()):
+                raise SnapshotError("event update action must be a nonempty string")
+            if not isinstance(post.get("eventIds"), list) or any(not isinstance(item, str) or not item.strip() for item in post["eventIds"]):
+                raise SnapshotError("activity eventIds must be an array of nonempty strings")
+
+
+def automatic_after(body: dict[str, Any], now: datetime, baseline: str, last_success: str | None = None) -> datetime:
+    boundaries = [source_time(baseline), now - timedelta(days=7), source_time(body["historyFrom"])]
+    if last_success:
+        checkpoint = source_time(last_success)
+        if checkpoint > now + timedelta(seconds=300):
+            raise SnapshotError("local clock is behind the last successful source check")
+        boundaries.append(checkpoint - timedelta(hours=1))
+    if max(boundaries) > now + timedelta(seconds=300):
+        raise SnapshotError("automatic time boundary exceeds the local clock tolerance")
+    return max(boundaries)
+
+
+def automatic_eligible(notice: Any, after: datetime, now: datetime) -> bool:
+    try:
+        published = source_time(notice.published_at, "publishedAt")
+    except SnapshotError:
+        return False
+    return after <= published <= now + timedelta(seconds=300)
+
+
+def validate_snapshot(body: Any, now: datetime | None = None) -> dict[str, Any]:
     if not isinstance(body, dict):
         raise SnapshotError("response JSON must be an object")
     missing = [name for name in REQUIRED_FIELDS if name not in body]
     if missing:
         raise SnapshotError("response is missing " + ", ".join(missing))
-    if body.get("schemaVersion") != 1:
+    if type(body.get("schemaVersion")) is not int or body.get("schemaVersion") != 1:
         raise SnapshotError(f"unsupported schemaVersion {body.get('schemaVersion')!r}")
     if not isinstance(body.get("events"), list):
         raise SnapshotError("events must be an array")
     if not isinstance(body.get("count"), int) or isinstance(body.get("count"), bool):
         raise SnapshotError("count must be an integer")
+    if body["count"] < 0:
+        raise SnapshotError("count must be nonnegative")
     if not isinstance(body.get("historyFrom"), str):
         raise SnapshotError("historyFrom must be a string")
+    history_from = source_time(body["historyFrom"], "historyFrom")
+    if now is not None and history_from > now + timedelta(seconds=300):
+        raise SnapshotError("historyFrom exceeds the local clock tolerance")
+    source_time(body["checkedAt"], "checkedAt")
+    if not isinstance(body.get("timezone"), str) or not body["timezone"].strip():
+        raise SnapshotError("timezone must be a nonempty string")
     activities = body.get("activities", [])
-    if activities is None:
-        activities = []
     if not isinstance(activities, list):
         raise SnapshotError("activities must be an array")
     for index, event in enumerate(body["events"]):
         if not isinstance(event, dict) or not event.get("id"):
             raise SnapshotError(f"events[{index}] is missing id")
-        posts = event.get("posts", [])
-        if posts is None:
-            posts = []
+        posts = event.get("posts")
         if not isinstance(posts, list):
             raise SnapshotError(f"events[{index}].posts must be an array")
     for index, activity in enumerate(activities):
         if not isinstance(activity, dict) or not activity.get("id"):
             raise SnapshotError(f"activities[{index}] is missing id")
+    validate_events(body["events"], now)
+    _posts(activities, "activities", now)
     return body
 
 

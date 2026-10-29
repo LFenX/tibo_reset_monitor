@@ -4,7 +4,7 @@
 
 最小配置见仓库里的 [`config.minimal.example.json`](../config.minimal.example.json)。密钥只放环境变量。
 
-`welcome_message` 默认是 `true`。进程拿到锁并且对话管理就绪后，会给配置里的管理员各发一条使用指南：Telegram 用数字 chat id，飞书用 `open_id`。飞书的 `admins` 为空时，改发给应用协作者；协作者也拿不到就跳过，不反复请求。Telegram 在对方还没给机器人发过消息时发不出去，这时记一条日志并跳过，等对方第一次 `/start` 或配对成功再发。同一份指南对同一个人只发一次，记在状态库里；指南内容版本变化后才会再发。`welcome_message` 设为 `false`，或启动时加 `run --no-welcome`，都不会发。发送失败会按通知一样稍后重试，不会挡住额度轮询，日志里也不会出现 token 或配对码。
+`welcome_message` 默认是 `true`。进程拿到锁并且对话管理就绪后，会给配置里的管理员各发一条使用指南：Telegram 用数字 chat id，飞书用 `open_id`。飞书的 `admins` 为空时，改发给应用协作者；协作者也拿不到就跳过，不反复请求。Telegram 在对方还没给机器人发过消息时发不出去，这时记一条日志并跳过，等对方第一次 `/start` 或配对成功再发。同一份指南对同一个人只发一次，记在状态库里；指南内容版本变化后才会再发。`welcome_message` 设为 `false`，或启动时加 `run --no-welcome`，都不会发。明确失败会稍后重试；结果不明遵守通知的停止重试规则，不会挡住额度轮询。无法核实原正文的旧尝试等待人工核验。日志不会出现 token 或配对码。
 
 ## 谁能用、权限与可用范围
 
@@ -37,6 +37,10 @@
 | 添加其他管理员 | `/addadmin <用户 id>` | `/addadmin <open_id>` |
 
 选择群时要在私聊里回复编号或完整群名，1 分钟内有效，一次一个群。在群里发数字不会选中。超时要重新发指令。重名必须用编号。只有最新一次列出的名单有效；如果这次列群失败，上一份名单作废。
+
+有效期从提示消息实际发送的时间开始计算，延迟回执或重放原提示不会延长一分钟期限。名单绑定用户和单聊；发送名单前、提交选择前都会重新检查权限。飞书群管理仅接受用户身份的机器人单聊，你和机器人都必须在目标群内；应用需要[读取群成员权限](https://open.feishu.cn/document/server-docs/group/chat-member/get)。撤权、成员变化或查询失败时拒绝操作，取消指令仍可退出选择。
+
+飞书应用协作者只接受 `owner`、`administrator`、`developer`、`operator` 四类角色，未知类型不授予管理权限。迟到的旧选择或取消消息不会操作新名单；原提示实际发出后达到 60 秒即过期，重复回执不延期，提交时再次核对。无法核实回执中的发送时间时，按持久保存的首次提交时刻计时。名单回复未取得有效回执时，同一事件可在重启后用原内容、原幂等键重试；选择写入失败会保留可恢复的会话，不会只清除名单而漏写订阅。成功选择的结果回复与订阅、会话清理原子保存；回复失败后重放同事件恢复原回复，不重复操作订阅。敏感回复重试前仍校验当前权限及成员身份，并在 55 分钟后停止。
 
 `allow_self_subscribe` 默认 `false`：只有管理员能给自己开单聊。设为 `true` 后，任何人都能给自己开单聊，但不能管理群。
 
@@ -79,7 +83,7 @@
 
 The smallest file is [`config.minimal.example.json`](../config.minimal.example.json). Secrets stay in environment variables.
 
-`welcome_message` defaults to `true`. After the process holds the lock and chat control is ready, each configured admin receives one usage guide: a Telegram numeric chat id, or a Feishu `open_id`. When Feishu `admins` is empty, the guide goes to the app collaborators instead; if those cannot be listed, it is skipped. Telegram cannot open a direct chat until that person has messaged the bot, so the send is skipped with one log line and is delivered on their first `/start` or successful `/pair`. The same guide version is sent once per person and recorded in the state database. A new guide version is sent again. Set `welcome_message` to `false`, or start with `run --no-welcome`, to turn this off. A failed send is retried on a later poll, the same way notifications are, and does not stop quota polling. Logs do not include the token or a pairing code.
+`welcome_message` defaults to `true`. After the process holds the lock and chat control is ready, each configured admin receives one usage guide: a Telegram numeric chat id, or a Feishu `open_id`. When Feishu `admins` is empty, the guide goes to the app collaborators instead; if those cannot be listed, it is skipped. Telegram cannot open a direct chat until that person has messaged the bot, so the send is skipped with one log line and is delivered on their first `/start` or successful `/pair`. The same guide version is sent once per person and recorded in the state database. A new guide version is sent again. Set `welcome_message` to `false`, or start with `run --no-welcome`, to turn this off. Clear failures retry on a later poll; unknown outcomes use the notification safety rules and do not stop quota polling. Legacy attempts without a recorded original body require review. Logs do not include the token or a pairing code.
 
 ### Who can use it
 
@@ -112,6 +116,8 @@ If someone cannot find the Feishu bot or cannot open a direct chat, they are usu
 | Add another admin | `/addadmin <user id>` | `/addadmin <open_id>` |
 
 Reply in the direct chat with a number or the full group name. A number sent inside a group does not select anything. The choice lasts one minute and selects one group. When it expires, send the command again. Duplicate names require the number. Only the latest list counts. If that list fails to load, the previous list is discarded.
+
+Feishu starts the minute at the prompt's original send time; delayed acknowledgments and replay do not extend it. An unverifiable receipt time falls back to the saved first submission time. A successful selection saves its result reply, subscription and session cleanup atomically. Replaying a failed reply uses its original text and key without repeating the subscription change, rechecks current access, and stops after 55 minutes. Startup guides also hold unknown Telegram outcomes for review instead of retrying them on `/start`.
 
 `allow_self_subscribe` defaults to `false`, so only an admin can turn on their own direct messages. Set it to `true` to let anyone do that. They still cannot manage groups.
 

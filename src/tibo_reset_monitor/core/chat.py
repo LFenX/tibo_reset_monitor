@@ -69,12 +69,18 @@ class Inbound:
     chat_title: str = ""
     migrate_to: str = ""
     membership: str = ""
+    created_at: datetime | None = None
 
 
 @dataclass(frozen=True)
 class Reply:
     chat_id: str
     text: str
+    picker_user_id: str = ""
+    picker_id: str = ""
+    result_id: str = ""
+    result_user_id: str = ""
+    result_group_id: str = ""
 
 
 @dataclass
@@ -133,6 +139,8 @@ class ChatController:
         pairing: PairingGate | None = None,
         extra_admins: Callable[[], set[str]] | None = None,
         welcome: Callable[[str], None] | None = None,
+        group_membership: Callable[[str, str], bool] | None = None,
+        require_reply_ack: bool = False,
     ) -> None:
         self.store = store
         self.clock = clock
@@ -144,13 +152,34 @@ class ChatController:
         self.pairing = pairing or PairingGate()
         self.extra_admins = extra_admins
         self.welcome = welcome
+        self.group_membership = group_membership
+        self.require_reply_ack = require_reply_ack
         self._hits: dict[str, list[datetime]] = {}
         self._extra_loaded = False
         self._extra_ids: set[str] | None = None
 
     def handle(self, inbound: Inbound) -> Reply | None:
+        if inbound.channel != self.channel:
+            return None
         now = self.clock.now()
-        if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, now):
+        command, argument = _split_command(inbound.text)
+        selection = (command is None and inbound.scope == "personal" and bool(inbound.text.strip())
+                     and not inbound.migrate_to and not inbound.membership
+                     and self.store.load_session(self.channel, inbound.user_id) is not None)
+        deferred_claim = selection or (inbound.scope == "personal" and command in {"add_group", "remove_group"})
+        duplicate = False
+        if inbound.event_id:
+            duplicate = (self.store.has_inbound(self.channel, inbound.event_id) if deferred_claim else
+                         not self.store.claim_inbound(self.channel, inbound.event_id, now))
+        if duplicate:
+            result = self._result_reply(inbound)
+            if result is not None:
+                return result
+            session = self.store.load_session(self.channel, inbound.user_id)
+            if (inbound.scope == "personal" and session and not session["expires_at"]
+                    and session["prompt_id"] == inbound.event_id and session["chat_id"] == inbound.chat_id
+                    and session["reply_text"]):
+                return Reply(inbound.chat_id, session["reply_text"], inbound.user_id, inbound.event_id)
             return None
         if inbound.migrate_to:
             self.store.migrate_chat(self.channel, inbound.chat_id, inbound.migrate_to, now)
@@ -161,7 +190,14 @@ class ChatController:
         if not inbound.text.strip():
             return None
         self._extra_loaded = False
-        command, argument = _split_command(inbound.text)
+        if command == "cancel":
+            session = self.store.load_session(self.channel, inbound.user_id)
+            if inbound.scope != "personal" or (session and session["chat_id"] != inbound.chat_id):
+                return Reply(inbound.chat_id, self._t("only_dm"))
+            if session and self._older_than_session(inbound, session):
+                return Reply(inbound.chat_id, self._t("expired"))
+            self.store.clear_session(self.channel, inbound.user_id)
+            return Reply(inbound.chat_id, self._t("cancelled"))
         if self._limited(inbound.user_id, now):
             return Reply(inbound.chat_id, self._t("slow"))
         if command == "help":
@@ -175,6 +211,8 @@ class ChatController:
         return self._dispatch(inbound, command, argument, now)
 
     def _dispatch(self, inbound: Inbound, command: str, argument: str, now: datetime) -> Reply | None:
+        if self.channel == "feishu" and inbound.scope != "personal" and command in {"add_group", "remove_group", "subscribe", "unsubscribe"}:
+            return Reply(inbound.chat_id, self._t("not_group_cmd"))
         if command == "help":
             return self._guide_for(inbound)
         if command == "pair":
@@ -248,7 +286,10 @@ class ChatController:
         removed = self.store.unsubscribe(self.channel, "group", chat_id, now, reason="unsubscribed")
         return Reply(reply_chat, self._t("group_off" if removed else "group_off_none", name=title))
 
-    def _open_picker(self, inbound: Inbound, command: str, now: datetime) -> Reply:
+    def _open_picker(self, inbound: Inbound, command: str, now: datetime) -> Reply | None:
+        previous = self.store.load_session(self.channel, inbound.user_id)
+        if previous and self._older_than_session(inbound, previous):
+            return Reply(inbound.chat_id, self._t("expired"))
         active_rows = [
             item
             for item in self.store.subscriptions(self.channel)
@@ -270,19 +311,136 @@ class ChatController:
         if not choices:
             self.store.clear_session(self.channel, inbound.user_id)
             return Reply(inbound.chat_id, self._t(empty))
+        if self.group_membership is not None:
+            try:
+                choices = [(identity, title) for identity, title in choices if self.group_membership(inbound.user_id, identity)]
+            except Exception:
+                self.store.clear_session(self.channel, inbound.user_id)
+                return Reply(inbound.chat_id, self._t("list_failed"))
+        if not choices:
+            self.store.clear_session(self.channel, inbound.user_id)
+            return Reply(inbound.chat_id, self._t(empty))
         payload = [{"id": chat_id, "title": title} for chat_id, title in choices]
-        self.store.save_session(self.channel, inbound.user_id, command, payload, now + timedelta(seconds=SESSION_SECONDS))
         lines = [self._t(intro)]
         for index, item in enumerate(payload, start=1):
             lines.append(self._t("choice", index=str(index), name=item["title"], tail=_tail(item["id"])))
-        return Reply(inbound.chat_id, "\n".join(lines))
+        text = "\n".join(lines)
+        with self.store.transaction():
+            if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, self.clock.now()):
+                current = self.store.load_session(self.channel, inbound.user_id)
+                if (current and not current["expires_at"] and current["prompt_id"] == inbound.event_id
+                        and current["chat_id"] == inbound.chat_id):
+                    return Reply(inbound.chat_id, current["reply_text"], inbound.user_id, inbound.event_id)
+                return None
+            current = self.store.load_session(self.channel, inbound.user_id)
+            if current and self._older_than_session(inbound, current):
+                return Reply(inbound.chat_id, self._t("expired"))
+            self.store.save_session(self.channel, inbound.user_id, command, payload,
+                                    None if self.require_reply_ack else now + timedelta(seconds=SESSION_SECONDS),
+                                    chat_id=inbound.chat_id, prompt_id=inbound.event_id, started_at=now, reply_text=text)
+        return Reply(inbound.chat_id, text, inbound.user_id, inbound.event_id)
 
-    def _select(self, inbound: Inbound, text: str, now: datetime) -> Reply:
+    @staticmethod
+    def _older_than_session(inbound: Inbound, session: dict) -> bool:
+        started = parse_utc(session.get("started_at"))
+        return bool(inbound.created_at is not None and (started is None or inbound.created_at < started))
+
+    def prepare_reply(self, reply: Reply) -> bool:
+        """Recheck sensitive picker data immediately before the adapter sends it."""
+        if reply.result_id:
+            payload = self.store.inbound_reply(self.channel, reply.result_id)
+            created = parse_utc(payload.get("created_at")) if payload else None
+            self._extra_loaded = False
+            valid = bool(payload and payload.get("user_id") == reply.result_user_id
+                         and payload.get("chat_id") == reply.chat_id and payload.get("text") == reply.text
+                         and payload.get("group_id") == reply.result_group_id and created
+                         and 0 <= (self.clock.now() - created).total_seconds() < 55 * 60
+                         and self._is_admin(reply.result_user_id))
+            if valid and self.group_membership is not None:
+                try:
+                    valid = self.group_membership(reply.result_user_id, reply.result_group_id)
+                except Exception:
+                    valid = False
+            self._extra_loaded = False
+            return bool(valid and self._is_admin(reply.result_user_id) and created
+                        and 0 <= (self.clock.now() - created).total_seconds() < 55 * 60)
+        if not reply.picker_user_id:
+            return True
+        self._extra_loaded = False
+        session = self.store.load_session(self.channel, reply.picker_user_id)
+        valid = bool(session and session["prompt_id"] == reply.picker_id
+                     and session["chat_id"] == reply.chat_id and session["reply_text"] == reply.text
+                     and self._is_admin(reply.picker_user_id))
+        if valid:
+            valid = self._prompt_time_valid(session)
+        if valid:
+            groups = self._groups()
+            valid = groups is not None and all(item["id"] in {identity for identity, _title in groups} for item in session["candidates"])
+        if valid and self.group_membership is not None:
+            try:
+                valid = all(self.group_membership(reply.picker_user_id, item["id"]) for item in session["candidates"])
+            except Exception:
+                valid = False
+        self._extra_loaded = False
+        valid = valid and self._is_admin(reply.picker_user_id)
+        current = self.store.load_session(self.channel, reply.picker_user_id)
+        valid = bool(valid and current and current["prompt_id"] == reply.picker_id
+                     and current["chat_id"] == reply.chat_id and current["reply_text"] == reply.text
+                     and self._prompt_time_valid(current))
+        if not valid:
+            self.store.clear_session(self.channel, reply.picker_user_id, prompt_id=reply.picker_id)
+        elif self.require_reply_ack:
+            self.store.note_session_attempt(self.channel, reply.picker_user_id, reply.picker_id, self.clock.now())
+        return valid
+
+    def _prompt_time_valid(self, session: dict) -> bool:
+        try:
+            now = self.clock.now()
+            if session["expires_at"]:
+                expires = parse_utc(session["expires_at"])
+                return bool(expires and now < expires)
+            first = parse_utc(session.get("reply_attempted_at") or session["started_at"])
+            return bool(first and 0 <= (now - first).total_seconds() < 55 * 60)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def confirm_reply(self, reply: Reply, *, sent_at: datetime | None = None) -> None:
+        if reply.result_id:
+            self.store.confirm_inbound_reply(self.channel, reply.result_id, reply.result_user_id, reply.chat_id)
+        if reply.picker_user_id:
+            session = self.store.load_session(self.channel, reply.picker_user_id)
+            if not session or session["prompt_id"] != reply.picker_id or session["chat_id"] != reply.chat_id:
+                return
+            first = parse_utc(session.get("reply_attempted_at") or session["started_at"])
+            if first is None:
+                return
+            if (not isinstance(sent_at, datetime) or sent_at.tzinfo is None
+                    or not first - timedelta(seconds=2) <= sent_at <= self.clock.now() + timedelta(seconds=30)):
+                sent_at = first
+            self.store.confirm_session(self.channel, reply.picker_user_id, reply.picker_id,
+                                       sent_at + timedelta(seconds=SESSION_SECONDS), started_at=sent_at)
+
+    def _result_reply(self, inbound: Inbound) -> Reply | None:
+        payload = self.store.inbound_reply(self.channel, inbound.event_id)
+        if (payload and inbound.scope == "personal" and payload.get("user_id") == inbound.user_id
+                and payload.get("chat_id") == inbound.chat_id):
+            return Reply(inbound.chat_id, payload["text"], result_id=inbound.event_id,
+                         result_user_id=inbound.user_id, result_group_id=payload["group_id"])
+        return None
+
+    def _select(self, inbound: Inbound, text: str, now: datetime) -> Reply | None:
         session = self.store.load_session(self.channel, inbound.user_id)
         if session is None:
             return Reply(inbound.chat_id, self._t("help"))
+        if session["chat_id"] != inbound.chat_id:
+            return Reply(inbound.chat_id, self._t("only_dm"))
+        if self._older_than_session(inbound, session):
+            return Reply(inbound.chat_id, self._t("expired"))
+        if not self._is_admin(inbound.user_id):
+            self.store.clear_session(self.channel, inbound.user_id)
+            return self._deny(inbound)
         expires = parse_utc(session["expires_at"])
-        if expires is None or now > expires:
+        if expires is None or now >= expires:
             self.store.clear_session(self.channel, inbound.user_id)
             return Reply(inbound.chat_id, self._t("expired"))
         candidates = session["candidates"]
@@ -298,10 +456,37 @@ class ChatController:
             if len(matches) != 1:
                 return Reply(inbound.chat_id, self._t("bad_choice"))
             chosen = matches[0]
-        self.store.clear_session(self.channel, inbound.user_id)
-        if session["action"] == "add_group":
-            return self._subscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, now)
-        return self._unsubscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, now)
+        groups = self._groups()
+        try:
+            member = self.group_membership is None or self.group_membership(inbound.user_id, str(chosen["id"]))
+        except Exception:
+            member = False
+        self._extra_loaded = False
+        if groups is None or str(chosen["id"]) not in {identity for identity, _title in groups} or not member or not self._is_admin(inbound.user_id):
+            self.store.clear_session(self.channel, inbound.user_id)
+            return Reply(inbound.chat_id, self._t("list_failed"))
+        with self.store.transaction():
+            if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, self.clock.now()):
+                return self._result_reply(inbound)
+            current = self.store.load_session(self.channel, inbound.user_id)
+            current_expiry = parse_utc(current["expires_at"]) if current else None
+            at_commit = self.clock.now()
+            if (not current or current["prompt_id"] != session["prompt_id"] or
+                    current["chat_id"] != inbound.chat_id or current_expiry is None or at_commit >= current_expiry):
+                return Reply(inbound.chat_id, self._t("expired"))
+            if not self.store.clear_session(self.channel, inbound.user_id, prompt_id=session["prompt_id"], commit=False):
+                return Reply(inbound.chat_id, self._t("expired"))
+            if session["action"] == "add_group":
+                result = self._subscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, at_commit)
+            else:
+                result = self._unsubscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, at_commit)
+            if self.require_reply_ack and inbound.event_id:
+                self.store.save_inbound_reply(self.channel, inbound.event_id, {
+                    "user_id": inbound.user_id, "chat_id": inbound.chat_id, "group_id": str(chosen["id"]),
+                    "text": result.text, "created_at": at_commit.isoformat(),
+                })
+                return self._result_reply(inbound)
+            return result
 
     def _status(self) -> str:
         rows = self.store.subscriptions(self.channel)

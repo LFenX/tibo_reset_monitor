@@ -1,6 +1,6 @@
 """Month calendar shared by channels.
 
-The model follows AIHOT's public history plus the recent feed. Pillow and a
+The model follows one complete AIHOT history snapshot. Pillow and a
 font are optional: Chinese images need a CJK face, English images use a common
 Latin face and still render when no CJK font is installed. When Pillow or the
 face is missing, ``render_calendar_png`` raises ``CalendarImageUnavailable``
@@ -133,25 +133,12 @@ def calendar_model(
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     today = now.astimezone(zone).date()
-    history = history or {}
-    recent = recent or {}
-    cutoff = str(recent.get("historyFrom") or "9999")
-    cutoff_day = cutoff[:10]
-    events: dict[str, dict[str, Any]] = {}
-    for event in history.get("events") or []:
-        if not isinstance(event, dict) or not event.get("id"):
-            continue
-        updated = str(event.get("updatedAt") or "")[:10]
-        if updated < cutoff_day:
-            events[str(event["id"])] = event
-    for event in recent.get("events") or []:
-        if isinstance(event, dict) and event.get("id"):
-            events[str(event["id"])] = event
-    for activity in recent.get("activities") or []:
-        if not isinstance(activity, dict) or activity.get("action") != "withdraw":
-            continue
-        for identity in activity.get("eventIds") or []:
-            events.pop(str(identity), None)
+    # The second argument remains for callers that supply a single model input.
+    # A complete history, including an empty one, always replaces that input.
+    document = history if history is not None else recent or {}
+    from tibo_reset_monitor.core.source import validate_events
+    validate_events(document.get("events", []))
+    events = {event["id"]: event for event in document.get("events", [])}
 
     owners: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {}
     for event in events.values():

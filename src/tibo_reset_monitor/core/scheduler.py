@@ -12,6 +12,7 @@ from typing import Any, Protocol, Sequence
 
 from tibo_reset_monitor.core.dedupe import extract_notices
 from tibo_reset_monitor.core.model import (
+    DUE_STATUSES,
     INFLIGHT,
     PERMANENT,
     SENT,
@@ -20,8 +21,9 @@ from tibo_reset_monitor.core.model import (
     Target,
     utc_now,
 )
-from tibo_reset_monitor.core.outbox import ambiguous_expired, on_receipt, on_recover
+from tibo_reset_monitor.core.outbox import ambiguous_expired, on_receipt, on_recover, send_lease_until, validated_receipt
 from tibo_reset_monitor.core.store import StateStore
+from tibo_reset_monitor.core.source import automatic_after, automatic_eligible, source_time, validate_snapshot
 
 log = logging.getLogger("tibo_reset_monitor")
 
@@ -44,51 +46,76 @@ def run_cycle(
     channels: Sequence[ChannelAdapter],
     clock: Any,
     heartbeat: Any = None,
+    before_delivery: Any = None,
 ) -> CycleReport:
     now = clock.now()
     report = CycleReport()
     _beat(heartbeat)
     _recover(store, now)
 
-    result = source.fetch(store.get_etag())
-    if result.failure is not None:
-        failure = result.failure
-        report.fetch_error = failure.message
-        report.fetch_error_kind = failure.kind
-        report.retry_after_seconds = failure.retry_after_seconds
-        store.note_fetch(failure.kind, failure.message, now)
+    # Commit before fetch/parse: a killed process must not release old cached work.
+    store.set_meta("automatic_blocked", "1")
+    store.conn.commit()
+    try:
+        result = source.fetch(store.get_etag())
+        if result.failure is not None:
+            report.fetch_error_kind = result.failure.kind
+            report.retry_after_seconds = result.failure.retry_after_seconds
+            raise ValueError(result.failure.message)
+        cached = store.get_snapshot() if result.not_modified else None
+        body = cached["body"] if cached else result.body
+        validate_snapshot(body, now)
+        notices = extract_notices(body)
+        _check_conflicts(store, notices, body, now)
+        previous_success = store.get_meta("last_success_at")
+        success_at = max(now, source_time(previous_success)) if previous_success else now
+        with store.transaction():
+            if not store.is_baselined():
+                if result.not_modified:
+                    raise ValueError("304 has no completed baseline")
+                report.baselined = store.baseline(notices, body, result.etag, now)
+                status = "baseline"
+            elif result.not_modified:
+                report.not_modified = True
+                report.cancelled = store.reconcile_source(notices, now)
+                store.save_snapshot(body, result.etag or cached["etag"], now)
+                status = "not_modified"
+            else:
+                created, cancelled = store.ingest(notices, effective_targets(channels, store), body, result.etag, now)
+                report.new_notices = len(created)
+                report.cancelled = cancelled
+                status = "ok"
+            store.note_fetch(status, None, now)
+            store.set_meta("last_success_at", utc_stamp(success_at))
+            store.set_meta("automatic_blocked", "0")
+    except Exception as exc:
+        report.fetch_error = str(exc)
+        report.fetch_error_kind = report.fetch_error_kind or "malformed"
+        store.note_fetch(report.fetch_error_kind, str(exc), now)
         store.conn.commit()
-        log.error("source fetch failed (%s): %s", failure.kind, failure.message)
-    elif result.not_modified:
-        report.not_modified = True
-        store.note_fetch("not_modified", None, now)
-        store.conn.commit()
-        log.info("source not modified")
-    else:
-        try:
-            notices = extract_notices(result.body)
-        except (KeyError, TypeError, ValueError) as exc:
-            report.fetch_error = str(exc)
-            report.fetch_error_kind = "malformed"
-            store.note_fetch("malformed", str(exc), now)
-            store.conn.commit()
-            log.error("source payload could not be read: %s", exc)
-        else:
-            with store.transaction():
-                if not store.is_baselined():
-                    count = store.baseline(notices, result.body, result.etag, now)
-                    report.baselined = count
-                    store.note_fetch("baseline", None, now)
-                    log.info("baseline recorded %s source posts; no notifications sent", count)
-                else:
-                    created, cancelled = store.ingest(notices, effective_targets(channels, store), result.body, result.etag, now)
-                    report.new_notices = len(created)
-                    report.cancelled = cancelled
-                    store.note_fetch("ok", None, now)
-                    log.info("detected %s new source posts; cancelled %s unsent deliveries", len(created), cancelled)
+        log.error("source check failed (%s): %s", report.fetch_error_kind, type(exc).__name__)
 
+    if before_delivery is not None and report.fetch_error is None:
+        before_delivery()
     report.deliveries = deliver_due(store, channels, clock, heartbeat=heartbeat)
     return report
+
+
+def utc_stamp(now: Any) -> str:
+    from tibo_reset_monitor.core.model import format_utc
+    return format_utc(now)
+
+
+def _check_conflicts(store: StateStore, notices: Any, body: Any, now: Any) -> None:
+    baseline = store.get_meta("baseline_completed_at") or utc_stamp(now)
+    after = automatic_after(body, now, baseline, store.get_meta("last_success_at"))
+    protected = {notice.post_key for notice in notices if automatic_eligible(notice, after, now)}
+    protected.update(row.notice.post_key for row in store.automatic_rows() if store.automatic_valid(row, body, now))
+    stages: dict[str, set[str]] = {}
+    for notice in notices:
+        stages.setdefault(notice.post_key, set()).add(notice.stage)
+    if any(len(stages.get(identity, ())) > 1 for identity in protected):
+        raise ValueError("source post has conflicting stages")
 
 
 def deliver_due(
@@ -96,12 +123,17 @@ def deliver_due(
     channels: Sequence[ChannelAdapter],
     clock: Any,
     heartbeat: Any = None,
+    only_row_id: int | None = None,
 ) -> list[dict[str, str]]:
     by_name = {channel.name: channel for channel in channels}
     reports: list[dict[str, str]] = []
     for row in store.due_rows(clock.now()):
+        if only_row_id is not None and row.id != only_row_id:
+            continue
         _beat(heartbeat)
         now = clock.now()
+        if row.automatic and store.get_meta("automatic_blocked") != "0":
+            continue
         if ambiguous_expired(row.state, now):
             store.mark_needs_review(row, now)
             store.conn.commit()
@@ -114,23 +146,118 @@ def deliver_due(
             )
             continue
         channel = by_name.get(row.channel)
+        if channel is not None and getattr(channel, "supports_idempotency", True) is False and row.state.first_ambiguous_at is not None:
+            row.state.last_error = "provider cannot safely retry an ambiguous delivery"
+            store.mark_needs_review(row, now)
+            store.conn.commit()
+            reports.append(_delivery_report(row.channel, row.target_key, "needs_review", row.state.last_error))
+            continue
         target = _find_target(channel, row.target_key, store) if channel else None
+        if target is not None and (target.kind != row.target_kind or (row.target_address is not None and target.address != row.target_address)):
+            row.state.last_error = "delivery target changed since it was queued"
+            store.mark_needs_review(row, now)
+            store.conn.commit()
+            reports.append(_delivery_report(row.channel, row.target_key, "needs_review", row.state.last_error))
+            continue
+        if row.automatic:
+            if not _automatic_safe(store, row, target, now):
+                row.state.last_error = "automatic delivery no longer matches the source, time window or target"
+                store.mark_needs_review(row, now)
+                store.conn.commit()
+                reports.append(_delivery_report(row.channel, row.target_key, "needs_review", row.state.last_error))
+                continue
         if channel is None or target is None:
             when = now + timedelta(seconds=600)
             store.defer(row.id, when, "target is not in the current config")
             store.conn.commit()
             reports.append(_delivery_report(row.channel, row.target_key, "deferred", "target is not in the current config"))
             continue
-        store.claim(row.id, now)
-        store.conn.commit()
-        claimed = store.read_row(row.id)
-        if claimed.state.status != INFLIGHT:
+        try:
+            message = row.message
+            if message is None and row.state.attempts == 0:
+                message = channel.render(row.notice, target)
+                if not isinstance(message, dict):
+                    raise TypeError("render must return an object")
+            prepare = getattr(channel, "prepare_message", None)
+            if message is not None and prepare is not None:
+                message = prepare(message, target, attempted=row.state.attempts > 0)
+            if message is not None and not isinstance(message, dict):
+                raise TypeError("prepared message must be an object")
+        except Exception as exc:
+            store.defer(row.id, clock.now() + timedelta(seconds=30), f"render failed: {type(exc).__name__}")
+            store.conn.commit()
+            reports.append(_delivery_report(row.channel, row.target_key, "deferred", "render failed"))
             continue
-        receipt = _send(channel, target, claimed)
-        decided_at = clock.now()
-        decision = on_receipt(claimed.state, receipt, decided_at)
-        if not store.apply_state(claimed.id, decision, decided_at):
-            continue
+        with store.delivery_guard(row.id) as owned:
+            if not owned:
+                continue
+            # Preparation can render a calendar or upload an image. Recheck after
+            # that work, then atomically freeze the final body and claim the row.
+            with store.transaction():
+                current = store.read_row(row.id)
+                claimed_at = clock.now()
+                if (current.state.status not in DUE_STATUSES or current.state.attempts != row.state.attempts
+                        or (current.state.next_attempt_at is not None and claimed_at < current.state.next_attempt_at)):
+                    continue
+                if current.automatic and store.get_meta("automatic_blocked") != "0":
+                    continue
+                target = _find_target(channel, current.target_key, store)
+                detail = None
+                if ambiguous_expired(current.state, claimed_at):
+                    detail = "ambiguous delivery was not retried after 55 minutes"
+                elif getattr(channel, "supports_idempotency", True) is False and current.state.first_ambiguous_at is not None:
+                    detail = "provider cannot safely retry an ambiguous delivery"
+                elif (target is None or target.kind != current.target_kind
+                        or (current.target_address is not None and target.address != current.target_address)):
+                    detail = "delivery target changed during message preparation"
+                elif current.automatic and not _automatic_safe(store, current, target, claimed_at):
+                    detail = "automatic delivery no longer matches the source, time window or target"
+                elif message is None or (current.state.attempts > 0 and message != current.message):
+                    detail = "original attempted message body is unavailable or changed"
+                if detail is not None:
+                    current.state.last_error = detail
+                    store.mark_needs_review(current, claimed_at)
+                    reports.append(_delivery_report(current.channel, current.target_key, "needs_review", detail))
+                    continue
+                if (current.message != row.message or
+                        (current.state.attempts == 0 and current.notice.to_json() != row.notice.to_json())):
+                    # Reclassification or another renderer won. Keep its result;
+                    # the next poll will prepare the latest unattempted notice.
+                    continue
+                try:
+                    store.save_message(current.id, message, replace_unattempted=True)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    store.defer(current.id, claimed_at + timedelta(seconds=30), f"render failed: {type(exc).__name__}")
+                    reports.append(_delivery_report(current.channel, current.target_key, "deferred", "render failed"))
+                    continue
+                snapshot = store.get_snapshot() if current.automatic else None
+                claimed_at = clock.now()
+                time_safe = not ambiguous_expired(current.state, claimed_at)
+                if current.automatic:
+                    try:
+                        time_safe = bool(time_safe and snapshot and store.automatic_valid(current, snapshot["body"], claimed_at))
+                    except Exception:
+                        time_safe = False
+                if not time_safe:
+                    current.state.last_error = "delivery time window expired during final preparation"
+                    store.mark_needs_review(current, claimed_at)
+                    reports.append(_delivery_report(current.channel, current.target_key, "needs_review", current.state.last_error))
+                    continue
+                lease_until = send_lease_until(claimed_at, getattr(channel, "_timeout", 20))
+                if not store.claim(current.id, claimed_at, lease_until=lease_until):
+                    continue
+                claimed = store.read_row(current.id)
+            receipt = _send(channel, target, claimed)
+            decided_at = clock.now()
+            if receipt.outcome == "ambiguous" and claimed.state.first_ambiguous_at is None:
+                claimed.state.first_ambiguous_at = claimed_at
+            decision = on_receipt(claimed.state, receipt, decided_at)
+            if receipt.outcome == "ambiguous" and getattr(channel, "supports_idempotency", True) is False:
+                decision.status = "needs_review"
+                decision.next_attempt_at = None
+            if not store.apply_state(claimed.id, decision, decided_at):
+                continue
+            store.conn.commit()
         if target is not None and target.options.get("subscription") == "1":
             if decision.status == SENT:
                 store.record_subscription_result(claimed.channel, claimed.target_key, ok=True, detail="", now=decided_at)
@@ -155,17 +282,33 @@ def deliver_due(
 
 
 def _send(channel: ChannelAdapter, target: Target, row: Any) -> Receipt:
+    if row.message is None:
+        return Receipt("ambiguous", detail="submitted message body is unavailable")
     try:
-        message = channel.render(row.notice, target)
-        return channel.send(message, target, row.idempotency_key)
+        receipt = channel.send(row.message, target, row.idempotency_key)
+        return validated_receipt(receipt)
     except TimeoutError as exc:
-        return Receipt("ambiguous", detail=f"timeout: {exc}")
+        return Receipt("ambiguous", detail="send timed out")
     except OSError as exc:
-        ambiguous = isinstance(exc, TimeoutError)
-        return Receipt("ambiguous" if ambiguous else "retryable", detail=str(exc))
+        return Receipt("ambiguous", detail=type(exc).__name__)
     except Exception as exc:  # a channel bug must not block the rest of the outbox
-        log.exception("channel %s raised while sending to %s", channel.name, target.key)
-        return Receipt("retryable", detail=f"{type(exc).__name__}: {exc}")
+        log.warning("channel %s send result unknown (%s)", channel.name, type(exc).__name__)
+        return Receipt("ambiguous", detail=f"send result unknown: {type(exc).__name__}")
+
+
+def _automatic_safe(store: StateStore, row: Any, target: Target | None, now: Any) -> bool:
+    try:
+        snapshot = store.get_snapshot()
+        body = validate_snapshot(snapshot["body"], now) if snapshot else None
+        current = extract_notices(body) if body else []
+        return bool(body is not None and store.automatic_valid(row, body, now)
+                    and any(item.post_key == row.notice.post_key
+                            and source_time(item.published_at) == source_time(row.source_published_at)
+                            and item.url == row.source_url for item in current)
+                    and target is not None and row.target_address == target.address
+                    and not store.duplicate_automatic(row))
+    except Exception:
+        return False
 
 
 def _recover(store: StateStore, now: Any) -> None:
@@ -174,10 +317,14 @@ def _recover(store: StateStore, now: Any) -> None:
         return
     updates = {}
     for row in rows:
+        if store.delivery_active(row.id) or (row.lease_until is not None and now < row.lease_until):
+            continue
+        row.state.first_ambiguous_at = row.state.first_ambiguous_at or row.attempted_at
         updates[row.id] = on_recover(row.state, now)
     store.recover_inflight(updates, now)
     store.conn.commit()
-    log.warning("recovered %s in-flight deliveries as ambiguous", len(rows))
+    if updates:
+        log.warning("recovered %s in-flight deliveries as ambiguous", len(updates))
 
 
 def effective_targets(channels: Sequence[ChannelAdapter], store: StateStore) -> list[Target]:

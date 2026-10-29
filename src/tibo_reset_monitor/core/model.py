@@ -123,6 +123,11 @@ class Notice:
     tag_label: str = ""
     contexts: tuple[dict[str, str], ...] = ()
     id: int | None = None
+    source_event_ids: tuple[str, ...] = ()
+
+    @property
+    def event_ids(self) -> tuple[str, ...]:
+        return tuple(dict.fromkeys(item for item in (self.source_event_id, *self.source_event_ids) if item))
 
     def headline(self) -> str:
         label = self.display_label or self.title or "Codex / ChatGPT 额度"
@@ -140,6 +145,8 @@ class Notice:
         contexts = data.get("contexts")
         if isinstance(contexts, list):
             data["contexts"] = tuple(item for item in contexts if isinstance(item, dict))
+        if isinstance(data.get("source_event_ids"), list):
+            data["source_event_ids"] = tuple(data["source_event_ids"])
         return cls(id=notice_id, **data)
 
 
@@ -181,6 +188,15 @@ class OutboxRow:
     idempotency_key: str
     state: DeliveryState
     notice: Notice
+    automatic: bool = True
+    automatic_after: str | None = None
+    target_address: str | None = None
+    attempted_at: datetime | None = None
+    message: dict[str, Any] | None = None
+    queued_at: datetime | None = None
+    lease_until: datetime | None = None
+    source_published_at: str | None = None
+    source_url: str | None = None
 
 
 @dataclass

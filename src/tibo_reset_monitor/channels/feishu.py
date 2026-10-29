@@ -87,16 +87,29 @@ class FeishuChannel:
         return self._post_message(message, idempotency_key or uuid.uuid4().hex, refreshed=False)
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
+        prepared = self.prepare_message(message, target)
+        assert prepared is not None
+        # Direct adapter callers can reuse this same prepared message too.
+        message.update(prepared)
+        return self._post_message(message, idempotency_key, refreshed=False)
+
+    def prepare_message(self, message: dict[str, Any], target: Target, *, attempted: bool = False) -> dict[str, Any] | None:
+        """Resolve an optional image before the outbox freezes the submitted body."""
         del target
         content = message.get("content")
         photo = message.get("photo")
         if isinstance(photo, (bytes, bytearray)) and photo and isinstance(content, str):
+            if attempted:
+                # Old rows did not preserve the image key used by an earlier POST.
+                return None
             image_key = self._upload_image(bytes(photo))
+            message = dict(message)
             if image_key:
                 content = _with_image(content, image_key, str(message.get("photo_alt") or ""))
-                message = dict(message)
                 message["content"] = content
-        return self._post_message(message, idempotency_key, refreshed=False)
+            # Freeze a failed optional upload as the same text-only message.
+            message["photo"] = None
+        return message
 
     def _post_message(self, message: dict[str, Any], idempotency_key: str, *, refreshed: bool) -> Receipt:
         token = self._access_token(force=refreshed)
@@ -126,6 +139,10 @@ class FeishuChannel:
         payload = _json_object(response.body)
         code = payload.get("code") if payload else None
         msg = str(payload.get("msg") or "") if payload else ""
+        if type(code) is not int:
+            return Receipt("ambiguous", detail="Feishu returned an invalid receipt")
+        if code == 0 and response.status != 200:
+            return Receipt("ambiguous", detail="Feishu returned a contradictory response")
         if response.status == 429 or code == 99991400:
             retry_after = parse_retry_after(response.headers.get("retry-after"))
             return Receipt("retryable", detail=f"Feishu rate limited: {msg or response.status}", retry_after_seconds=retry_after)
@@ -136,7 +153,12 @@ class FeishuChannel:
         if response.status == 200 and code == 0:
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
             message_id = data.get("message_id")
-            return Receipt("sent", provider_message_id=str(message_id) if message_id else None, detail="sent")
+            chat_id = data.get("chat_id")
+            if (not isinstance(message_id, str) or not message_id.strip()
+                    or not isinstance(chat_id, str) or not chat_id.strip()
+                    or (message["receive_id_type"] == "chat_id" and chat_id != message["receive_id"])):
+                return Receipt("ambiguous", detail="Feishu receipt has no valid message id or matching chat")
+            return Receipt("sent", provider_message_id=message_id, detail="sent")
         detail = _feishu_detail(response.status, code, msg)
         if response.status in (400, 401, 403, 404) or code in _PERMANENT_CODES or _looks_permanent(msg):
             return Receipt("permanent", detail=detail)
