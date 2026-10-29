@@ -362,16 +362,17 @@ class ChatController:
                 except Exception:
                     valid = False
             self._extra_loaded = False
-            return bool(valid and self._is_admin(reply.result_user_id))
+            return bool(valid and self._is_admin(reply.result_user_id) and created
+                        and 0 <= (self.clock.now() - created).total_seconds() < 55 * 60)
         if not reply.picker_user_id:
             return True
         self._extra_loaded = False
         session = self.store.load_session(self.channel, reply.picker_user_id)
         valid = bool(session and session["prompt_id"] == reply.picker_id
-                     and session["chat_id"] == reply.chat_id and self._is_admin(reply.picker_user_id))
-        if valid and not session["expires_at"]:
-            started = parse_utc(session["started_at"])
-            valid = bool(started and 0 <= (self.clock.now() - started).total_seconds() < 55 * 60)
+                     and session["chat_id"] == reply.chat_id and session["reply_text"] == reply.text
+                     and self._is_admin(reply.picker_user_id))
+        if valid:
+            valid = self._prompt_time_valid(session)
         if valid:
             groups = self._groups()
             valid = groups is not None and all(item["id"] in {identity for identity, _title in groups} for item in session["candidates"])
@@ -382,16 +383,42 @@ class ChatController:
                 valid = False
         self._extra_loaded = False
         valid = valid and self._is_admin(reply.picker_user_id)
+        current = self.store.load_session(self.channel, reply.picker_user_id)
+        valid = bool(valid and current and current["prompt_id"] == reply.picker_id
+                     and current["chat_id"] == reply.chat_id and current["reply_text"] == reply.text
+                     and self._prompt_time_valid(current))
         if not valid:
             self.store.clear_session(self.channel, reply.picker_user_id, prompt_id=reply.picker_id)
+        elif self.require_reply_ack:
+            self.store.note_session_attempt(self.channel, reply.picker_user_id, reply.picker_id, self.clock.now())
         return valid
 
-    def confirm_reply(self, reply: Reply) -> None:
+    def _prompt_time_valid(self, session: dict) -> bool:
+        try:
+            now = self.clock.now()
+            if session["expires_at"]:
+                expires = parse_utc(session["expires_at"])
+                return bool(expires and now < expires)
+            first = parse_utc(session.get("reply_attempted_at") or session["started_at"])
+            return bool(first and 0 <= (now - first).total_seconds() < 55 * 60)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def confirm_reply(self, reply: Reply, *, sent_at: datetime | None = None) -> None:
         if reply.result_id:
             self.store.confirm_inbound_reply(self.channel, reply.result_id, reply.result_user_id, reply.chat_id)
         if reply.picker_user_id:
+            session = self.store.load_session(self.channel, reply.picker_user_id)
+            if not session or session["prompt_id"] != reply.picker_id or session["chat_id"] != reply.chat_id:
+                return
+            first = parse_utc(session.get("reply_attempted_at") or session["started_at"])
+            if first is None:
+                return
+            if (not isinstance(sent_at, datetime) or sent_at.tzinfo is None
+                    or not first - timedelta(seconds=2) <= sent_at <= self.clock.now() + timedelta(seconds=30)):
+                sent_at = first
             self.store.confirm_session(self.channel, reply.picker_user_id, reply.picker_id,
-                                       self.clock.now() + timedelta(seconds=SESSION_SECONDS))
+                                       sent_at + timedelta(seconds=SESSION_SECONDS), started_at=sent_at)
 
     def _result_reply(self, inbound: Inbound) -> Reply | None:
         payload = self.store.inbound_reply(self.channel, inbound.event_id)

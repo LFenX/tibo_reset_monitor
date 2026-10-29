@@ -57,7 +57,8 @@ class ChatFlowTest(TempStoreTest):
         reply = controller.handle(inbound("p1", "/addgroup"))
         self.assertTrue(controller.prepare_reply(reply))
         self.clock.advance(120)
-        controller.confirm_reply(reply)
+        # This prompt is actually created late, rather than receiving a late ACK.
+        controller.confirm_reply(reply, sent_at=self.clock.now())
         self.clock.advance(59)
         picked = controller.handle(inbound("p2", "1"))
         self.assertIn("Private virtual group", picked.text)
@@ -617,6 +618,41 @@ class PickerAcknowledgmentRegressionTest(SafetyFixture):
         actual = self.store.subscriptions('feishu')
         self.assertEqual(second_expiry, first_expiry, {'first': first_expiry, 'second': second_expiry})
         self.assertEqual(actual, [])
+
+
+class PromptReplayBoundaryTest(SafetyFixture):
+    def test_result_reply_deadline_is_checked_after_slow_membership_lookup(self):
+        controller = self.controller()
+        self.picker(controller)
+        reply = controller.handle(self.inbound("synthetic-select", "1"))
+        self.assertIsNotNone(reply.result_id)
+        self.clock.advance(55 * 60 - 1)
+        def slow(*args):
+            self.clock.advance(2)
+            return True
+        controller.group_membership = slow
+        self.assertFalse(controller.prepare_reply(reply))
+
+    def test_duplicate_reply_cannot_be_prepared_after_original_deadline(self):
+        controller = self.controller()
+        inbound = self.inbound("synthetic-prompt", "/addgroup")
+        first = controller.handle(inbound)
+        duplicate = controller.handle(inbound)
+        self.assertTrue(controller.prepare_reply(first))
+        controller.confirm_reply(first)
+        self.clock.advance(60)
+        self.assertFalse(controller.prepare_reply(duplicate))
+
+    def test_slow_permission_lookup_cannot_extend_an_acknowledged_prompt(self):
+        controller = self.controller()
+        reply = self.picker(controller)
+        self.clock.advance(59)
+        def slow():
+            self.clock.advance(2)
+            return [("oc_virtual_group", "Virtual group")]
+        controller.group_catalog = slow
+        self.assertFalse(controller.prepare_reply(reply))
+        self.assertIsNone(self.store.load_session("feishu", "ou_virtual_reviewer"))
 
 
 if __name__ == "__main__":

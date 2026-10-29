@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from tests.support import make_activity, make_event, make_post, snapshot, utc
+from tests.support import SafetyFixture, make_activity, make_event, make_post, snapshot, utc
 from tibo_reset_monitor.core.http import HttpResponse
 from tibo_reset_monitor.core.source import SourceClient, validate_snapshot
 
@@ -123,6 +123,66 @@ class SourceClientTest(unittest.TestCase):
         self.assertEqual(result.failure.kind, "malformed")
         self.assertIn("too large", result.failure.message)
         self.assertIsNone(result.body)
+
+
+class SourceStringSafetyTest(SafetyFixture):
+    def test_required_and_supplied_strings_fail_before_any_state_change(self):
+        self.baseline()
+        cases = [("post", "url", None), ("post", "url", {}), ("post", "url", ""),
+                 ("post", "url", "https://"), ("post", "url", "relative/path"),
+                 ("post", "text", None), ("post", "text", {}), ("post", "text", ""),
+                 ("post", "originalText", None), ("post", "originalText", []),
+                 ("post", "fullText", {}), ("activity", "originalText", None),
+                 ("activity", "originalText", ""), ("activity", "text", {}),
+                 ("activity", "url", {}), ("event", "type", None),
+                 ("context", "author", []), ("context", "url", None),
+                 ("root", "checkedAt", None), ("root", "timezone", {})]
+        for index, (level, field, value) in enumerate(cases):
+            with self.subTest(level=level, field=field, value=value):
+                body = self.body(identity=f"synthetic-post-{index}")
+                if level == "activity":
+                    activity = make_activity(f"synthetic-activity-{index}", "confirm", "virtual-event")
+                    activity["publishedAt"] = body["events"][0]["posts"][0]["publishedAt"]
+                    body["activities"] = [activity]
+                    record = activity
+                elif level == "context":
+                    record = {"id": "synthetic-context", "author": "synthetic", "relation": "quote",
+                              "text": None, "originalText": "Synthetic original",
+                              "url": "https://x.com/thsottiaux/status/synthetic-context"}
+                    body["events"][0]["posts"][0]["context"] = [record]
+                else:
+                    record = {"post": body["events"][0]["posts"][0], "event": body["events"][0], "root": body}[level]
+                if value is None:
+                    del record[field]
+                else:
+                    record[field] = value
+                previous = self.store.get_snapshot()
+                seen = self.store.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]
+                notices = len(self.store.list_notices(100))
+                sent_count = len(self.channel.sent)
+                report = self.cycle(body)
+                self.assertIsNotNone(report.fetch_error)
+                self.assertEqual(self.store.get_snapshot(), previous)
+                self.assertEqual(self.store.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0], seen)
+                self.assertEqual(len(self.store.list_notices(100)), notices)
+                self.assertEqual(len(self.channel.sent), sent_count)
+                self.assertEqual(self.store.get_meta("automatic_blocked"), "1")
+                recovered = self.cycle(self.body(identity=f"synthetic-post-{index}"))
+                self.assertIsNone(recovered.fetch_error)
+                self.assertEqual(len(self.channel.sent), sent_count + 1)
+
+    def test_nullable_translation_and_unknown_nonempty_activity_kind_remain_valid(self):
+        self.baseline()
+        activity = make_activity("synthetic-null-translation", "confirm", None)
+        activity["text"] = None
+        activity["publishedAt"] = self.body()["events"][0]["posts"][0]["publishedAt"]
+        report = self.cycle(snapshot([], [activity]))
+        self.assertIsNone(report.fetch_error)
+        self.assertEqual(len(self.channel.sent), 1)
+        unknown = dict(activity, id="synthetic-future-activity", kind="future_kind", action=None)
+        report = self.cycle(snapshot([], [activity, unknown]))
+        self.assertIsNone(report.fetch_error)
+        self.assertEqual(len(self.channel.sent), 1)
 
 
 if __name__ == "__main__":

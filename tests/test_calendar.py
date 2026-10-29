@@ -7,7 +7,7 @@ from tests.support import SafetyFixture
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from tests.support import FakeClock, ScriptedSource, TempStoreTest, failure, ok, snapshot
+from tests.support import FakeClock, ScriptedSource, TempStoreTest, failure, make_post, ok, snapshot
 from tibo_reset_monitor.core.calendar import (
     CalendarImageUnavailable,
     calendar_model,
@@ -119,7 +119,7 @@ class CalendarModelTest(unittest.TestCase):
                 _event(
                     "base",
                     updatedAt="2026-09-02T00:00:00.000+08:00",
-                    posts=[{"id": "amend-post", "stage": "补充说明", "publishedAt": "2026-10-02T00:00:00Z"}],
+                    posts=[{**make_post("amend-post", "补充说明"), "publishedAt": "2026-10-02T00:00:00Z"}],
                 ),
                 _event(
                     "follow",
@@ -127,7 +127,7 @@ class CalendarModelTest(unittest.TestCase):
                     confirmationBasis="source_post",
                     confirmedAt="2026-10-03T00:00:00.000+08:00",
                     occurredOn="2026-10-03",
-                    posts=[{"id": "follow-post", "stage": "确认完成", "publishedAt": "2026-10-03T00:00:00Z", "context": [{"id": "amend-post"}]}],
+                    posts=[{**make_post("follow-post", "确认完成"), "publishedAt": "2026-10-03T00:00:00Z", "context": [{"id": "amend-post", "author": "synthetic", "relation": "quote", "text": None, "originalText": "Synthetic amendment", "url": "https://x.com/thsottiaux/status/amend-post"}]}],
                 ),
             ],
         }
@@ -189,14 +189,14 @@ class CalendarModelTest(unittest.TestCase):
         recent = {
             "historyFrom": "2026-10-01T00:00:00.000+08:00",
             "events": [
-                _event("base", posts=[{"id": "amend-post", "stage": "补充说明", "publishedAt": "2026-10-02T00:00:00Z"}]),
+                _event("base", posts=[{**make_post("amend-post", "补充说明"), "publishedAt": "2026-10-02T00:00:00Z"}]),
                 _event(
                     "explicit",
                     confirmationBasis="source_post",
                     confirmedAt="2026-10-04T00:00:00.000+08:00",
                     occurredOn="2026-10-04",
                     presentation={"kindExplicit": True, "status": "confirmed"},
-                    posts=[{"id": "follow", "stage": "确认完成", "publishedAt": "2026-10-04T00:00:00Z", "context": [{"id": "amend-post"}]}],
+                    posts=[{**make_post("follow", "确认完成"), "publishedAt": "2026-10-04T00:00:00Z", "context": [{"id": "amend-post", "author": "synthetic", "relation": "quote", "text": None, "originalText": "Synthetic amendment", "url": "https://x.com/thsottiaux/status/amend-post"}]}],
                 ),
             ],
         }
@@ -664,6 +664,25 @@ class FutureHistoryMetadataTest(SafetyFixture):
         self.assertEqual(len(source.etags), 1,
                          {"fetches": source.etags, "history": self.store.get_history(),
                           "attempt_at": self.store.get_meta("history_attempt_at")})
+
+class InvalidHistoryTimeTest(SafetyFixture):
+    def test_malformed_fetch_time_forces_an_immediate_full_replacement(self):
+        self.store.save_history(snapshot([]), "synthetic-old", self.clock.now() - timedelta(days=2))
+        self.store.conn.execute("UPDATE history_snapshot SET fetched_at = 'not-a-timestamp'")
+        source = ScriptedSource([ok(snapshot([]), "synthetic-replaced")])
+        HistoryCalendar(self.store, source, self.clock).refresh()
+        self.assertEqual(source.etags, [None])
+        self.assertEqual(self.store.get_history()["etag"], "synthetic-replaced")
+        self.assertIsNone(self.store.get_meta("calendar_error"))
+
+    def test_malformed_attempt_time_does_not_block_a_valid_old_cache_refresh(self):
+        self.store.save_history(snapshot([]), "synthetic-old", self.clock.now() - timedelta(days=2))
+        self.store.set_meta("history_attempt_at", "not-a-timestamp")
+        source = ScriptedSource([ok(snapshot([]), "synthetic-replaced")])
+        HistoryCalendar(self.store, source, self.clock).refresh()
+        self.assertEqual(source.etags, ["synthetic-old"])
+        self.assertIsNone(self.store.get_meta("calendar_error"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ import re
 import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from tibo_reset_monitor.core.http import TransportError, UrllibTransport
 from tibo_reset_monitor.core.model import FetchResult, SourceFailure
@@ -59,6 +60,8 @@ def validate_events(events: Any, now: datetime | None = None) -> None:
     identities: set[str] = set()
     for event in events:
         _record(event, "event", now)
+        if not isinstance(event.get("type"), str) or not event["type"].strip():
+            raise SnapshotError("event type must be a nonempty string")
         identity = event.get("id")
         if not isinstance(identity, str) or not identity or identity in identities:
             raise SnapshotError("event ids must be nonempty and unique")
@@ -86,7 +89,18 @@ def validate_events(events: Any, now: datetime | None = None) -> None:
 def _record(record: Any, label: str, now: datetime | None) -> None:
     if not isinstance(record, dict):
         raise SnapshotError(f"{label} must be an object")
+    for name in ("id", "author", "relation", "stage", "type", "status", "title", "label", "displayLabel",
+                 "scope", "url", "text", "originalText", "fullText", "fullOriginalText"):
+        if name not in record:
+            continue
+        nullable = name in {"fullText", "fullOriginalText"} or (name == "text" and label in {"activities", "context"})
+        if not isinstance(record[name], str) and not (nullable and record[name] is None):
+            raise SnapshotError(f"{label}.{name} has an invalid string value")
+    if "url" in record:
+        _source_url(record["url"], label)
     for name in ("publishedAt", "createdAt", "updatedAt", "confirmedAt"):
+        if name in record and record[name] is None and name != "confirmedAt":
+            raise SnapshotError(f"{label}.{name} must be a timestamp")
         if record.get(name) is not None:
             stamp = source_time(record[name], f"{label}.{name}")
             if now is not None and stamp > now + timedelta(seconds=300):
@@ -97,6 +111,20 @@ def _record(record: Any, label: str, now: datetime | None) -> None:
             raise SnapshotError(f"{label}.context must be an array or null")
         for item in context:
             _record(item, "context", now)
+            for name in ("id", "author", "relation", "originalText", "url"):
+                if not isinstance(item.get(name), str):
+                    raise SnapshotError(f"context.{name} must be a string")
+
+
+def _source_url(value: Any, label: str) -> None:
+    try:
+        parsed = urlsplit(value) if isinstance(value, str) else None
+        valid = (parsed is not None and parsed.scheme in {"http", "https"} and parsed.hostname
+                 and not any(character.isspace() for character in value))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise SnapshotError(f"{label}.url must be an absolute HTTP URL")
 
 
 def _posts(posts: Any, label: str, now: datetime | None) -> None:
@@ -110,6 +138,12 @@ def _posts(posts: Any, label: str, now: datetime | None) -> None:
         if not isinstance(identity, str) or not identity or identity in identities:
             raise SnapshotError(f"{label} ids must be nonempty and unique")
         identities.add(identity)
+        required = ("text", "originalText", "url") if label == "posts" else ("originalText", "url")
+        for name in required:
+            if not isinstance(post.get(name), str) or (name != "originalText" and not post[name]):
+                raise SnapshotError(f"{label}.{name} must be a string")
+        if label == "activities" and not post["originalText"]:
+            raise SnapshotError("activity originalText must not be empty")
         if label == "posts":
             if not isinstance(post.get("stage"), str) or not post["stage"].strip():
                 raise SnapshotError("post stage must be a nonempty string")
@@ -161,8 +195,9 @@ def validate_snapshot(body: Any, now: datetime | None = None) -> dict[str, Any]:
     history_from = source_time(body["historyFrom"], "historyFrom")
     if now is not None and history_from > now + timedelta(seconds=300):
         raise SnapshotError("historyFrom exceeds the local clock tolerance")
-    if body.get("checkedAt") is not None:
-        source_time(body["checkedAt"], "checkedAt")
+    source_time(body["checkedAt"], "checkedAt")
+    if not isinstance(body.get("timezone"), str) or not body["timezone"].strip():
+        raise SnapshotError("timezone must be a nonempty string")
     activities = body.get("activities", [])
     if not isinstance(activities, list):
         raise SnapshotError("activities must be an array")

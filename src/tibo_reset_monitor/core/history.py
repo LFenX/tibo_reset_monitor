@@ -120,7 +120,10 @@ class HistoryCalendar:
         cached = self._valid_cache(now)
         if cached is None and self.store.has_history() and self.store.get_meta("history_invalid_cache") != "1":
             return True
-        last_attempt = parse_utc(self.store.get_meta("history_attempt_at"))
+        try:
+            last_attempt = parse_utc(self.store.get_meta("history_attempt_at"))
+        except (TypeError, ValueError, OverflowError):
+            last_attempt = None
         if last_attempt is not None and 0 <= (now - last_attempt).total_seconds() < _MIN_GAP_SECONDS:
             return False
         if cached is None:
@@ -140,6 +143,8 @@ class HistoryCalendar:
         try:
             cached = self.store.get_history()
             if cached is None:
+                return None
+            if parse_utc(cached["fetched_at"]) is None:
                 return None
             validate_snapshot(cached["body"], now)
             calendar_model(cached["body"], None, now)

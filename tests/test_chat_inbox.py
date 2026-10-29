@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from datetime import timedelta, timezone
 from tests.support import SafetyFixture
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from tibo_reset_monitor.config import ChannelSpec
 from tibo_reset_monitor.channels.telegram import TelegramChannel
 from tibo_reset_monitor.core.chat import ChatController
 from tibo_reset_monitor.core.http import HttpResponse
+from tibo_reset_monitor.core.model import parse_utc
 
 
 class ParseUpdateTest(unittest.TestCase):
@@ -507,6 +509,92 @@ class DurableManagementReplyTest(SafetyFixture):
         self.assertEqual(replies[0], replies[1])
         self.assertEqual(replies[0].result_id, event.event_id)
         self.assertEqual(len(self.store.subscriptions("feishu")), 1)
+
+
+class ProviderPromptTimeTest(SafetyFixture):
+    def _channel(self, responder):
+        return SimpleNamespace(_api_base="https://example.invalid", _timeout=20,
+                               _access_token=lambda **_: "synthetic-token", _transport=SimpleNamespace(send=responder))
+
+    def test_provider_creation_time_controls_the_deadline_despite_delayed_ack(self):
+        started = self.clock.now()
+        times = [str(int(started.timestamp() * 1000)),
+                 started.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S")]
+        for index, provider_time in enumerate(times):
+            with self.subTest(provider_time=provider_time):
+                self.clock.now_value = started
+                controller = self.controller()
+                def responder(method, url, headers, body, timeout):
+                    self.clock.advance(20)
+                    payload = {"code": 0, "data": {"message_id": "om_synthetic_prompt", "chat_id": "oc_virtual_dm", "create_time": provider_time}}
+                    return HttpResponse(200, {}, json.dumps(payload).encode(), url)
+                event = self.feishu_event(f"synthetic-prompt-{index}", "/addgroup", times[0])
+                handle_feishu_event(self._channel(responder), controller, event)
+                session = self.store.load_session("feishu", "ou_virtual_reviewer")
+                self.assertEqual(parse_utc(session["started_at"]), started)
+                self.assertEqual(parse_utc(session["expires_at"]), started + timedelta(seconds=60))
+                self.clock.now_value = started + timedelta(seconds=70)
+                controller.handle(self.inbound(f"synthetic-late-selection-{index}", "1"))
+                self.assertEqual(self.store.subscriptions("feishu"), [])
+
+    def test_recovered_prompt_does_not_restart_the_original_deadline(self):
+        started = self.clock.now()
+        for index, create_time in enumerate((str(int(started.timestamp() * 1000)), None, "invalid-timestamp")):
+            with self.subTest(create_time=create_time):
+                self.clock.now_value = started
+                requests = []
+                def responder(method, url, headers, body, timeout):
+                    requests.append(json.loads(body))
+                    payload = {"code": 0, "data": {}}
+                    if len(requests) > 1:
+                        payload["data"] = {"message_id": "om_synthetic_prompt", "chat_id": "oc_virtual_dm", "create_time": create_time}
+                    return HttpResponse(200, {}, json.dumps(payload).encode(), url)
+                event = self.feishu_event(f"synthetic-replay-{index}", "/addgroup", str(int(started.timestamp() * 1000)))
+                channel = self._channel(responder)
+                handle_feishu_event(channel, self.controller(), event)
+                self.clock.advance(120)
+                handle_feishu_event(channel, self.controller(), event)
+                session = self.store.load_session("feishu", "ou_virtual_reviewer")
+                self.assertEqual(requests[0], requests[1])
+                self.assertEqual(parse_utc(session["expires_at"]), started + timedelta(seconds=60))
+
+
+class ChatCatalogProtocolTest(SafetyFixture):
+    def _channel(self, responder):
+        return SimpleNamespace(_api_base="https://example.invalid", _timeout=20,
+                               _access_token=lambda **_: "synthetic-token", _transport=SimpleNamespace(send=responder))
+
+    def test_incomplete_and_circular_pages_cannot_create_a_picker(self):
+        for index, data in enumerate((
+            {"items": [{"chat_id": "oc_synthetic", "name": "Synthetic private group"}], "has_more": True},
+            {"items": [{"chat_id": "oc_synthetic", "name": "Synthetic private group"}], "has_more": True, "page_token": "loop"},
+            {"items": [], "has_more": None},
+        )):
+            with self.subTest(data=data):
+                calls = []
+                def responder(method, url, headers, body, timeout):
+                    calls.append(url)
+                    return HttpResponse(200, {}, json.dumps({"code": 0, "data": data}).encode(), url)
+                controller = self.controller()
+                controller.group_catalog = lambda: list_bot_chats(self._channel(responder))
+                reply = controller.handle(self.inbound(f"synthetic-catalog-{index}", "/addgroup"))
+                self.assertIsNone(self.store.load_session("feishu", "ou_virtual_reviewer"))
+                self.assertNotIn("Synthetic private group", reply.text)
+                self.assertLessEqual(len(calls), 2)
+
+    def test_valid_paging_completes_before_the_existing_display_cap(self):
+        pages = [list(range(50)), list(range(50, 100)), [100]]
+        calls = []
+        def responder(method, url, headers, body, timeout):
+            index = len(calls)
+            calls.append(url)
+            data = {"items": [{"chat_id": f"oc_synthetic_{value}", "name": f"Group {value}"} for value in pages[index]],
+                    "has_more": index < 2, "page_token": str(index + 1)}
+            return HttpResponse(200, {}, json.dumps({"code": 0, "data": data}).encode(), url)
+        groups = list_bot_chats(self._channel(responder))
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(groups), 100)
+        self.assertEqual(len(set(identity for identity, _ in groups)), 100)
 
 
 if __name__ == "__main__":

@@ -250,6 +250,7 @@ class CycleTest(TempStoreTest):
         notice = extract_notices(snapshot([make_event("reset-1", [make_post("p9", "预告")])]))[0]
         with self.store.transaction():
             self.store.ingest([notice], channel.targets, body, 'W/"same"', now)
+        self.store.save_message(1, channel.render(notice, channel.targets[0]))
         self.store.conn.execute("UPDATE outbox SET status = 'inflight', attempts = 1")
         self.store.conn.commit()
         original = _rows(self.store)[0]["idempotency_key"]
@@ -946,6 +947,115 @@ class SourceIdentityRecoveryTest(SafetyFixture):
                     record[field] = value
                 with self.assertRaises(SnapshotError):
                     validate_snapshot(body, self.clock.now())
+
+
+class SubmissionBoundaryTest(SafetyFixture):
+    def test_final_serialization_cannot_move_submission_past_the_age_limit(self):
+        self.clock.advance(-8 * 86400)
+        baseline = snapshot([])
+        baseline["historyFrom"] = format_utc(self.clock.now() - timedelta(days=30))
+        self.cycle(baseline)
+        self.clock.advance(8 * 86400)
+        body = self.body(published=format_utc(self.clock.now() - timedelta(days=7)))
+        save = self.store.save_message
+        def slow(*args, **kwargs):
+            self.clock.advance(1)
+            return save(*args, **kwargs)
+        self.store.save_message = slow
+        self.cycle(body)
+        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+
+    def test_age_is_checked_after_slow_render(self):
+        self.clock.advance(-8 * 86400)
+        baseline = snapshot([])
+        baseline["historyFrom"] = format_utc(self.clock.now() - timedelta(days=30))
+        self.cycle(baseline)
+        self.clock.advance(8 * 86400)
+        body = self.body(published=format_utc(self.clock.now() - timedelta(days=7)))
+        render = self.channel.render
+        def slow(notice, destination):
+            self.clock.advance(1)
+            return render(notice, destination)
+        self.channel.render = slow
+        self.cycle(body)
+        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+
+    def test_target_is_checked_after_render(self):
+        from dataclasses import replace
+        self.baseline()
+        render = self.channel.render
+        def changed(notice, destination):
+            self.channel.targets[0] = replace(destination, address="synthetic-new-address")
+            return render(notice, destination)
+        self.channel.render = changed
+        self.cycle(self.body())
+        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+
+    def test_source_url_is_checked_after_render(self):
+        self.baseline()
+        body = self.body()
+        render = self.channel.render
+        def changed(notice, destination):
+            corrected = copy.deepcopy(body)
+            corrected["events"][0]["posts"][0]["url"] += "-corrected"
+            self.store.save_snapshot(corrected, "synthetic-corrected", self.clock.now())
+            self.store.conn.commit()
+            return render(notice, destination)
+        self.channel.render = changed
+        self.cycle(body)
+        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+
+    def test_reclassification_during_render_uses_latest_unattempted_content(self):
+        self.baseline()
+        body = self.body()
+        render = self.channel.render
+        def changed(notice, destination):
+            corrected = copy.deepcopy(body)
+            corrected["events"][0]["posts"][0]["stage"] = "确认完成"
+            corrected["events"][0]["posts"][0]["text"] = "Corrected source text"
+            corrected["events"][0]["posts"][0]["fullText"] = "Corrected source text"
+            corrected["events"][0]["confirmationBasis"] = "source_post"
+            self.store.ingest(extract_notices(corrected), self.channel.targets, corrected, "synthetic-new", self.clock.now())
+            self.store.conn.commit()
+            return render(notice, destination)
+        self.channel.render = changed
+        self.cycle(body)
+        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(self.store.read_row(1).state.attempts, 0)
+        self.channel.render = render
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(self.channel.sent[0]["message"]["text"], "Corrected source text")
+
+    def test_ambiguous_cutoff_is_checked_after_preparation(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("ambiguous", detail="synthetic ACK loss")
+        self.cycle(self.body())
+        self.clock.advance(120)
+        def slow(message, destination, **kwargs):
+            self.clock.advance(3180)
+            return message
+        self.channel.prepare_message = slow
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+
+    def test_attempted_legacy_row_without_original_body_is_held(self):
+        self.baseline()
+        render = self.channel.render
+        self.channel.render = lambda *_: (_ for _ in ()).throw(ValueError("synthetic hold"))
+        self.cycle(self.body())
+        self.channel.render = render
+        self.store.conn.execute("UPDATE outbox SET status = 'ambiguous', attempts = 1, next_attempt_at = NULL")
+        original = self.store.read_row(1).idempotency_key
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(self.channel.sent, [])
+        row = self.store.read_row(1)
+        self.assertEqual((row.state.status, row.state.attempts, row.idempotency_key), ("needs_review", 1, original))
 
 
 if __name__ == "__main__":

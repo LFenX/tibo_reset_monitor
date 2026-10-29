@@ -179,7 +179,7 @@ class StateStore:
                 conn.execute("UPDATE outbox SET source_published_at = ?, source_url = ? WHERE id = ?",
                              (notice.published_at, notice.url, row["id"]))
             session_columns = {row[1] for row in conn.execute("PRAGMA table_info(chat_session)")}
-            for name in ("chat_id", "prompt_id", "started_at", "reply_text"):
+            for name in ("chat_id", "prompt_id", "started_at", "reply_text", "reply_attempted_at"):
                 if name not in session_columns:
                     conn.execute(f"ALTER TABLE chat_session ADD COLUMN {name} TEXT")
             inbound_columns = {row[1] for row in conn.execute("PRAGMA table_info(inbound_seen)")}
@@ -531,9 +531,11 @@ class StateStore:
         )
         return cursor.rowcount > 0
 
-    def save_message(self, row_id: int, message: dict[str, Any]) -> None:
+    def save_message(self, row_id: int, message: dict[str, Any], *, replace_unattempted: bool = False) -> None:
         payload = json.dumps(message, ensure_ascii=False, default=_message_bytes, allow_nan=False)
-        self.conn.execute("UPDATE outbox SET message_json = COALESCE(message_json, ?) WHERE id = ?", (payload, row_id))
+        self.conn.execute("""UPDATE outbox SET message_json = CASE WHEN attempts = 0 AND ? THEN ?
+                            ELSE COALESCE(message_json, ?) END WHERE id = ?""",
+                          (int(replace_unattempted), payload, payload, row_id))
 
     def read_row(self, row_id: int) -> OutboxRow:
         row = self.conn.execute("SELECT * FROM outbox WHERE id = ?", (row_id,)).fetchone()
@@ -1107,14 +1109,15 @@ class StateStore:
                     chat_id = excluded.chat_id,
                     prompt_id = excluded.prompt_id,
                     started_at = excluded.started_at,
-                    reply_text = excluded.reply_text
+                    reply_text = excluded.reply_text,
+                    reply_attempted_at = NULL
                 """,
                 (channel, user_id, action, json.dumps(candidates, ensure_ascii=False), _session_time(expires_at), chat_id, prompt_id, _session_time(started_at), reply_text),
             )
 
     def load_session(self, channel: str, user_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
-            "SELECT action, candidates_json, expires_at, chat_id, prompt_id, started_at, reply_text FROM chat_session WHERE channel = ? AND user_id = ?",
+            "SELECT action, candidates_json, expires_at, chat_id, prompt_id, started_at, reply_text, reply_attempted_at FROM chat_session WHERE channel = ? AND user_id = ?",
             (channel, user_id),
         ).fetchone()
         if row is None:
@@ -1123,11 +1126,16 @@ class StateStore:
             candidates = json.loads(row["candidates_json"])
         except json.JSONDecodeError:
             candidates = []
-        return {"action": str(row["action"]), "candidates": candidates, "expires_at": str(row["expires_at"]), "chat_id": row["chat_id"], "prompt_id": row["prompt_id"], "started_at": row["started_at"], "reply_text": row["reply_text"]}
+        return {"action": str(row["action"]), "candidates": candidates, "expires_at": str(row["expires_at"]), "chat_id": row["chat_id"], "prompt_id": row["prompt_id"], "started_at": row["started_at"], "reply_text": row["reply_text"], "reply_attempted_at": row["reply_attempted_at"]}
 
-    def confirm_session(self, channel: str, user_id: str, prompt_id: str, expires_at: datetime) -> None:
-        self.conn.execute("UPDATE chat_session SET expires_at = ? WHERE channel = ? AND user_id = ? AND prompt_id = ? AND (expires_at IS NULL OR expires_at = '')",
-                          (_session_time(expires_at), channel, user_id, prompt_id))
+    def note_session_attempt(self, channel: str, user_id: str, prompt_id: str, now: datetime) -> None:
+        self.conn.execute("UPDATE chat_session SET reply_attempted_at = COALESCE(reply_attempted_at, ?) WHERE channel = ? AND user_id = ? AND prompt_id = ? AND (expires_at IS NULL OR expires_at = '')",
+                          (_session_time(now), channel, user_id, prompt_id))
+        self.conn.commit()
+
+    def confirm_session(self, channel: str, user_id: str, prompt_id: str, expires_at: datetime, *, started_at: datetime | None = None) -> None:
+        self.conn.execute("UPDATE chat_session SET expires_at = ?, started_at = COALESCE(?, started_at) WHERE channel = ? AND user_id = ? AND prompt_id = ? AND (expires_at IS NULL OR expires_at = '')",
+                          (_session_time(expires_at), _session_time(started_at) if started_at is not None else None, channel, user_id, prompt_id))
         self.conn.commit()
 
     def clear_session(self, channel: str, user_id: str, *, prompt_id: str | None = None, commit: bool = True) -> bool:

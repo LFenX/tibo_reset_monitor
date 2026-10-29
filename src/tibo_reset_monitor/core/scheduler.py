@@ -12,6 +12,7 @@ from typing import Any, Protocol, Sequence
 
 from tibo_reset_monitor.core.dedupe import extract_notices
 from tibo_reset_monitor.core.model import (
+    DUE_STATUSES,
     INFLIGHT,
     PERMANENT,
     SENT,
@@ -159,17 +160,7 @@ def deliver_due(
             reports.append(_delivery_report(row.channel, row.target_key, "needs_review", row.state.last_error))
             continue
         if row.automatic:
-            try:
-                snapshot = store.get_snapshot()
-                body = validate_snapshot(snapshot["body"], now) if snapshot else None
-                current = extract_notices(body) if body else []
-                safe = (body is not None and store.automatic_valid(row, body, now)
-                        and any(item.post_key == row.notice.post_key and source_time(item.published_at) == source_time(row.source_published_at)
-                                and item.url == row.source_url for item in current)
-                        and target is not None and row.target_address == target.address and not store.duplicate_automatic(row))
-            except Exception:
-                safe = False
-            if not safe:
+            if not _automatic_safe(store, row, target, now):
                 row.state.last_error = "automatic delivery no longer matches the source, time window or target"
                 store.mark_needs_review(row, now)
                 store.conn.commit()
@@ -181,27 +172,81 @@ def deliver_due(
             store.conn.commit()
             reports.append(_delivery_report(row.channel, row.target_key, "deferred", "target is not in the current config"))
             continue
-        if row.message is None:
-            try:
+        try:
+            message = row.message
+            if message is None and row.state.attempts == 0:
                 message = channel.render(row.notice, target)
                 if not isinstance(message, dict):
                     raise TypeError("render must return an object")
-                store.save_message(row.id, message)
-                store.conn.commit()
-            except Exception as exc:
-                store.defer(row.id, now + timedelta(seconds=30), f"render failed: {type(exc).__name__}")
-                store.conn.commit()
-                reports.append(_delivery_report(row.channel, row.target_key, "deferred", "render failed"))
-                continue
-        with store.delivery_guard(row.id) as owned:
-            claimed_at = clock.now()
-            lease_until = send_lease_until(claimed_at, getattr(channel, "_timeout", 20))
-            if not owned or not store.claim(row.id, claimed_at, lease_until=lease_until):
-                continue
+            prepare = getattr(channel, "prepare_message", None)
+            if message is not None and prepare is not None:
+                message = prepare(message, target, attempted=row.state.attempts > 0)
+            if message is not None and not isinstance(message, dict):
+                raise TypeError("prepared message must be an object")
+        except Exception as exc:
+            store.defer(row.id, clock.now() + timedelta(seconds=30), f"render failed: {type(exc).__name__}")
             store.conn.commit()
-            claimed = store.read_row(row.id)
-            if claimed.state.status != INFLIGHT:
+            reports.append(_delivery_report(row.channel, row.target_key, "deferred", "render failed"))
+            continue
+        with store.delivery_guard(row.id) as owned:
+            if not owned:
                 continue
+            # Preparation can render a calendar or upload an image. Recheck after
+            # that work, then atomically freeze the final body and claim the row.
+            with store.transaction():
+                current = store.read_row(row.id)
+                claimed_at = clock.now()
+                if (current.state.status not in DUE_STATUSES or current.state.attempts != row.state.attempts
+                        or (current.state.next_attempt_at is not None and claimed_at < current.state.next_attempt_at)):
+                    continue
+                if current.automatic and store.get_meta("automatic_blocked") != "0":
+                    continue
+                target = _find_target(channel, current.target_key, store)
+                detail = None
+                if ambiguous_expired(current.state, claimed_at):
+                    detail = "ambiguous delivery was not retried after 55 minutes"
+                elif getattr(channel, "supports_idempotency", True) is False and current.state.first_ambiguous_at is not None:
+                    detail = "provider cannot safely retry an ambiguous delivery"
+                elif (target is None or target.kind != current.target_kind
+                        or (current.target_address is not None and target.address != current.target_address)):
+                    detail = "delivery target changed during message preparation"
+                elif current.automatic and not _automatic_safe(store, current, target, claimed_at):
+                    detail = "automatic delivery no longer matches the source, time window or target"
+                elif message is None or (current.state.attempts > 0 and message != current.message):
+                    detail = "original attempted message body is unavailable or changed"
+                if detail is not None:
+                    current.state.last_error = detail
+                    store.mark_needs_review(current, claimed_at)
+                    reports.append(_delivery_report(current.channel, current.target_key, "needs_review", detail))
+                    continue
+                if (current.message != row.message or
+                        (current.state.attempts == 0 and current.notice.to_json() != row.notice.to_json())):
+                    # Reclassification or another renderer won. Keep its result;
+                    # the next poll will prepare the latest unattempted notice.
+                    continue
+                try:
+                    store.save_message(current.id, message, replace_unattempted=True)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    store.defer(current.id, claimed_at + timedelta(seconds=30), f"render failed: {type(exc).__name__}")
+                    reports.append(_delivery_report(current.channel, current.target_key, "deferred", "render failed"))
+                    continue
+                snapshot = store.get_snapshot() if current.automatic else None
+                claimed_at = clock.now()
+                time_safe = not ambiguous_expired(current.state, claimed_at)
+                if current.automatic:
+                    try:
+                        time_safe = bool(time_safe and snapshot and store.automatic_valid(current, snapshot["body"], claimed_at))
+                    except Exception:
+                        time_safe = False
+                if not time_safe:
+                    current.state.last_error = "delivery time window expired during final preparation"
+                    store.mark_needs_review(current, claimed_at)
+                    reports.append(_delivery_report(current.channel, current.target_key, "needs_review", current.state.last_error))
+                    continue
+                lease_until = send_lease_until(claimed_at, getattr(channel, "_timeout", 20))
+                if not store.claim(current.id, claimed_at, lease_until=lease_until):
+                    continue
+                claimed = store.read_row(current.id)
             receipt = _send(channel, target, claimed)
             decided_at = clock.now()
             if receipt.outcome == "ambiguous" and claimed.state.first_ambiguous_at is None:
@@ -237,12 +282,10 @@ def deliver_due(
 
 
 def _send(channel: ChannelAdapter, target: Target, row: Any) -> Receipt:
+    if row.message is None:
+        return Receipt("ambiguous", detail="submitted message body is unavailable")
     try:
-        message = row.message if row.message is not None else channel.render(row.notice, target)
-    except Exception as exc:
-        return Receipt("retryable", detail=f"render failed: {type(exc).__name__}")
-    try:
-        receipt = channel.send(message, target, row.idempotency_key)
+        receipt = channel.send(row.message, target, row.idempotency_key)
         return validated_receipt(receipt)
     except TimeoutError as exc:
         return Receipt("ambiguous", detail="send timed out")
@@ -251,6 +294,21 @@ def _send(channel: ChannelAdapter, target: Target, row: Any) -> Receipt:
     except Exception as exc:  # a channel bug must not block the rest of the outbox
         log.warning("channel %s send result unknown (%s)", channel.name, type(exc).__name__)
         return Receipt("ambiguous", detail=f"send result unknown: {type(exc).__name__}")
+
+
+def _automatic_safe(store: StateStore, row: Any, target: Target | None, now: Any) -> bool:
+    try:
+        snapshot = store.get_snapshot()
+        body = validate_snapshot(snapshot["body"], now) if snapshot else None
+        current = extract_notices(body) if body else []
+        return bool(body is not None and store.automatic_valid(row, body, now)
+                    and any(item.post_key == row.notice.post_key
+                            and source_time(item.published_at) == source_time(row.source_published_at)
+                            and item.url == row.source_url for item in current)
+                    and target is not None and row.target_address == target.address
+                    and not store.duplicate_automatic(row))
+    except Exception:
+        return False
 
 
 def _recover(store: StateStore, now: Any) -> None:

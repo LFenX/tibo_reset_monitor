@@ -87,16 +87,29 @@ class FeishuChannel:
         return self._post_message(message, idempotency_key or uuid.uuid4().hex, refreshed=False)
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
+        prepared = self.prepare_message(message, target)
+        assert prepared is not None
+        # Direct adapter callers can reuse this same prepared message too.
+        message.update(prepared)
+        return self._post_message(message, idempotency_key, refreshed=False)
+
+    def prepare_message(self, message: dict[str, Any], target: Target, *, attempted: bool = False) -> dict[str, Any] | None:
+        """Resolve an optional image before the outbox freezes the submitted body."""
         del target
         content = message.get("content")
         photo = message.get("photo")
         if isinstance(photo, (bytes, bytearray)) and photo and isinstance(content, str):
+            if attempted:
+                # Old rows did not preserve the image key used by an earlier POST.
+                return None
             image_key = self._upload_image(bytes(photo))
+            message = dict(message)
             if image_key:
                 content = _with_image(content, image_key, str(message.get("photo_alt") or ""))
-                message = dict(message)
                 message["content"] = content
-        return self._post_message(message, idempotency_key, refreshed=False)
+            # Freeze a failed optional upload as the same text-only message.
+            message["photo"] = None
+        return message
 
     def _post_message(self, message: dict[str, Any], idempotency_key: str, *, refreshed: bool) -> Receipt:
         token = self._access_token(force=refreshed)
