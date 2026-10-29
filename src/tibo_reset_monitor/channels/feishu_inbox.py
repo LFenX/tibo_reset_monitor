@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from tibo_reset_monitor.core.chat import Inbound
 from tibo_reset_monitor.logutil import redact
@@ -125,6 +125,38 @@ def collaborator_open_ids(channel: Any) -> set[str]:
     return found
 
 
+def user_in_chat(channel: Any, user_id: str, chat_id: str, *, page_limit: int = 100) -> bool:
+    """Check user membership with the bot token; lookup failures fail closed."""
+    from tibo_reset_monitor.core.model import Receipt
+    token = channel._access_token(force=False)
+    if isinstance(token, Receipt):
+        raise RuntimeError("feishu membership token unavailable")
+    page_token = ""
+    seen_tokens: set[str] = set()
+    for _ in range(page_limit):
+        query = {"member_id_type": "open_id", "page_size": "100"}
+        if page_token:
+            query["page_token"] = page_token
+        response = channel._transport.send("GET", f"{channel._api_base}/open-apis/im/v1/chats/{quote(chat_id, safe='')}/members?{urlencode(query)}",
+                                           {"Authorization": f"Bearer {token}"}, b"", channel._timeout)
+        payload = _object(response.body)
+        data = payload.get("data")
+        if response.status != 200 or type(payload.get("code")) is not int or payload["code"] != 0 or not isinstance(data, dict) or not isinstance(data.get("items"), list):
+            raise RuntimeError("feishu membership lookup failed")
+        for item in data["items"]:
+            if not isinstance(item, dict):
+                raise RuntimeError("invalid feishu member")
+            if item.get("member_id_type") == "open_id" and item.get("member_id") == user_id:
+                return True
+        if data.get("has_more") is False:
+            return False
+        page_token = data.get("page_token")
+        if data.get("has_more") is not True or not isinstance(page_token, str) or not page_token or page_token in seen_tokens:
+            raise RuntimeError("incomplete feishu member list")
+        seen_tokens.add(page_token)
+    raise RuntimeError("feishu membership page limit exceeded")
+
+
 def start_feishu_listener(channel: Any, controller: Any) -> Any | None:
     """Start the long connection when lark-oapi is installed. Otherwise log and return."""
     try:
@@ -160,6 +192,8 @@ def handle_feishu_event(channel: Any, controller: Any, data: Any) -> None:
     try:
         message = data.event.message
         sender = data.event.sender.sender_id
+        if data.event.sender.sender_type != "user" or not str(sender.open_id or "").startswith("ou_"):
+            return
         inbound = inbound_from_fields(
             message_id=str(message.message_id or ""),
             chat_id=str(message.chat_id or ""),
@@ -178,7 +212,12 @@ def handle_feishu_event(channel: Any, controller: Any, data: Any) -> None:
     if reply is None:
         return
     try:
-        _send_text(channel, reply.chat_id, reply.text)
+        prepare = getattr(controller, "prepare_reply", lambda _reply: True)
+        if not prepare(reply):
+            return
+        if _send_text(channel, reply.chat_id, reply.text):
+            confirm = getattr(controller, "confirm_reply", lambda _reply: None)
+            confirm(reply)
     except Exception as exc:
         log.warning("Feishu reply failed: %s", redact(str(exc)).replace("\n", " ")[:300])
 
@@ -189,25 +228,30 @@ def os_secret(channel: Any) -> str:
     return os.environ.get(channel._secret_env, "").strip()
 
 
-def _send_text(channel: Any, chat_id: str, text: str) -> None:
+def _send_text(channel: Any, chat_id: str, text: str) -> bool:
     from tibo_reset_monitor.core.model import Receipt
 
     token = channel._access_token(force=False)
     if isinstance(token, Receipt):
         log.warning("Feishu reply skipped: %s", token.detail)
-        return
+        return False
     body = {
         "receive_id": chat_id,
         "msg_type": "text",
         "content": json.dumps({"text": text}, ensure_ascii=False),
     }
-    channel._transport.send(
+    response = channel._transport.send(
         "POST",
         f"{channel._api_base}/open-apis/im/v1/messages?receive_id_type=chat_id",
         {"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
         json.dumps(body, ensure_ascii=False).encode("utf-8"),
         channel._timeout,
     )
+    payload = _object(response.body)
+    data = payload.get("data")
+    return (response.status == 200 and type(payload.get("code")) is int and payload["code"] == 0
+            and isinstance(data, dict) and isinstance(data.get("message_id"), str) and bool(data["message_id"].strip())
+            and data.get("chat_id") == chat_id)
 
 
 def _object(body: bytes) -> dict[str, Any]:

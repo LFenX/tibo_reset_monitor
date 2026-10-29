@@ -31,15 +31,31 @@ class FakeTransport:
                 url,
             )
         if "receive_id_type=chat_id" in url and b"oc_group" in body:
-            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_group"}}).encode(), url)
+            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_group", "chat_id": "oc_group"}}).encode(), url)
         if "receive_id_type=email" in url:
-            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_mail"}}).encode(), url)
+            return HttpResponse(200, {}, json.dumps({"code": 0, "msg": "success", "data": {"message_id": "om_mail", "chat_id": "oc_virtual_dm"}}).encode(), url)
         if "receive_id_type=open_id" in url:
             return HttpResponse(400, {}, json.dumps({"code": 230002, "msg": "Bot/User can NOT be out of the chat."}).encode(), url)
         raise AssertionError(url)
 
 
 class FeishuRequestTest(unittest.TestCase):
+    def test_bad_success_receipts_are_ambiguous(self):
+        cases = [[], {}, {"message_id": 7, "chat_id": "oc_group"},
+                 {"message_id": "", "chat_id": "oc_group"},
+                 {"message_id": "om_virtual", "chat_id": "oc_other"}]
+        target = Target("feishu", "ops", "group", "oc_group", {"receive_id_type": "chat_id"})
+        for data in cases:
+            with self.subTest(data=data):
+                class BadReceiptTransport(FakeTransport):
+                    def send(inner, method, url, headers, body, timeout):
+                        if "/im/v1/messages?" in url:
+                            return HttpResponse(200, {}, json.dumps({"code": 0, "data": data}).encode(), url)
+                        return super().send(method, url, headers, body, timeout)
+                self.channel._transport = BadReceiptTransport()
+                receipt = self.channel.send(self.channel.render(self.notice, target), target, "same-virtual-key")
+                self.assertEqual(receipt.outcome, "ambiguous")
+
     def setUp(self) -> None:
         self._secret = "test-secret-not-real"
         os.environ["TIBO_FEISHU_APP_SECRET"] = self._secret

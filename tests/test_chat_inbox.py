@@ -12,6 +12,7 @@ from tibo_reset_monitor.channels.feishu_inbox import (
     handle_feishu_event,
     inbound_from_fields,
     list_bot_chats,
+    user_in_chat,
     text_from_content,
 )
 from tibo_reset_monitor.channels.telegram_inbox import TelegramInbox, parse_update
@@ -218,6 +219,28 @@ class InboxPollTest(TempStoreTest):
 
 
 class FeishuInboxTest(unittest.TestCase):
+    def test_membership_pages_are_checked_and_errors_fail_closed(self):
+        class Channel:
+            _api_base = "https://open.feishu.cn"
+            _timeout = 5
+            def _access_token(self, force):
+                return "virtual-token"
+        class Transport:
+            def __init__(self):
+                self.pages = [
+                    {"code": 0, "data": {"items": [], "has_more": True, "page_token": "next"}},
+                    {"code": 0, "data": {"items": [{"member_id_type": "open_id", "member_id": "ou_virtual"}], "has_more": False}},
+                ]
+            def send(self, method, url, headers, body, timeout):
+                return HttpResponse(200, {}, json.dumps(self.pages.pop(0)).encode(), url)
+        channel = Channel()
+        channel._transport = Transport()
+        self.assertTrue(user_in_chat(channel, "ou_virtual", "oc_virtual"))
+        for invalid in [{"code": 0, "data": []}, {"code": 0, "data": {"items": [], "has_more": True}}, {"data": {"items": []}}]:
+            channel._transport.pages = [invalid]
+            with self.subTest(invalid=invalid), self.assertRaises(RuntimeError):
+                user_in_chat(channel, "ou_virtual", "oc_virtual")
+
     def test_keeps_only_needed_fields(self):
         self.assertEqual(text_from_content('{"text":"#添加群聊"}'), "#添加群聊")
         inbound = inbound_from_fields(
@@ -267,6 +290,7 @@ class FeishuInboxTest(unittest.TestCase):
                     content = '{"text":"/help"}'
 
                 class sender:
+                    sender_type = "user"
                     class sender_id:
                         open_id = "ou_1"
 

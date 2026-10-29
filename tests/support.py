@@ -13,7 +13,7 @@ from tibo_reset_monitor.core.store import StateStore
 logging.getLogger("tibo_reset_monitor").setLevel(logging.CRITICAL)
 
 
-def utc(year=2026, month=10, day=28, hour=0, minute=0, second=0) -> datetime:
+def utc(year=2026, month=10, day=28, hour=2, minute=0, second=0) -> datetime:
     return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
 
 
@@ -162,7 +162,7 @@ def make_event(event_id: str, posts: list[dict], title: str = "Tibo 预告将重
         "scope": "",
         "createdAt": "2026-10-28T10:00:00.000+08:00",
         "updatedAt": "2026-10-28T10:00:00.000+08:00",
-        "confirmedAt": None if status != "confirmed" else "2026-10-28T11:00:00.000+08:00",
+        "confirmedAt": None if status != "confirmed" else "2026-10-28T10:00:00.000+08:00",
         "occurredOn": None,
         "confirmationBasis": None if status != "confirmed" else "source_post",
         "schedule": {

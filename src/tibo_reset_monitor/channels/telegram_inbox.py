@@ -157,13 +157,12 @@ class TelegramInbox:
             log.warning("Telegram setMyCommands was not accepted")
 
     def _reply(self, token: str, reply: Reply) -> None:
-        self.transport.send(
-            "POST",
-            f"{self.channel._api_base}/bot{token}/sendMessage",
-            {"Content-Type": "application/json; charset=utf-8"},
-            json.dumps({"chat_id": reply.chat_id, "text": reply.text}, ensure_ascii=False).encode("utf-8"),
-            self.channel._timeout,
-        )
+        del token
+        if not getattr(self.controller, "prepare_reply", lambda _reply: True)(reply):
+            return
+        receipt = self.channel.send_text(reply.chat_id, reply.text)
+        if receipt.outcome == "sent":
+            getattr(self.controller, "confirm_reply", lambda _reply: None)(reply)
 
     def channel_offset(self) -> str | None:
         store = getattr(self.controller, "store", None)

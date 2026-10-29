@@ -143,7 +143,7 @@ class CycleTest(TempStoreTest):
         self.assertEqual([item["target"] for item in channel.sent], ["broken", "fine", "broken"])
         statuses = {(row["target_key"], row["status"]) for row in _rows(self.store)}
         self.assertIn(("fine", "sent"), statuses)
-        self.assertIn(("broken", "retryable"), statuses)
+        self.assertIn(("broken", "ambiguous"), statuses)
 
     def test_new_targets_do_not_receive_history(self):
         channel = ScriptedChannel("fake", [target("fake", "original")], lambda *_: sent())
@@ -238,7 +238,7 @@ class CycleTest(TempStoreTest):
     def test_inflight_without_receipt_retries_with_the_same_key(self):
         channel = ScriptedChannel("fake", [target("fake", "ops")], lambda *_: sent("later"))
         source = ScriptedSource([not_modified('W/"same"')])
-        body = snapshot([])
+        body = snapshot([make_event("reset-1", [make_post("p9", "预告")])])
         now = self.clock.now()
         with self.store.transaction():
             self.store.baseline([], body, 'W/"same"', now)
@@ -289,6 +289,328 @@ class ClockSanityTest(unittest.TestCase):
         clock = FakeClock(utc())
         clock.advance(1)
         self.assertEqual(clock.now().second, 1)
+
+
+class SourceSafetyTest(TempStoreTest):
+    """Synthetic backfill and failure recovery: no production data or network."""
+
+    def setUp(self):
+        super().setUp()
+        self.clock.now_value = utc(hour=4)
+        self.channel = ScriptedChannel("fake", [target("fake", "oc_virtual")], lambda *_: sent())
+
+    def cycle(self, body=None, result=None):
+        return run_cycle(store=self.store, source=ScriptedSource([result or ok(body)]),
+                         channels=[self.channel], clock=self.clock)
+
+    def body(self, identity="virtual-post", published="2026-10-28T04:00:01Z", stage="预告"):
+        post = make_post(identity, stage)
+        post["publishedAt"] = published
+        return snapshot([make_event("virtual-event", [post])])
+
+    def baseline(self):
+        self.cycle(snapshot([]))
+        self.clock.advance(2)
+
+    def test_historical_backfill_after_empty_baseline_is_not_a_new_post(self):
+        self.baseline()
+        body = self.body(published="2026-07-01T00:00:00Z")
+        body["events"][0]["updatedAt"] = "2026-10-28T04:00:02Z"
+        self.cycle(body)
+        self.assertEqual(self.channel.sent, [])
+
+    def test_healthy_checks_reject_late_backfill_but_accept_out_of_order_new_posts(self):
+        self.baseline()
+        self.clock.advance(3 * 3600)
+        self.cycle(snapshot([]))
+        self.cycle(self.body("old-backfill"))
+        self.assertEqual(self.channel.sent, [])
+        self.cycle(self.body("newer", "2026-10-28T07:00:00Z"))
+        self.cycle(self.body("out-of-order", "2026-10-28T06:59:30Z"))
+        self.assertEqual([item["message"]["post_key"] for item in self.channel.sent], ["newer", "out-of-order"])
+
+    def test_failure_and_restart_block_cached_delivery_until_valid_304(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        self.cycle(result=failure("network", "unavailable"))
+        self.assertEqual(len(self.channel.sent), 1)
+        self.store.close()
+        from tibo_reset_monitor.core.store import StateStore
+        self.store = StateStore(self.path("state.sqlite3"))
+        self.addCleanup(self.store.close)
+        from tibo_reset_monitor.core.scheduler import deliver_due
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.channel._send = lambda *_: sent()
+        self.cycle(result=not_modified())
+        self.assertEqual(len(self.channel.sent), 2)
+
+    def test_unexpected_source_exception_does_not_release_old_queue(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        class BrokenSource:
+            def fetch(self, _etag):
+                raise RuntimeError("synthetic parse failure")
+        report = run_cycle(store=self.store, source=BrokenSource(), channels=[self.channel], clock=self.clock)
+        self.assertIsNotNone(report.fetch_error)
+        self.assertEqual(len(self.channel.sent), 1)
+
+    def test_stage_reclassification_does_not_resend_a_delivered_post(self):
+        self.baseline()
+        self.cycle(self.body())
+        self.cycle(self.body(stage="确认完成"))
+        self.assertEqual(len(self.channel.sent), 1)
+
+    def test_conflicting_stages_reject_the_whole_response(self):
+        self.baseline()
+        body = self.body()
+        body["activities"] = [make_activity("virtual-post", "confirm", "virtual-event")]
+        body["activities"][0]["publishedAt"] = "2026-10-28T04:00:01Z"
+        report = self.cycle(body)
+        self.assertIsNotNone(report.fetch_error)
+        self.assertEqual(self.channel.sent, [])
+
+    def test_legal_retry_retains_original_boundary_after_later_health_checks(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        key = self.channel.sent[0]["key"]
+        self.clock.advance(2 * 3600)
+        self.channel._send = lambda *_: sent()
+        self.cycle(self.body())
+        self.assertEqual([item["key"] for item in self.channel.sent], [key, key])
+
+    def test_removed_source_does_not_send_a_pending_post(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        self.channel._send = lambda *_: sent()
+        self.cycle(snapshot([]))
+        self.assertEqual(len(self.channel.sent), 1)
+
+    def test_304_without_a_cached_snapshot_is_not_success(self):
+        report = self.cycle(result=not_modified())
+        self.assertIsNotNone(report.fetch_error)
+        self.assertFalse(self.store.is_baselined())
+
+    def test_process_interruption_persists_block_and_valid_304_recovers(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        class Interrupted:
+            def fetch(self, _etag):
+                raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            run_cycle(store=self.store, source=Interrupted(), channels=[self.channel], clock=self.clock)
+        self.store.close()
+        from tibo_reset_monitor.core.store import StateStore
+        from tibo_reset_monitor.core.scheduler import deliver_due
+        self.store = StateStore(self.path("state.sqlite3"))
+        self.addCleanup(self.store.close)
+        deliver_due(self.store, [self.channel], self.clock)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.cycle(result=not_modified())
+        self.assertEqual(len(self.channel.sent), 2)
+
+    def test_conflict_is_rejected_even_for_pending_post_older_than_overlap(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(2 * 3600)
+        self.cycle(self.body())
+        body = self.body()
+        activity = make_activity("virtual-post", "confirm", "virtual-event")
+        activity["publishedAt"] = "2026-10-28T04:00:01Z"
+        body["activities"] = [activity]
+        report = self.cycle(body)
+        self.assertIsNotNone(report.fetch_error)
+        self.assertEqual(len(self.channel.sent), 2)
+
+    def test_future_post_at_tolerance_is_allowed_and_beyond_it_is_rejected(self):
+        self.baseline()
+        self.cycle(self.body("edge", "2026-10-28T04:05:02Z"))
+        report = self.cycle(self.body("beyond", "2026-10-28T04:05:03Z"))
+        self.assertIsNotNone(report.fetch_error)
+        self.assertEqual([item["message"]["post_key"] for item in self.channel.sent], ["edge"])
+
+    def test_changed_target_is_held_instead_of_delivering_old_work_to_new_address(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        self.channel.targets = [target("fake", "oc_virtual", address="different-virtual-address")]
+        self.cycle(result=not_modified())
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(_rows(self.store)[0]["status"], "needs_review")
+
+    def test_attempted_reclassification_keeps_key_and_original_body(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        original = self.channel.sent[0]
+        self.clock.advance(60)
+        changed = self.body(stage="确认完成")
+        changed["events"][0]["posts"][0]["publishedAt"] = "2026-10-28T09:30:01+05:30"
+        changed["events"][0]["posts"][0]["fullText"] = "changed source text"
+        self.channel._send = lambda *_: sent()
+        self.cycle(changed)
+        self.assertEqual(len(self.channel.sent), 2)
+        self.assertEqual(self.channel.sent[1]["key"], original["key"])
+        self.assertEqual(self.channel.sent[1]["message"], original["message"])
+
+    def test_unknown_receipt_is_ambiguous_and_does_not_block_other_target(self):
+        self.baseline()
+        self.channel.targets.append(target("fake", "second-virtual"))
+        self.channel._send = lambda _message, dest, _key: [] if dest.key == "oc_virtual" else sent()
+        self.cycle(self.body())
+        self.assertEqual([row["status"] for row in _rows(self.store)], ["ambiguous", "sent"])
+
+    def test_retry_freezes_rendered_text_and_calendar_bytes(self):
+        self.baseline()
+        photo = [b"virtual-original-calendar"]
+        rendered = []
+        def render(notice, target):
+            rendered.append(True)
+            return {"post_key": notice.post_key, "photo": photo[0], "text": "first rendering"}
+        self.channel.render = render
+        self.channel._send = lambda *_: Receipt("ambiguous", detail="unknown")
+        self.cycle(self.body())
+        original = self.channel.sent[0]
+        photo[0] = b"different-calendar"
+        self.clock.advance(120)
+        self.channel._send = lambda *_: sent()
+        self.cycle(result=not_modified())
+        self.assertEqual(len(rendered), 1)
+        self.assertEqual(self.channel.sent[1], original)
+
+    def test_non_idempotent_provider_does_not_retry_an_unknown_send(self):
+        self.baseline()
+        self.channel.supports_idempotency = False
+        self.channel._send = lambda *_: Receipt("ambiguous", detail="unknown")
+        self.cycle(self.body())
+        self.clock.advance(120)
+        self.cycle(result=not_modified())
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(_rows(self.store)[0]["status"], "needs_review")
+
+    def test_manual_row_does_not_drain_automatic_queue(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        historical = self.body("historical", "2026-07-01T00:00:00Z")
+        notice = extract_notices(historical)[0]
+        manual = self.store.insert_manual(notice, self.channel.targets[0], self.clock.now(), salt="virtual-explicit-request")
+        self.channel._send = lambda *_: sent()
+        from tibo_reset_monitor.core.scheduler import deliver_due
+        deliver_due(self.store, [self.channel], self.clock, only_row_id=manual.id)
+        self.assertEqual([entry["message"]["post_key"] for entry in self.channel.sent], ["virtual-post", "historical"])
+        self.assertEqual(_rows(self.store)[0]["status"], "retryable")
+
+    def test_unverifiable_legacy_target_is_held_for_review(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.store.conn.execute("UPDATE outbox SET automatic_after = NULL, target_address = NULL, message_json = NULL")
+        self.clock.advance(60)
+        self.cycle(result=not_modified())
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(_rows(self.store)[0]["status"], "needs_review")
+
+    def test_duplicate_legacy_classifications_do_not_send_twice(self):
+        self.baseline()
+        self.cycle(self.body())
+        duplicate = extract_notices(self.body(stage="确认完成"))[0]
+        identity = self.store._insert_notice(duplicate, self.clock.now())
+        from dataclasses import replace
+        self.store._enqueue(replace(duplicate, id=identity), self.channel.targets[0], self.clock.now())
+        self.cycle(self.body(stage="确认完成"))
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(_rows(self.store)[1]["status"], "needs_review")
+
+    def test_failures_do_not_advance_the_successful_check_boundary(self):
+        self.baseline()
+        self.clock.advance(3 * 3600)
+        self.cycle(result=failure("network", "offline"))
+        self.cycle(self.body("during-offline", "2026-10-28T04:30:00Z"))
+        self.assertEqual([entry["message"]["post_key"] for entry in self.channel.sent], ["during-offline"])
+
+    def test_seven_day_limit_rejects_old_post_even_after_offline_period(self):
+        self.baseline()
+        self.clock.advance(8 * 24 * 3600)
+        self.cycle(self.body())
+        self.assertEqual(self.channel.sent, [])
+        self.assertEqual(len(self.store.list_notices(10)), 1)
+
+    def test_invalid_cached_304_cannot_release_pending_work(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        self.store.conn.execute("UPDATE snapshot SET body_json = ?", ('{"events":"bad"}',))
+        report = self.cycle(result=not_modified())
+        self.assertIsNotNone(report.fetch_error)
+        self.assertEqual(len(self.channel.sent), 1)
+
+    def test_success_watermark_is_monotonic_and_large_clock_rollback_blocks(self):
+        self.baseline()
+        self.clock.advance(240)
+        self.cycle(self.body())
+        checkpoint = self.store.get_meta("last_success_at")
+        self.clock.advance(-240)
+        self.cycle(result=not_modified())
+        self.assertEqual(self.store.get_meta("last_success_at"), checkpoint)
+        self.clock.now_value = utc(hour=3, minute=58)
+        report = self.cycle(result=not_modified())
+        self.assertIsNotNone(report.fetch_error)
+        self.assertEqual(self.store.get_meta("last_success_at"), checkpoint)
+
+    def test_future_source_window_does_not_establish_a_baseline(self):
+        body = snapshot([])
+        body["historyFrom"] = "2026-12-01T00:00:00Z"
+        report = self.cycle(body)
+        self.assertIsNotNone(report.fetch_error)
+        self.assertFalse(self.store.is_baselined())
+
+    def test_concurrent_claim_has_one_winner(self):
+        import threading
+        from tibo_reset_monitor.core.store import StateStore
+        row = self.store.insert_manual(extract_notices(self.body())[0], self.channel.targets[0], self.clock.now(), salt="virtual-race")
+        barrier = threading.Barrier(2)
+        winners, errors = [], []
+        def worker():
+            state = None
+            try:
+                state = StateStore(self.store.path)
+                barrier.wait(timeout=5)
+                winners.append(state.claim(row.id, self.clock.now()))
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+            finally:
+                if state:
+                    state.close()
+        workers = [threading.Thread(target=worker) for _ in range(2)]
+        for item in workers:
+            item.start()
+        for item in workers:
+            item.join(timeout=10)
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(winners), [False, True])
+
+    def test_unserializable_render_does_not_count_as_a_send_attempt(self):
+        self.baseline()
+        self.channel.targets.append(target("fake", "good-virtual"))
+        self.channel.render = lambda notice, dest: {"text": object()} if dest.key == "oc_virtual" else {"text": "virtual"}
+        self.cycle(self.body())
+        rows = _rows(self.store)
+        self.assertEqual((rows[0]["attempts"], rows[0]["status"]), (0, "pending"))
+        self.assertEqual((rows[1]["attempts"], rows[1]["status"]), (1, "sent"))
 
 
 if __name__ == "__main__":

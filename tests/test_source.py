@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from tests.support import make_activity, make_event, make_post, snapshot
+from tests.support import make_activity, make_event, make_post, snapshot, utc
 from tibo_reset_monitor.core.http import HttpResponse
 from tibo_reset_monitor.core.source import SourceClient, validate_snapshot
 
@@ -25,6 +25,38 @@ class FakeTransport:
 
 
 class SourceClientTest(unittest.TestCase):
+    def test_nested_types_duplicate_ids_and_bad_dates_reject_whole_snapshot(self):
+        from copy import deepcopy
+        from tibo_reset_monitor.core.source import SnapshotError
+        original = snapshot([make_event("virtual", [make_post("virtual-post", "预告")])])
+        mutations = [
+            lambda b: b["events"].append(deepcopy(b["events"][0])),
+            lambda b: b["events"][0].update(presentation=[]),
+            lambda b: b["events"][0].update(schedule="invalid"),
+            lambda b: b["events"][0].update(occurredOn="2026-02-30"),
+            lambda b: b["events"][0].update(occurredOn="20261028"),
+            lambda b: b["events"][0].update(updatedAt="2026-10-28T02:00:00"),
+            lambda b: b["events"][0].update(confirmedAt="invalid"),
+            lambda b: b["events"][0]["estimate"].update(through="2026-02-30T00:00:00Z"),
+            lambda b: b["events"][0]["posts"][0].update(context={}),
+            lambda b: b["events"][0]["posts"].append(deepcopy(b["events"][0]["posts"][0])),
+        ]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                body = deepcopy(original)
+                mutate(body)
+                with self.assertRaises(SnapshotError):
+                    validate_snapshot(body, utc())
+
+    def test_future_estimate_is_valid_but_future_record_timestamp_is_not(self):
+        from tibo_reset_monitor.core.source import SnapshotError
+        body = snapshot([make_event("virtual", [make_post("virtual-post", "预告")])])
+        body["events"][0]["estimate"]["through"] = "2027-01-01T00:00:00Z"
+        validate_snapshot(body, utc())
+        body["events"][0]["confirmedAt"] = "2027-01-01T00:00:00Z"
+        with self.assertRaises(SnapshotError):
+            validate_snapshot(body, utc())
+
     def test_sends_etag_gzip_and_keeps_snapshot_on_304(self):
         body = snapshot([make_event("reset-1", [make_post("p1", "预告")])])
         payloads = [

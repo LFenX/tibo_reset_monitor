@@ -75,6 +75,8 @@ class Inbound:
 class Reply:
     chat_id: str
     text: str
+    picker_user_id: str = ""
+    picker_id: str = ""
 
 
 @dataclass
@@ -133,6 +135,8 @@ class ChatController:
         pairing: PairingGate | None = None,
         extra_admins: Callable[[], set[str]] | None = None,
         welcome: Callable[[str], None] | None = None,
+        group_membership: Callable[[str, str], bool] | None = None,
+        require_reply_ack: bool = False,
     ) -> None:
         self.store = store
         self.clock = clock
@@ -144,11 +148,15 @@ class ChatController:
         self.pairing = pairing or PairingGate()
         self.extra_admins = extra_admins
         self.welcome = welcome
+        self.group_membership = group_membership
+        self.require_reply_ack = require_reply_ack
         self._hits: dict[str, list[datetime]] = {}
         self._extra_loaded = False
         self._extra_ids: set[str] | None = None
 
     def handle(self, inbound: Inbound) -> Reply | None:
+        if inbound.channel != self.channel:
+            return None
         now = self.clock.now()
         if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, now):
             return None
@@ -162,6 +170,12 @@ class ChatController:
             return None
         self._extra_loaded = False
         command, argument = _split_command(inbound.text)
+        if command == "cancel":
+            session = self.store.load_session(self.channel, inbound.user_id)
+            if inbound.scope != "personal" or (session and session["chat_id"] != inbound.chat_id):
+                return Reply(inbound.chat_id, self._t("only_dm"))
+            self.store.clear_session(self.channel, inbound.user_id)
+            return Reply(inbound.chat_id, self._t("cancelled"))
         if self._limited(inbound.user_id, now):
             return Reply(inbound.chat_id, self._t("slow"))
         if command == "help":
@@ -175,6 +189,8 @@ class ChatController:
         return self._dispatch(inbound, command, argument, now)
 
     def _dispatch(self, inbound: Inbound, command: str, argument: str, now: datetime) -> Reply | None:
+        if self.channel == "feishu" and inbound.scope != "personal" and command in {"add_group", "remove_group", "subscribe", "unsubscribe"}:
+            return Reply(inbound.chat_id, self._t("not_group_cmd"))
         if command == "help":
             return self._guide_for(inbound)
         if command == "pair":
@@ -270,17 +286,60 @@ class ChatController:
         if not choices:
             self.store.clear_session(self.channel, inbound.user_id)
             return Reply(inbound.chat_id, self._t(empty))
+        if self.group_membership is not None:
+            try:
+                choices = [(identity, title) for identity, title in choices if self.group_membership(inbound.user_id, identity)]
+            except Exception:
+                self.store.clear_session(self.channel, inbound.user_id)
+                return Reply(inbound.chat_id, self._t("list_failed"))
+        if not choices:
+            self.store.clear_session(self.channel, inbound.user_id)
+            return Reply(inbound.chat_id, self._t(empty))
         payload = [{"id": chat_id, "title": title} for chat_id, title in choices]
-        self.store.save_session(self.channel, inbound.user_id, command, payload, now + timedelta(seconds=SESSION_SECONDS))
+        self.store.save_session(self.channel, inbound.user_id, command, payload,
+                                None if self.require_reply_ack else now + timedelta(seconds=SESSION_SECONDS),
+                                chat_id=inbound.chat_id, prompt_id=inbound.event_id)
         lines = [self._t(intro)]
         for index, item in enumerate(payload, start=1):
             lines.append(self._t("choice", index=str(index), name=item["title"], tail=_tail(item["id"])))
-        return Reply(inbound.chat_id, "\n".join(lines))
+        return Reply(inbound.chat_id, "\n".join(lines), inbound.user_id, inbound.event_id)
+
+    def prepare_reply(self, reply: Reply) -> bool:
+        """Recheck sensitive picker data immediately before the adapter sends it."""
+        if not reply.picker_user_id:
+            return True
+        self._extra_loaded = False
+        session = self.store.load_session(self.channel, reply.picker_user_id)
+        valid = bool(session and session["prompt_id"] == reply.picker_id
+                     and session["chat_id"] == reply.chat_id and self._is_admin(reply.picker_user_id))
+        if valid:
+            groups = self._groups()
+            valid = groups is not None and all(item["id"] in {identity for identity, _title in groups} for item in session["candidates"])
+        if valid and self.group_membership is not None:
+            try:
+                valid = all(self.group_membership(reply.picker_user_id, item["id"]) for item in session["candidates"])
+            except Exception:
+                valid = False
+        self._extra_loaded = False
+        valid = valid and self._is_admin(reply.picker_user_id)
+        if not valid:
+            self.store.clear_session(self.channel, reply.picker_user_id, prompt_id=reply.picker_id)
+        return valid
+
+    def confirm_reply(self, reply: Reply) -> None:
+        if reply.picker_user_id:
+            self.store.confirm_session(self.channel, reply.picker_user_id, reply.picker_id,
+                                       self.clock.now() + timedelta(seconds=SESSION_SECONDS))
 
     def _select(self, inbound: Inbound, text: str, now: datetime) -> Reply:
         session = self.store.load_session(self.channel, inbound.user_id)
         if session is None:
             return Reply(inbound.chat_id, self._t("help"))
+        if session["chat_id"] != inbound.chat_id:
+            return Reply(inbound.chat_id, self._t("only_dm"))
+        if not self._is_admin(inbound.user_id):
+            self.store.clear_session(self.channel, inbound.user_id)
+            return self._deny(inbound)
         expires = parse_utc(session["expires_at"])
         if expires is None or now > expires:
             self.store.clear_session(self.channel, inbound.user_id)
@@ -298,7 +357,17 @@ class ChatController:
             if len(matches) != 1:
                 return Reply(inbound.chat_id, self._t("bad_choice"))
             chosen = matches[0]
-        self.store.clear_session(self.channel, inbound.user_id)
+        groups = self._groups()
+        try:
+            member = self.group_membership is None or self.group_membership(inbound.user_id, str(chosen["id"]))
+        except Exception:
+            member = False
+        self._extra_loaded = False
+        if groups is None or str(chosen["id"]) not in {identity for identity, _title in groups} or not member or not self._is_admin(inbound.user_id):
+            self.store.clear_session(self.channel, inbound.user_id)
+            return Reply(inbound.chat_id, self._t("list_failed"))
+        if not self.store.clear_session(self.channel, inbound.user_id, prompt_id=session["prompt_id"]):
+            return Reply(inbound.chat_id, self._t("expired"))
         if session["action"] == "add_group":
             return self._subscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, now)
         return self._unsubscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, now)

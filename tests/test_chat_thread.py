@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from contextlib import ExitStack
 
 from tests.support import FakeClock, make_event, make_post, snapshot, utc
 from tibo_reset_monitor.config import load_config
@@ -36,8 +37,8 @@ class RoutingTransport:
                             "update_id": 1,
                             "message": {
                                 "text": "/subscribe",
-                                "from": {"id": 6173752247},
-                                "chat": {"id": 6173752247, "type": "private"},
+                                "from": {"id": 42},
+                                "chat": {"id": 42, "type": "private"},
                             },
                         }
                     ],
@@ -47,7 +48,7 @@ class RoutingTransport:
             return HttpResponse(200, {}, json.dumps(payload).encode(), url)
         if "api.telegram.org" in url:
             self.sent.append({"url": url, "body": body})
-            return HttpResponse(200, {}, b'{"ok":true,"result":{"message_id":1}}', url)
+            return HttpResponse(200, {}, b'{"ok":true,"result":{"message_id":1,"chat":{"id":42}}}', url)
         if "codex-resets" in url:
             return self._feed(headers, url)
         return HttpResponse(500, {}, b"", url)
@@ -71,7 +72,7 @@ class RoutingTransport:
 
 class ChatThreadIntegrationTest(unittest.TestCase):
     def test_run_loop_and_chat_thread_share_one_sqlite_file(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as resources:
             root = Path(tmp)
             db = root / "monitor.sqlite3"
             config_path = root / "config-chat.json"
@@ -85,7 +86,7 @@ class ChatThreadIntegrationTest(unittest.TestCase):
                                 "enabled": True,
                                 "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
                                 "chat_control": True,
-                                "admins": ["6173752247"],
+                                "admins": ["42"],
                                 "targets": [],
                             }
                         },
@@ -99,6 +100,7 @@ class ChatThreadIntegrationTest(unittest.TestCase):
             transport = RoutingTransport(holder)
             config = load_config(config_path, environ={})
             runtime = build_runtime(config, transport=transport, clock=FakeClock(utc()))
+            resources.callback(runtime.close)
             runtime.config.poll_interval_seconds = 0.2
             holder["runtime"] = runtime
             self.addCleanup(runtime.close)
@@ -128,11 +130,14 @@ class ChatThreadIntegrationTest(unittest.TestCase):
                 code = run_forever(runtime, sleep=sleeper)
             finally:
                 time.sleep = original_sleep
+            for worker in threading.enumerate():
+                if worker.name == "telegram-chat":
+                    worker.join(timeout=2)
             self.assertEqual(code, 0)
             self.assertLess(time.time() - started, 15)
             active = [item for item in runtime.store.subscriptions("telegram") if item["status"] == "active"]
             self.assertEqual(len(active), 1)
-            self.assertEqual(active[0]["address"], "6173752247")
+            self.assertEqual(active[0]["address"], "42")
             self.assertEqual(active[0]["kind"], "personal")
             # A second connection, like the other thread, can read the same file.
             other = sqlite3.connect(db)
@@ -142,7 +147,7 @@ class ChatThreadIntegrationTest(unittest.TestCase):
                 ).fetchone()
             finally:
                 other.close()
-            self.assertEqual(tuple(row), ("6173752247", "active"))
+            self.assertEqual(tuple(row), ("42", "active"))
             self.assertTrue(any(b"brand new" in item["body"] for item in transport.sent))
 
     def test_failures_log_the_reason_and_back_off(self):

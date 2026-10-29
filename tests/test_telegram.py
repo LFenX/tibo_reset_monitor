@@ -46,6 +46,15 @@ def _channel(transport) -> TelegramChannel:
 
 
 class TelegramRequestTest(unittest.TestCase):
+    def test_receipts_validate_destination_and_public_username(self):
+        from tibo_reset_monitor.channels.telegram import _receipt
+        payload = {"ok": True, "result": {"message_id": 1, "chat": {"id": -10042, "username": "Virtual_Channel"}}}
+        body = json.dumps(payload).encode()
+        self.assertEqual(_receipt(200, body, {}, expected_chat="@virtual_channel").outcome, "sent")
+        self.assertEqual(_receipt(200, body, {}, expected_chat="@different_channel").outcome, "ambiguous")
+        for invalid in [b"{}", b"[]", b'{"ok":true,"result":[]}']:
+            self.assertEqual(_receipt(200, invalid, {}, expected_chat="-10042").outcome, "ambiguous")
+
     def setUp(self) -> None:
         os.environ["TIBO_TELEGRAM_BOT_TOKEN"] = "123456789:example-token-value-not-real"
         self.addCleanup(os.environ.pop, "TIBO_TELEGRAM_BOT_TOKEN", None)
@@ -57,8 +66,8 @@ class TelegramRequestTest(unittest.TestCase):
         png = b"\x89PNG\r\n\x1a\ncalendar"
         transport = FakeTransport(
             [
-                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 10}}).encode(), "u"),
-                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 11}}).encode(), "u"),
+                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 10, "chat": {"id": -1001234567890}}}).encode(), "u"),
+                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 11, "chat": {"id": 424242}}}).encode(), "u"),
             ]
         )
         channel = _channel(transport)
@@ -123,7 +132,7 @@ class TelegramRequestTest(unittest.TestCase):
     def test_missing_calendar_falls_back_to_one_text_message(self):
         transport = FakeTransport(
             [
-                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 12}}).encode(), "u"),
+                HttpResponse(200, {}, json.dumps({"ok": True, "result": {"message_id": 12, "chat": {"id": 424242}}}).encode(), "u"),
             ]
         )
         channel = _channel(transport)

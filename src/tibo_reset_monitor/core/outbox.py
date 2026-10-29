@@ -20,6 +20,7 @@ from tibo_reset_monitor.core.model import (
     RETRYABLE,
     SENT,
     DeliveryState,
+    DUE_STATUSES,
     Receipt,
 )
 
@@ -35,14 +36,14 @@ def idempotency_key(dedupe_key: str, channel: str, target_key: str, *, salt: str
 
 
 def ambiguous_expired(state: DeliveryState, now: datetime) -> bool:
-    if state.status != AMBIGUOUS or state.first_ambiguous_at is None:
+    if state.status not in DUE_STATUSES or state.first_ambiguous_at is None:
         return False
     age = (now - state.first_ambiguous_at).total_seconds()
     return age >= AMBIGUOUS_REVIEW_AFTER_SECONDS
 
 
 def retry_delay(attempts: int, retry_after_seconds: float | None, *, ambiguous: bool) -> float:
-    exponent = max(0, attempts - 1)
+    exponent = min(20, max(0, attempts - 1))
     base = _AMBIGUOUS_BASE_SECONDS if ambiguous else _CLEAR_BASE_SECONDS
     delay = min(_MAX_DELAY_SECONDS, base * (2**exponent))
     if retry_after_seconds is not None:

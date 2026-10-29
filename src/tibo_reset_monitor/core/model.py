@@ -181,6 +181,12 @@ class OutboxRow:
     idempotency_key: str
     state: DeliveryState
     notice: Notice
+    automatic: bool = True
+    automatic_after: str | None = None
+    target_address: str | None = None
+    attempted_at: datetime | None = None
+    message: dict[str, Any] | None = None
+    queued_at: datetime | None = None
 
 
 @dataclass

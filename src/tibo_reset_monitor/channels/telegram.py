@@ -32,6 +32,7 @@ _TAG_RE = re.compile(r"<[^>]+>")
 class TelegramChannel:
     name = "telegram"
     supports_chat = True
+    supports_idempotency = False
 
     def __init__(self, spec: ChannelSpec, transport: Any, clock: Any) -> None:
         del clock
@@ -89,7 +90,7 @@ class TelegramChannel:
             )
         except TransportError as exc:
             return receipt_from_transport(exc, sent=True)
-        return _receipt(response.status, response.body, response.headers)
+        return _receipt(response.status, response.body, response.headers, expected_chat=str(chat_id))
 
     def send(self, message: dict[str, Any], target: Target, idempotency_key: str) -> Receipt:
         del target, idempotency_key  # Telegram has no uuid; the outbox row is the idempotency record.
@@ -127,7 +128,7 @@ class TelegramChannel:
             response = self._transport.send("POST", url, headers, body, self._timeout)
         except TransportError as exc:
             return receipt_from_transport(exc, sent=True)
-        return _receipt(response.status, response.body, response.headers)
+        return _receipt(response.status, response.body, response.headers, expected_chat=str(message["chat_id"]))
 
     def _load_photo(self, language: str, timezone_name: str) -> bytes | None:
         if self._calendar_png is None:
@@ -367,12 +368,26 @@ def _multipart(fields: list[tuple[str, str]], photo: bytes) -> tuple[bytes, str]
     return b"".join(chunks), f"multipart/form-data; boundary={boundary}"
 
 
-def _receipt(status: int, body: bytes, headers: dict[str, str]) -> Receipt:
+def _receipt(status: int, body: bytes, headers: dict[str, str], *, expected_chat: str | None = None) -> Receipt:
     payload = _json_object(body)
     if payload.get("ok") is True:
+        if status != 200:
+            return Receipt("ambiguous", detail="Telegram returned a contradictory response")
         result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
         message_id = result.get("message_id")
+        chat = result.get("chat")
+        matches = isinstance(chat, dict) and type(chat.get("id")) is int
+        if matches and expected_chat is not None:
+            if expected_chat.startswith("@"):
+                matches = isinstance(chat.get("username"), str) and chat["username"].lower() == expected_chat[1:].lower()
+            else:
+                matches = str(chat["id"]) == expected_chat
+        if (type(message_id) is not int or message_id <= 0 or (expected_chat is not None
+                and not matches)):
+            return Receipt("ambiguous", detail="Telegram returned no valid message id or matching chat")
         return Receipt("sent", provider_message_id=str(message_id) if message_id is not None else None, detail="sent")
+    if payload.get("ok") is not False:
+        return Receipt("ambiguous", detail="Telegram returned an invalid receipt")
     error_code = payload.get("error_code")
     if not isinstance(error_code, int):
         error_code = status

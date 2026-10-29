@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -282,7 +283,7 @@ class GuideDeliveryTest(TempStoreTest):
 
 class GuidePollTest(unittest.TestCase):
     def test_poll_skips_a_closed_direct_chat_and_keeps_polling(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, ExitStack() as resources:
             root = Path(tmp)
             config_path = root / "config-chat.json"
             config_path.write_text(
@@ -293,7 +294,7 @@ class GuidePollTest(unittest.TestCase):
                             "telegram": {
                                 "enabled": True,
                                 "bot_token_env": "TIBO_TELEGRAM_BOT_TOKEN",
-                                "admins": ["6173752247"],
+                                "admins": ["42"],
                                 "targets": [],
                             }
                         },
@@ -306,6 +307,7 @@ class GuidePollTest(unittest.TestCase):
             transport = _Feed()
             runtime = build_runtime(load_config(config_path, environ={}), transport=transport, clock=FakeClock(NOW))
             self.addCleanup(runtime.close)
+            resources.callback(runtime.close)
             with self.assertLogs("tibo_reset_monitor", level="INFO") as first:
                 self.assertEqual(poll(runtime), 0)
             self.assertEqual(transport.guides, 1)
@@ -316,7 +318,7 @@ class GuidePollTest(unittest.TestCase):
                 self.assertEqual(poll(runtime), 0)
             self.assertEqual(transport.guides, 1)
             self.assertFalse(any("welcome guide" in line for line in second.output))
-            row = runtime.store.guide_row("telegram", "6173752247", GUIDE_VERSION)
+            row = runtime.store.guide_row("telegram", "42", GUIDE_VERSION)
             self.assertEqual(row["status"], "skipped")
 
 

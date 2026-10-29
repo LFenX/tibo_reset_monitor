@@ -17,7 +17,7 @@ from tibo_reset_monitor.core.scheduler import effective_targets
 from tibo_reset_monitor.core.store import StateStore
 
 
-NOW = datetime(2026, 10, 28, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 28, 2, tzinfo=timezone.utc)
 
 
 def _inbound(channel="telegram", **overrides) -> Inbound:
@@ -35,6 +35,64 @@ def _inbound(channel="telegram", **overrides) -> Inbound:
 
 
 class ChatFlowTest(TempStoreTest):
+    def test_stale_picker_reply_cannot_clear_a_newer_session(self):
+        controller = self._controller(channel="feishu", admins=("ou_virtual",), group_catalog=lambda: [("oc_virtual", "Virtual")])
+        def message(identity):
+            return _inbound(channel="feishu", event_id=identity, user_id="ou_virtual", chat_id="oc_dm", text="/addgroup")
+        old = controller.handle(message("old"))
+        controller.handle(message("new"))
+        self.assertFalse(controller.prepare_reply(old))
+        self.assertEqual(self.store.load_session("feishu", "ou_virtual")["prompt_id"], "new")
+
+    def test_picker_rechecks_authority_membership_and_prompt_delivery_time(self):
+        allowed = {"ou_virtual"}
+        member = {"oc_virtual"}
+        controller = self._controller(channel="feishu", admins=(), extra_admins=lambda: set(allowed),
+                                      group_catalog=lambda: [("oc_virtual", "Private virtual group")],
+                                      group_membership=lambda user, chat: chat in member, require_reply_ack=True)
+        inbound = lambda key, text, chat="oc_dm": _inbound(channel="feishu", event_id=key, user_id="ou_virtual", chat_id=chat, text=text)
+        reply = controller.handle(inbound("p1", "/addgroup"))
+        self.assertTrue(controller.prepare_reply(reply))
+        self.clock.advance(120)
+        controller.confirm_reply(reply)
+        self.clock.advance(59)
+        picked = controller.handle(inbound("p2", "1"))
+        self.assertIn("Private virtual group", picked.text)
+        controller.handle(inbound("p3", "/removegroup"))
+        allowed.clear()
+        denied = controller.handle(inbound("p4", "1"))
+        self.assertNotIn("已取消群聊", denied.text)
+        self.assertEqual(self.store.subscriptions("feishu")[0]["status"], "active")
+        allowed.add("ou_virtual")
+        reply = controller.handle(inbound("p5", "/removegroup"))
+        member.clear()
+        self.assertFalse(controller.prepare_reply(reply))
+
+    def test_picker_is_bound_to_private_chat_and_cancel_survives_revocation(self):
+        allowed = {"ou_virtual"}
+        controller = self._controller(channel="feishu", admins=(), extra_admins=lambda: set(allowed),
+                                      group_catalog=lambda: [("oc_virtual", "Virtual")])
+        def message(key, text, chat="oc_dm"):
+            return _inbound(channel="feishu", event_id=key, user_id="ou_virtual", chat_id=chat, text=text)
+        controller.handle(message("c1", "/addgroup"))
+        controller.handle(message("c2", "1", "oc_other_dm"))
+        self.assertEqual(self.store.subscriptions("feishu"), [])
+        controller.handle(message("c3", "/addgroup"))
+        allowed.clear()
+        cancelled = controller.handle(message("c4", "/cancel"))
+        self.assertIn("退出", cancelled.text)
+        self.assertIsNone(self.store.load_session("feishu", "ou_virtual"))
+
+    def _queue_notice(self, notice, targets):
+        from dataclasses import replace
+        from tibo_reset_monitor.core.model import format_utc
+        if not self.store.is_baselined():
+            self.store.baseline([], snapshot([]), None, NOW)
+        notice = replace(notice, published_at=notice.published_at or format_utc(NOW))
+        post = make_post(notice.post_key, notice.stage)
+        post["publishedAt"] = notice.published_at
+        return self.store.ingest([notice], targets, snapshot([make_event("virtual-event", [post])]), None, NOW)
+
     def setUp(self) -> None:
         super().setUp()
         self.clock.now_value = NOW
@@ -277,7 +335,7 @@ class ChatFlowTest(TempStoreTest):
             published_at="",
         )
         targets = self.store.subscription_targets("telegram", "zh", "UTC")
-        self.store.ingest([notice], targets, {"events": []}, None, NOW)
+        self._queue_notice(notice, targets)
         self.store.conn.commit()
         row = self.store.due_rows(NOW)[0]
         self.store.claim(row.id, NOW)
@@ -352,6 +410,7 @@ class ChatFlowTest(TempStoreTest):
         self.assertIn("还没有管理员", empty.text)
         self.assertIn("协作者", empty.text)
 
+    @unittest.skipIf(os.name == "nt", "POSIX mode bits do not represent Windows ACLs")
     def test_state_file_is_owner_only(self):
         mode = os.stat(self.store.path).st_mode
         self.assertEqual(mode & 0o077, 0)
@@ -387,7 +446,7 @@ class ChatFlowTest(TempStoreTest):
             published_at="",
         )
         targets = self.store.subscription_targets("telegram", "zh", "UTC")
-        self.store.ingest([notice], targets, {"events": [], "activities": []}, None, NOW)
+        self._queue_notice(notice, targets)
         self.store.conn.commit()
         self.assertEqual(len(self.store.due_rows(NOW)), 1)
         self.store.unsubscribe("telegram", "group", "-100", NOW, reason="unsubscribed")
@@ -446,7 +505,7 @@ class ChatFlowTest(TempStoreTest):
             url="",
             published_at="",
         )
-        self.store.ingest([notice], self.store.subscription_targets("telegram", "zh", "UTC"), {"events": [], "activities": []}, None, NOW)
+        self._queue_notice(notice, self.store.subscription_targets("telegram", "zh", "UTC"))
         self.store.conn.commit()
         self.controller.handle(
             _inbound(event_id="mig", scope="group", chat_id="-100", user_id="42", text="", migrate_to="-100999")
@@ -475,7 +534,7 @@ class ChatFlowTest(TempStoreTest):
             published_at="",
         )
         old = next(item for item in self.store.subscription_targets("telegram", "zh", "UTC") if item.address == "-100")
-        self.store.ingest([notice], [old], {"events": [], "activities": []}, None, NOW)
+        self._queue_notice(notice, [old])
         self.store.conn.commit()
         self.store.migrate_chat("telegram", "-100", "-100999", NOW)
         active = [item for item in self.store.subscriptions("telegram") if item["status"] == "active"]

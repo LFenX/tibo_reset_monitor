@@ -87,18 +87,22 @@ Telegram chat control uses polling. An existing Telegram webhook must be removed
 
 1. Enable the bot, message permissions, and long-connection events, then publish the app. Include the intended users in its availability scope.
 2. Add your admin `open_id` to configuration, or use an app collaborator if `admins` is empty.
-3. Open a direct chat and send `#开启单聊通知`, or `#添加群聊` and reply with a listed number or full group name. The bot must already be in the group.
+3. Open a direct chat and send `#开启单聊通知`, or `#添加群聊` and reply with a listed number or full group name. Both you and the bot must be in the group. Grant [group-member read access](https://open.feishu.cn/document/server-docs/group/chat-member/get); a failed membership check keeps group management closed.
 4. Use `#关闭单聊通知`, `#移除群聊`, or `#状态` to manage subscriptions. `#帮助` shows the guide.
 
 Admins can manage subscriptions by default. Set `allow_self_subscribe` to `true` to allow other users to manage their own direct messages; group management stays restricted to admins. See the full [permissions and commands](chat-setup.md#who-can-use-it).
 
 Once ready, admins receive one usage guide per guide version. Telegram can deliver it after the user starts the bot or pairs successfully. A first fetch establishes the baseline; new subscriptions do not receive old posts.
 
+Automatic notifications use the original post's publication time, not an event's update time. Even an empty first response establishes the baseline. Publication must be at or after the latest of the baseline, seven days ago, the source history boundary, and one hour before the last successful local check; future clock skew is limited to five minutes. Historical backfills appear in `list` for an explicit `manual --event` request without being automatically sent. A classification change keeps the same post identity.
+
+Source failures and interrupted checks block automatic delivery until a valid response or a validated cached 304 recovers it. Legal retries keep their original time boundary, target, rendered message and idempotency key. Removed source posts cancel their automatic pending work; unsafe legacy or changed targets become `needs_review`. Unknown send results stop blind retries after 55 minutes. Telegram has no provider idempotency key, so an ambiguous Telegram delivery needs review immediately.
+
 ## Language, time zone, and calendars
 
 Notifications default to Chinese. Set `language` to `en` or `zh` globally, per channel, or per target; the most specific value wins. English notifications use the original post text. `timezone` follows the same order and accepts an IANA name such as `Asia/Shanghai` or `America/Los_Angeles`. Times include the recipient's current UTC offset.
 
-Telegram sends one calendar photo with a caption when rendering is available, otherwise one text message. Feishu sends one card with an optional calendar; an image upload failure still allows the text card. The calendar uses the recipient's local month. A failed history refresh keeps the last cached history.
+Telegram sends one calendar photo with a caption when rendering is available, otherwise one text message. Feishu sends one card with an optional calendar; an image upload failure still allows the text card. The calendar uses the recipient's local month and one validated full-history snapshot. It replaces deleted and corrected events without merging old recent data. A failed refresh keeps valid cached history; a recent ETag change triggers another history check after the ten-minute minimum interval, with revalidation at least every 24 hours.
 
 ## Check delivery
 

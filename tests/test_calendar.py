@@ -92,7 +92,9 @@ class CalendarModelTest(unittest.TestCase):
             ],
             "activities": [{"id": "w", "action": "withdraw", "eventIds": ["old"]}],
         }
-        model = calendar_model(history, recent, NOW)
+        # A corrected full snapshot is authoritative, including deletions.
+        full = {"events": recent["events"]}
+        model = calendar_model(full, history, NOW)
         self.assertEqual(model["today"], "2026-10-28")
         self.assertNotIn("old", [item["id"] for items in model["days"].values() for item in items])
         self.assertNotIn("dropped", [item["id"] for items in model["days"].values() for item in items])
@@ -128,8 +130,7 @@ class CalendarModelTest(unittest.TestCase):
                 ),
             ],
         }
-        # base is before the cutoff only when it comes from history. Put both in recent so both exist.
-        model = calendar_model({"events": []}, recent, NOW)
+        model = calendar_model(recent, {"events": []}, NOW)
         follow = next(item for items in model["days"].values() for item in items if item["id"] == "follow")
         self.assertEqual(follow["label"], "补充确认")
         self.assertEqual(model["totals"]["补充确认"], 1)
@@ -500,6 +501,50 @@ def _cell_box(view_year: int, view_month: int, cell_date: date) -> tuple[int, in
 
 
 class HistoryCacheTest(TempStoreTest):
+    def test_deleted_history_is_not_resurrected_by_old_recent(self):
+        old = {"events": [_event("removed", occurredOn="2026-10-02")]}
+        self.assertEqual(calendar_model({"events": []}, old, NOW)["days"], {})
+
+    def test_bad_replacement_preserves_valid_history_and_304_clears_error(self):
+        from tests.support import not_modified
+        from copy import deepcopy
+        original = snapshot([_event("virtual")])
+        bad = deepcopy(original)
+        bad["events"][0]["occurredOn"] = "2026-02-30"
+        source = ScriptedSource([ok(original), ok(bad), not_modified()])
+        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=600)
+        calendar.refresh()
+        self.clock.advance(600)
+        calendar.refresh()
+        self.assertEqual(self.store.get_history()["body"], original)
+        self.assertIsNotNone(self.store.get_meta("calendar_error"))
+        self.clock.advance(600)
+        calendar.refresh()
+        self.assertIsNone(self.store.get_meta("calendar_error"))
+        self.assertEqual(self.store.get_history()["body"], original)
+
+    def test_recent_etag_change_refreshes_complete_history_after_minimum_gap(self):
+        source = ScriptedSource([ok(snapshot([_event("deleted")])), ok(snapshot([]))])
+        calendar = HistoryCalendar(self.store, source, self.clock)
+        calendar.refresh()
+        self.store.save_snapshot(snapshot([]), 'W/"changed"', self.clock.now())
+        self.clock.advance(599)
+        calendar.refresh()
+        self.assertEqual(len(source.etags), 1)
+        self.clock.advance(1)
+        calendar.refresh()
+        self.assertEqual(self.store.get_history()["body"]["events"], [])
+        self.assertEqual(self.store.outbox_counts(), {})
+
+    def test_invalid_cached_history_requests_full_replacement(self):
+        bad = snapshot([_event("bad", occurredOn="invalid")])
+        self.store.save_history(bad, 'W/"invalid"', self.clock.now())
+        source = ScriptedSource([ok(snapshot([]))])
+        calendar = HistoryCalendar(self.store, source, self.clock)
+        calendar.refresh()
+        self.assertEqual(source.etags, [None])
+        self.assertEqual(self.store.get_history()["body"]["events"], [])
+
     def test_failure_keeps_the_previous_snapshot_and_does_not_raise(self):
         body = snapshot([], checked_at="2026-10-01T00:00:00.000+08:00")
         source = ScriptedSource(
@@ -522,6 +567,7 @@ class HistoryCacheTest(TempStoreTest):
         self.clock.now_value = datetime(2026, 9, 30, 2, 0, tzinfo=timezone.utc)
         first = snapshot([], checked_at="2026-09-30T00:00:00.000+08:00")
         second = snapshot([], checked_at="2026-10-02T00:00:00.000+08:00")
+        first["historyFrom"] = second["historyFrom"] = "2026-01-01T00:00:00Z"
         source = ScriptedSource([ok(first, etag='W/"a"'), ok(second, etag='W/"b"')])
         calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=7 * 24 * 3600)
         calendar.refresh()
@@ -573,9 +619,11 @@ class HistoryCacheTest(TempStoreTest):
 
     def test_failed_new_month_fetch_still_draws_that_month(self):
         self.clock.now_value = datetime(2026, 10, 15, 4, tzinfo=timezone.utc)
+        october = snapshot([])
+        october["historyFrom"] = "2026-01-01T00:00:00Z"
         source = ScriptedSource(
             [
-                ok(snapshot([]), etag='W/"oct"'),
+                ok(october, etag='W/"oct"'),
                 failure("network", "history down"),
             ]
         )

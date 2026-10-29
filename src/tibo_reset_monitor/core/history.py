@@ -19,6 +19,7 @@ from tibo_reset_monitor.core.calendar import (
     render_calendar_png,
 )
 from tibo_reset_monitor.core.model import parse_utc
+from tibo_reset_monitor.core.source import validate_snapshot
 from tibo_reset_monitor.core.timeutil import month_of, zone_for
 
 log = logging.getLogger("tibo_reset_monitor")
@@ -53,24 +54,33 @@ class HistoryCalendar:
         try:
             if not self._due(now):
                 return
-            result = self.source.fetch(self.store.get_history_etag())
+            # Do not validate an invalid cache via 304: request a full replacement.
+            cached = self._valid_cache(now)
+            if cached is None and self.store.has_history():
+                self.store.set_meta("history_invalid_cache", "1")
+            self._note_attempt(now)
+            result = self.source.fetch(cached["etag"] if cached else None)
+            if result.failure is not None:
+                raise ValueError(f"history fetch failed ({result.failure.kind})")
+            if result.not_modified:
+                if cached is None:
+                    raise ValueError("history 304 has no valid cached snapshot")
+                body = cached["body"]
+            else:
+                body = validate_snapshot(result.body, now)
+            # Build the entire model before replacing the last usable snapshot.
+            calendar_model(body, None, now)
+            self.store.save_history(body, result.etag or (cached["etag"] if cached else None), now)
+            self.store.set_meta("history_recent_etag", self.store.get_etag() or "")
+            self.store.set_meta("calendar_error", None)
+            self.store.set_meta("history_invalid_cache", None)
+            self.store.conn.commit()
         except Exception as exc:
-            log.warning("history fetch failed: %s", exc)
+            log.warning("history fetch failed: %s", type(exc).__name__)
+            self.store.set_meta("calendar_error", type(exc).__name__)
             self._note_attempt(now)
             return
-        self._note_attempt(now)
-        if result.not_modified:
-            self.store.touch_history(now, result.etag)
-            self.store.conn.commit()
-            log.info("history not modified")
-            return
-        if result.failure is not None:
-            log.warning("history fetch failed (%s): %s", result.failure.kind, result.failure.message)
-            self.store.conn.commit()
-            return
-        self.store.save_history(result.body, result.etag, now)
-        self.store.conn.commit()
-        log.info("history snapshot stored events=%s", len(result.body.get("events") or []))
+        log.info("history snapshot validated events=%s", len(body.get("events") or []))
 
     def month(self, timezone_name: str | None = None) -> tuple[int, int]:
         zone = zone_for(timezone_name, self.timezones[0])
@@ -85,11 +95,12 @@ class HistoryCalendar:
         language = "en" if language == "en" else "zh"
         zone = zone_for(timezone_name, self.timezones[0])
         try:
-            recent = self.store.get_snapshot()
-            history = self.store.get_history()
+            history = self._valid_cache(self.clock.now())
+            if history is None:
+                raise CalendarImageUnavailable("no validated full history")
             model = calendar_model(
-                history["body"] if history else None,
-                recent["body"] if recent else None,
+                history["body"],
+                None,
                 self.clock.now(),
                 zone,
             )
@@ -106,20 +117,35 @@ class HistoryCalendar:
             return None
 
     def _due(self, now: datetime) -> bool:
+        cached = self._valid_cache(now)
+        if cached is None and self.store.has_history() and self.store.get_meta("history_invalid_cache") != "1":
+            return True
         last_attempt = parse_utc(self.store.get_meta("history_attempt_at"))
         if last_attempt is not None and (now - last_attempt).total_seconds() < _MIN_GAP_SECONDS:
             return False
-        cached = self.store.get_history()
         if cached is None:
-            if last_attempt is not None and (now - last_attempt).total_seconds() < self.refresh_seconds:
-                return False
+            return True
+        if self.store.get_meta("calendar_error"):
+            return True
+        if self.store.get_meta("history_recent_etag") != (self.store.get_etag() or ""):
             return True
         fetched = parse_utc(cached["fetched_at"])
         if fetched is None:
             return True
         if any(month_of(fetched, zone_for(name)) != month_of(now, zone_for(name)) for name in self.timezones):
             return True
-        return (now - fetched).total_seconds() >= self.refresh_seconds
+        return (now - fetched).total_seconds() >= min(self.refresh_seconds, 24 * 3600)
+
+    def _valid_cache(self, now: datetime) -> dict[str, Any] | None:
+        try:
+            cached = self.store.get_history()
+            if cached is None:
+                return None
+            validate_snapshot(cached["body"], now)
+            calendar_model(cached["body"], None, now)
+            return cached
+        except Exception:
+            return None
 
     def _note_attempt(self, now: datetime) -> None:
         from tibo_reset_monitor.core.model import format_utc

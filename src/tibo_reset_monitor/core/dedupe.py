@@ -223,6 +223,11 @@ def _build_notice(
 
 def _merge(existing: Notice, incoming: Notice) -> Notice:
     """Keep event metadata and the longer source text when two feeds describe one post."""
+    from tibo_reset_monitor.core.source import source_time
+    if existing.url and incoming.url and existing.url != incoming.url:
+        raise ValueError("source post has conflicting URLs")
+    if existing.published_at and incoming.published_at and source_time(existing.published_at) != source_time(incoming.published_at):
+        raise ValueError("source post has conflicting publication times")
     return Notice(
         dedupe_key=existing.dedupe_key,
         post_key=existing.post_key,

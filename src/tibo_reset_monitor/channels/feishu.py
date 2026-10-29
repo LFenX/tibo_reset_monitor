@@ -126,6 +126,10 @@ class FeishuChannel:
         payload = _json_object(response.body)
         code = payload.get("code") if payload else None
         msg = str(payload.get("msg") or "") if payload else ""
+        if type(code) is not int:
+            return Receipt("ambiguous", detail="Feishu returned an invalid receipt")
+        if code == 0 and response.status != 200:
+            return Receipt("ambiguous", detail="Feishu returned a contradictory response")
         if response.status == 429 or code == 99991400:
             retry_after = parse_retry_after(response.headers.get("retry-after"))
             return Receipt("retryable", detail=f"Feishu rate limited: {msg or response.status}", retry_after_seconds=retry_after)
@@ -136,7 +140,12 @@ class FeishuChannel:
         if response.status == 200 and code == 0:
             data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
             message_id = data.get("message_id")
-            return Receipt("sent", provider_message_id=str(message_id) if message_id else None, detail="sent")
+            chat_id = data.get("chat_id")
+            if (not isinstance(message_id, str) or not message_id.strip()
+                    or not isinstance(chat_id, str) or not chat_id.strip()
+                    or (message["receive_id_type"] == "chat_id" and chat_id != message["receive_id"])):
+                return Receipt("ambiguous", detail="Feishu receipt has no valid message id or matching chat")
+            return Receipt("sent", provider_message_id=message_id, detail="sent")
         detail = _feishu_detail(response.status, code, msg)
         if response.status in (400, 401, 403, 404) or code in _PERMANENT_CODES or _looks_permanent(msg):
             return Receipt("permanent", detail=detail)
