@@ -107,6 +107,7 @@ def _posts(posts: Any, label: str, now: datetime | None) -> None:
     identities: set[str] = set()
     for post in posts:
         _record(post, label, now)
+        source_time(post.get("publishedAt"), f"{label}.publishedAt")
         identity = post.get("id")
         if not isinstance(identity, str) or not identity or identity in identities:
             raise SnapshotError(f"{label} ids must be nonempty and unique")

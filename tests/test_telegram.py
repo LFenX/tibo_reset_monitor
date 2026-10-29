@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from tests.support import SafetyFixture
+from unittest.mock import patch
+from tests.support import target
+from tibo_reset_monitor.core.http import UrllibTransport
 
 from tests.support import make_event, make_post, snapshot
 from tibo_reset_monitor.channels.telegram import TelegramChannel, escape_html
@@ -483,6 +487,47 @@ def _form(call: dict) -> dict:
         parts[name] = data if name == "photo" else data.decode("utf-8")
     return parts
 
+
+class TelegramAcknowledgmentLossTest(SafetyFixture):
+    def test_post_acceptance_connection_reset_is_not_a_clear_telegram_failure(self):
+        class AcceptedResponse:
+            status = 200
+            headers = {}
+
+            def __init__(inner, lose_ack):
+                inner.lose_ack = lose_ack
+
+            def getcode(inner):
+                return 200
+
+            def geturl(inner):
+                return "https://api.telegram.org/botvirtual/sendMessage"
+
+            def read(inner):
+                if inner.lose_ack:
+                    raise ConnectionResetError("synthetic reset after provider accepted request")
+                return json.dumps({"ok": True, "result": {"message_id": 2,
+                                   "chat": {"id": -100424242}}}).encode()
+
+        class AcceptedOpener:
+            accepted = 0
+
+            def open(inner, request, timeout):
+                inner.accepted += 1
+                return AcceptedResponse(inner.accepted == 1)
+
+        opener = AcceptedOpener()
+        spec = ChannelSpec("telegram", True, {"bot_token_env": "ADVERSARIAL_R1_SYNTHETIC_TOKEN"},
+                           [target("telegram", "virtual-destination", address="-100424242")])
+        self.channel = TelegramChannel(spec, UrllibTransport(opener=opener), self.clock)
+        with patch.dict(os.environ, {"ADVERSARIAL_R1_SYNTHETIC_TOKEN": "synthetic-token"}):
+            self.baseline()
+            first = self.cycle(self.body())
+            self.clock.advance(60)
+            second = self.cycle(self.body())
+        self.assertEqual(opener.accepted, 1,
+                         {"accepted": opener.accepted, "first": first.deliveries,
+                          "second": second.deliveries, "counts": self.store.outbox_counts()})
 
 if __name__ == "__main__":
     unittest.main()

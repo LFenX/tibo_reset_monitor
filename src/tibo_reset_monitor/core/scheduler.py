@@ -165,8 +165,8 @@ def deliver_due(
                 body = validate_snapshot(snapshot["body"], now) if snapshot else None
                 current = extract_notices(body) if body else []
                 safe = (body is not None and store.automatic_valid(row, body, now)
-                        and any(item.post_key == row.notice.post_key and source_time(item.published_at) == source_time(row.notice.published_at)
-                                and item.url == row.notice.url for item in current)
+                        and any(item.post_key == row.notice.post_key and source_time(item.published_at) == source_time(row.source_published_at)
+                                and item.url == row.source_url for item in current)
                         and target is not None and row.target_address == target.address and not store.duplicate_automatic(row))
             except Exception:
                 safe = False
@@ -194,22 +194,28 @@ def deliver_due(
                 store.conn.commit()
                 reports.append(_delivery_report(row.channel, row.target_key, "deferred", "render failed"))
                 continue
-        if not store.claim(row.id, now):
-            continue
-        store.conn.commit()
-        claimed = store.read_row(row.id)
-        if claimed.state.status != INFLIGHT:
-            continue
-        receipt = _send(channel, target, claimed)
-        decided_at = clock.now()
-        if receipt.outcome == "ambiguous" and claimed.state.first_ambiguous_at is None:
-            claimed.state.first_ambiguous_at = now
-        decision = on_receipt(claimed.state, receipt, decided_at)
-        if receipt.outcome == "ambiguous" and getattr(channel, "supports_idempotency", True) is False:
-            decision.status = "needs_review"
-            decision.next_attempt_at = None
-        if not store.apply_state(claimed.id, decision, decided_at):
-            continue
+        with store.delivery_guard(row.id) as owned:
+            claimed_at = clock.now()
+            timeout = float(getattr(channel, "_timeout", 20))
+            timeout = timeout if math.isfinite(timeout) and timeout >= 0 else 20
+            lease_until = claimed_at + timedelta(seconds=max(600, timeout * 8 + 60))
+            if not owned or not store.claim(row.id, claimed_at, lease_until=lease_until):
+                continue
+            store.conn.commit()
+            claimed = store.read_row(row.id)
+            if claimed.state.status != INFLIGHT:
+                continue
+            receipt = _send(channel, target, claimed)
+            decided_at = clock.now()
+            if receipt.outcome == "ambiguous" and claimed.state.first_ambiguous_at is None:
+                claimed.state.first_ambiguous_at = claimed_at
+            decision = on_receipt(claimed.state, receipt, decided_at)
+            if receipt.outcome == "ambiguous" and getattr(channel, "supports_idempotency", True) is False:
+                decision.status = "needs_review"
+                decision.next_attempt_at = None
+            if not store.apply_state(claimed.id, decision, decided_at):
+                continue
+            store.conn.commit()
         if target is not None and target.options.get("subscription") == "1":
             if decision.status == SENT:
                 store.record_subscription_result(claimed.channel, claimed.target_key, ok=True, detail="", now=decided_at)
@@ -264,11 +270,14 @@ def _recover(store: StateStore, now: Any) -> None:
         return
     updates = {}
     for row in rows:
+        if store.delivery_active(row.id) or (row.lease_until is not None and now < row.lease_until):
+            continue
         row.state.first_ambiguous_at = row.state.first_ambiguous_at or row.attempted_at
         updates[row.id] = on_recover(row.state, now)
     store.recover_inflight(updates, now)
     store.conn.commit()
-    log.warning("recovered %s in-flight deliveries as ambiguous", len(rows))
+    if updates:
+        log.warning("recovered %s in-flight deliveries as ambiguous", len(updates))
 
 
 def effective_targets(channels: Sequence[ChannelAdapter], store: StateStore) -> list[Target]:

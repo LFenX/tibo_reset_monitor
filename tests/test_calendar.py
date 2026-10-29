@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from tests.support import SafetyFixture
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -118,7 +119,7 @@ class CalendarModelTest(unittest.TestCase):
                 _event(
                     "base",
                     updatedAt="2026-09-02T00:00:00.000+08:00",
-                    posts=[{"id": "amend-post", "stage": "补充说明"}],
+                    posts=[{"id": "amend-post", "stage": "补充说明", "publishedAt": "2026-10-02T00:00:00Z"}],
                 ),
                 _event(
                     "follow",
@@ -126,7 +127,7 @@ class CalendarModelTest(unittest.TestCase):
                     confirmationBasis="source_post",
                     confirmedAt="2026-10-03T00:00:00.000+08:00",
                     occurredOn="2026-10-03",
-                    posts=[{"id": "follow-post", "stage": "确认完成", "context": [{"id": "amend-post"}]}],
+                    posts=[{"id": "follow-post", "stage": "确认完成", "publishedAt": "2026-10-03T00:00:00Z", "context": [{"id": "amend-post"}]}],
                 ),
             ],
         }
@@ -188,14 +189,14 @@ class CalendarModelTest(unittest.TestCase):
         recent = {
             "historyFrom": "2026-10-01T00:00:00.000+08:00",
             "events": [
-                _event("base", posts=[{"id": "amend-post", "stage": "补充说明"}]),
+                _event("base", posts=[{"id": "amend-post", "stage": "补充说明", "publishedAt": "2026-10-02T00:00:00Z"}]),
                 _event(
                     "explicit",
                     confirmationBasis="source_post",
                     confirmedAt="2026-10-04T00:00:00.000+08:00",
                     occurredOn="2026-10-04",
                     presentation={"kindExplicit": True, "status": "confirmed"},
-                    posts=[{"id": "follow", "stage": "确认完成", "context": [{"id": "amend-post"}]}],
+                    posts=[{"id": "follow", "stage": "确认完成", "publishedAt": "2026-10-04T00:00:00Z", "context": [{"id": "amend-post"}]}],
                 ),
             ],
         }
@@ -651,6 +652,18 @@ class HistoryCacheTest(TempStoreTest):
         image = Image.open(io.BytesIO(png))
         self.assertEqual(image.size[1], canvas_height(6))
 
+
+class FutureHistoryMetadataTest(SafetyFixture):
+    def test_future_history_cache_metadata_does_not_suspend_daily_refresh(self):
+        body = snapshot([])
+        self.store.save_history(body, 'W/"future-cache"', self.clock.now() + timedelta(days=3))
+        source = ScriptedSource([ok(snapshot([]), etag='W/"recovered"')])
+        calendar = HistoryCalendar(self.store, source, self.clock, refresh_seconds=7 * 24 * 3600)
+        self.clock.advance(24 * 3600 + 1)
+        calendar.refresh()
+        self.assertEqual(len(source.etags), 1,
+                         {"fetches": source.etags, "history": self.store.get_history(),
+                          "attempt_at": self.store.get_meta("history_attempt_at")})
 
 if __name__ == "__main__":
     unittest.main()

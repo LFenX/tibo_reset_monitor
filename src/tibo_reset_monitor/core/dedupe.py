@@ -82,7 +82,9 @@ def extract_notices(snapshot: dict[str, Any]) -> list[Notice]:
                 continue
             stage = canonical_stage(raw_stage)
             key = (str(post["id"]), stage)
-            notices[key] = _notice_from_post(event, post, stage, raw_stage if isinstance(raw_stage, str) else None)
+            incoming = _notice_from_post(event, post, stage, raw_stage)
+            existing = notices.get(key)
+            notices[key] = _merge(existing, incoming) if existing else incoming
 
     for activity in snapshot.get("activities") or []:
         if not isinstance(activity, dict):

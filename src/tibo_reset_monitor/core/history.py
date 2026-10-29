@@ -121,7 +121,7 @@ class HistoryCalendar:
         if cached is None and self.store.has_history() and self.store.get_meta("history_invalid_cache") != "1":
             return True
         last_attempt = parse_utc(self.store.get_meta("history_attempt_at"))
-        if last_attempt is not None and (now - last_attempt).total_seconds() < _MIN_GAP_SECONDS:
+        if last_attempt is not None and 0 <= (now - last_attempt).total_seconds() < _MIN_GAP_SECONDS:
             return False
         if cached is None:
             return True
@@ -130,7 +130,7 @@ class HistoryCalendar:
         if self.store.get_meta("history_recent_etag") != (self.store.get_etag() or ""):
             return True
         fetched = parse_utc(cached["fetched_at"])
-        if fetched is None:
+        if fetched is None or fetched > now:
             return True
         if any(month_of(fetched, zone_for(name)) != month_of(now, zone_for(name)) for name in self.timezones):
             return True

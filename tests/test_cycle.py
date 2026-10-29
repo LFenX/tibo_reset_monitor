@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import unittest
+from tests.support import SafetyFixture
+import copy
+from datetime import timedelta
 
 from tests.support import (
     FakeClock,
@@ -612,6 +615,185 @@ class SourceSafetyTest(TempStoreTest):
         self.assertEqual((rows[0]["attempts"], rows[0]["status"]), (0, "pending"))
         self.assertEqual((rows[1]["attempts"], rows[1]["status"]), (1, "sent"))
 
+
+class AdversarialDeliveryTest(SafetyFixture):
+    def test_reclassification_does_not_replace_the_queued_source_identity(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="synthetic offline")
+        self.cycle(self.body())
+        changed = self.body(stage="确认完成", published="2026-10-28T04:00:02Z")
+        changed["events"][0]["posts"][0]["url"] = "https://x.com/thsottiaux/status/virtual-other"
+        self.clock.advance(60)
+        self.channel._send = lambda *_: sent()
+        self.cycle(changed)
+        self.assertEqual(len(self.channel.sent), 1)
+        self.assertEqual(self.store.read_row(1).state.status, "needs_review")
+
+    def test_another_process_waits_for_an_active_send_lease(self):
+        from tibo_reset_monitor.core.dedupe import extract_notices
+        self.baseline()
+        self.channel.supports_idempotency = False
+        row = self.store.insert_manual(extract_notices(self.body())[0], self.channel.targets[0],
+                                       self.clock.now(), salt="virtual-leased-orphan")
+        self.store.claim(row.id, self.clock.now(), lease_until=self.clock.now() + timedelta(seconds=600))
+        self.store.conn.commit()
+        self.cycle(snapshot([]))
+        self.assertEqual(self.store.read_row(row.id).state.status, "inflight")
+        self.assertEqual(self.channel.sent, [])
+        self.clock.advance(600)
+        self.cycle(snapshot([]))
+        recovered = self.store.read_row(row.id)
+        self.assertEqual(recovered.state.status, "needs_review")
+        self.assertEqual(recovered.idempotency_key, row.idempotency_key)
+        self.assertEqual(self.channel.sent, [])
+
+    def test_an_already_processed_retraction_does_not_cancel_later_confirmation(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="virtual offline")
+        self.cycle(self.body())
+        withdrawn = self.body(stage="撤回", identity="virtual-withdrawal")
+        self.clock.advance(1)
+        self.cycle(withdrawn)
+        confirmed = self.body(stage="确认完成", identity="virtual-later-confirmation",
+                              published="2026-10-28T04:00:04Z")
+        confirmed["events"][0]["posts"].append(withdrawn["events"][0]["posts"][0])
+        self.clock.advance(1)
+        self.channel._send = lambda *_: sent()
+        self.cycle(confirmed)
+        self.assertTrue(any(item["message"]["stage"] == "confirmation" for item in self.channel.sent))
+
+    def test_missing_publication_must_reject_without_poisoning_seen(self):
+        self.baseline()
+        body = self.body()
+        del body["events"][0]["posts"][0]["publishedAt"]
+        before = self.store.get_snapshot()
+        report = self.cycle(body)
+        actual = {"error": report.fetch_error,
+                  "snapshot_unchanged": self.store.get_snapshot() == before,
+                  "seen": self.store.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0]}
+        self.assertIsNotNone(report.fetch_error, actual)
+        self.assertEqual(self.store.get_snapshot(), before)
+
+    def test_corrected_publication_recovers_without_permanent_suppression(self):
+        self.baseline()
+        bad = self.body()
+        bad["events"][0]["posts"][0]["publishedAt"] = None
+        first = self.cycle(bad)
+        second = self.cycle(self.body())
+        self.assertEqual(len(self.channel.sent), 1,
+                         {"bad_error": first.fetch_error, "good_error": second.fetch_error,
+                          "notices": self.store.list_notices(10), "sends": self.channel.sent})
+
+    def test_same_post_reclassified_to_withdrawal_cancels_old_attempt(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="synthetic offline")
+        self.cycle(self.body())
+        self.clock.advance(60)
+        self.channel._send = lambda *_: sent()
+        report = self.cycle(self.body(stage="撤回"))
+        actual = {"cancelled": report.cancelled, "sends": self.channel.sent,
+                  "counts": self.store.outbox_counts()}
+        self.assertEqual(len(self.channel.sent), 1, actual)
+        self.assertEqual(self.store.outbox_counts().get("cancelled"), 1, actual)
+
+    def test_retraction_outside_new_notice_overlap_still_cancels_pending_event(self):
+        self.baseline()
+        self.channel._send = lambda *_: Receipt("retryable", detail="synthetic offline")
+        original = self.body()
+        self.cycle(original)
+        self.clock.advance(3 * 3600)
+        self.cycle(original)
+        # A valid success at 07:00 establishes a 06:00 new-post cutoff.
+        # Retraction at 05:00 belongs to the current event but is a historical notice.
+        post = make_post("virtual-withdrawal", "撤回")
+        post["publishedAt"] = "2026-10-28T05:00:00Z"
+        changed = copy.deepcopy(original)
+        changed["events"][0]["posts"].append(post)
+        self.clock.advance(60)
+        self.channel._send = lambda *_: sent()
+        before = len(self.channel.sent)
+        report = self.cycle(changed)
+        self.assertEqual(len(self.channel.sent), before,
+                         {"report": report.__dict__, "sends": self.channel.sent,
+                          "counts": self.store.outbox_counts()})
+
+    def test_conflicting_same_stage_post_across_events_must_not_replace_cache(self):
+        self.baseline()
+        first = self.body()
+        second = copy.deepcopy(first["events"][0])
+        second["id"] = "virtual-second-event"
+        second["posts"][0]["publishedAt"] = "2026-10-28T04:00:02Z"
+        second["posts"][0]["url"] = "https://x.com/thsottiaux/status/virtual-other"
+        first["events"].append(second)
+        first["count"] = 2
+        report = self.cycle(first)
+        self.assertIsNotNone(report.fetch_error,
+                             {"error": report.fetch_error, "sends": self.channel.sent})
+
+    def test_reclassification_refreshes_unattempted_target_independently(self):
+        self.channel.targets.append(target("fake", "virtual-unattempted", address="other-virtual-address"))
+        original_render = self.channel.render
+        fail_second = True
+
+        def render(notice, destination):
+            if fail_second and destination.key == "virtual-unattempted":
+                raise ValueError("synthetic pre-send render failure")
+            return original_render(notice, destination)
+
+        self.channel.render = render
+        self.baseline()
+        self.cycle(self.body())
+        second_row = self.store.conn.execute("SELECT * FROM outbox WHERE target_key = 'virtual-unattempted'").fetchone()
+        self.assertEqual(second_row["attempts"], 0)
+        fail_second = False
+        self.clock.advance(60)
+        self.cycle(self.body(stage="确认完成"))
+        latest = self.channel.sent[-1]
+        self.assertEqual(latest["target"], "virtual-unattempted")
+        self.assertEqual(latest["message"]["stage"], "confirmation",
+                         {"second_target": latest, "all_sends": self.channel.sent})
+
+    def test_active_manual_send_is_not_recovered_as_an_orphan_by_a_poll(self):
+        from tibo_reset_monitor.core.dedupe import extract_notices
+        from tibo_reset_monitor.core.scheduler import deliver_due
+        self.baseline()
+        self.channel.supports_idempotency = False
+        nested = False
+
+        def send_during_poll(*_):
+            nonlocal nested
+            if not nested:
+                nested = True
+                self.cycle(snapshot([]))
+            return sent("virtual-ack-after-concurrent-poll")
+
+        self.channel._send = send_during_poll
+        row = self.store.insert_manual(extract_notices(self.body())[0], self.channel.targets[0],
+                                       self.clock.now(), salt="virtual-concurrent-manual")
+        deliver_due(self.store, [self.channel], self.clock, only_row_id=row.id)
+        actual = self.store.read_row(row.id).state
+        self.assertEqual(actual.status, "sent", actual.__dict__)
+
+    def test_trusted_chat_migration_keeps_unattempted_pending_delivery_usable(self):
+        self.channel = ScriptedChannel("telegram", [], lambda *_: sent())
+        self.store.subscribe(channel="telegram", kind="group", address="-10042",
+                             display_name="Virtual migrated group", now=self.clock.now())
+        self.baseline()
+        original_render = self.channel.render
+        self.channel.render = lambda *_: (_ for _ in ()).throw(ValueError("synthetic render unavailable"))
+        self.cycle(self.body())
+        queued = self.store.due_rows(self.clock.now() + timedelta(seconds=60))[0]
+        self.assertEqual(queued.state.attempts, 0)
+        self.store.migrate_chat("telegram", "-10042", "-10099", self.clock.now())
+        self.channel.render = original_render
+        self.clock.advance(60)
+        report = self.cycle(self.body())
+        actual = self.store.read_row(queued.id)
+        self.assertEqual(actual.state.status, "sent",
+                         {"status": actual.state.status, "error": actual.state.last_error,
+                          "stored_address": actual.target_address,
+                          "current_address": self.store.subscription_targets("telegram", "zh", "UTC")[0].address,
+                          "report": report.deliveries})
 
 if __name__ == "__main__":
     unittest.main()

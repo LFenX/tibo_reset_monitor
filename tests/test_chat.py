@@ -6,6 +6,9 @@ import json
 import os
 import threading
 import unittest
+from tests.support import SafetyFixture
+import sqlite3
+from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 
 from tests.support import FakeClock, TempStoreTest, make_event, make_post, snapshot
@@ -563,6 +566,38 @@ class ChatFlowTest(TempStoreTest):
         assert failed is not None
         self.assertIn("暂时", failed.text)
 
+
+class PickerTransactionTest(SafetyFixture):
+    def test_expiry_is_rechecked_after_external_membership_checks(self):
+        controller = self.controller()
+        self.picker(controller)
+        def slow_membership(*_):
+            self.clock.advance(60)
+            return True
+        controller.group_membership = slow_membership
+        controller.handle(self.inbound("virtual-slow-membership-selection", "1"))
+        self.assertEqual(self.store.subscriptions("feishu"), [])
+
+    def test_picker_expires_at_exactly_sixty_seconds_after_ack(self):
+        controller = self.controller()
+        self.picker(controller)
+        self.clock.advance(60)
+        reply = controller.handle(self.inbound("virtual-select-at-60", "1"))
+        self.assertEqual(self.store.subscriptions("feishu"), [],
+                         {"reply": reply.text, "subscriptions": self.store.subscriptions("feishu")})
+
+    def test_selection_failure_keeps_recoverable_session_and_replay(self):
+        controller = self.controller()
+        self.picker(controller)
+        selection = self.inbound("virtual-selection-crash", "1")
+        with patch.object(self.store, "subscribe", side_effect=sqlite3.OperationalError("synthetic transient failure")):
+            with self.assertRaises(sqlite3.OperationalError):
+                controller.handle(selection)
+        replay = controller.handle(selection)
+        actual = {"session": self.store.load_session("feishu", "ou_virtual_reviewer"),
+                  "subscriptions": self.store.subscriptions("feishu"),
+                  "replay_reply": None if replay is None else replay.text}
+        self.assertTrue(actual["session"] is not None or actual["subscriptions"], actual)
 
 if __name__ == "__main__":
     unittest.main()

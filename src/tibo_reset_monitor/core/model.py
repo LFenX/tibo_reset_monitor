@@ -187,6 +187,9 @@ class OutboxRow:
     attempted_at: datetime | None = None
     message: dict[str, Any] | None = None
     queued_at: datetime | None = None
+    lease_until: datetime | None = None
+    source_published_at: str | None = None
+    source_url: str | None = None
 
 
 @dataclass

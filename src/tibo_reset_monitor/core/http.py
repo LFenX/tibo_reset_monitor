@@ -103,8 +103,11 @@ class UrllibTransport:
     ) -> HttpResponse:
         request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
         safe_url = redact_url(url)
+        mutating = method.upper() not in {"GET", "HEAD", "OPTIONS"}
+        response_received = False
         try:
             response = self._opener.open(request, timeout=timeout)
+            response_received = True
             status = getattr(response, "status", response.getcode())
             payload = response.read()
             header_map = _header_map(response.headers)
@@ -120,20 +123,23 @@ class UrllibTransport:
             raise TransportError(f"timeout talking to {safe_url}: {exc}", ambiguous=True) from exc
         except urllib.error.URLError as exc:
             reason = exc.reason
-            ambiguous = isinstance(reason, (TimeoutError, socket.timeout))
+            definitely_not_sent = isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError))
+            ambiguous = isinstance(reason, (TimeoutError, socket.timeout)) or (mutating and not definitely_not_sent)
             raise TransportError(
                 f"request to {safe_url} failed: {reason}",
                 ambiguous=ambiguous,
             ) from exc
         except ssl.SSLError as exc:
-            raise TransportError(f"TLS error talking to {safe_url}: {exc}", ambiguous=False) from exc
+            ambiguous = mutating and (response_received or not isinstance(exc, ssl.SSLCertVerificationError))
+            raise TransportError(f"TLS error talking to {safe_url}: {exc}", ambiguous=ambiguous) from exc
         except OSError as exc:
-            raise TransportError(f"network error talking to {safe_url}: {exc}", ambiguous=False) from exc
+            ambiguous = mutating and (response_received or not isinstance(exc, (socket.gaierror, ConnectionRefusedError)))
+            raise TransportError(f"network error talking to {safe_url}: {exc}", ambiguous=ambiguous) from exc
 
         encoding = header_map.get("content-encoding", "")
         if "gzip" in encoding.lower() and payload:
             try:
                 payload = gzip.decompress(payload)
             except (OSError, EOFError, gzip.BadGzipFile) as exc:
-                raise TransportError(f"gzip body from {safe_url} could not be read", ambiguous=False) from exc
+                raise TransportError(f"gzip body from {safe_url} could not be read", ambiguous=mutating) from exc
         return HttpResponse(status=status, headers=header_map, body=payload, url=redact_url(final_url))

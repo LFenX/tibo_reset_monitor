@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 import os
 import unittest
+from tests.support import SafetyFixture
+from types import SimpleNamespace
+from unittest.mock import patch
+from tibo_reset_monitor.channels.feishu_inbox import collaborator_open_ids
 
 from tests.support import FakeClock, TempStoreTest
 from tibo_reset_monitor.channels.feishu_inbox import (
@@ -288,6 +292,7 @@ class FeishuInboxTest(unittest.TestCase):
                     chat_id = "oc_1"
                     chat_type = "p2p"
                     content = '{"text":"/help"}'
+                    create_time = "1793152800000"
 
                 class sender:
                     sender_type = "user"
@@ -313,6 +318,90 @@ class FeishuInboxTest(unittest.TestCase):
         else:
             self.assertTrue(feishu_sdk_available())
 
+
+class PickerDeliveryTest(SafetyFixture):
+    def test_old_cancel_does_not_clear_a_newer_picker(self):
+        controller = self.controller()
+        self.picker(controller)
+        self.clock.advance(10)
+        fresh = controller.handle(self.inbound("virtual-new-prompt", "/addgroup"))
+        controller.confirm_reply(fresh)
+        with patch("tibo_reset_monitor.channels.feishu_inbox._send_text", return_value=True):
+            handle_feishu_event(object(), controller, self.feishu_event("virtual-old-cancel", "/cancel"))
+        self.assertEqual(self.store.load_session("feishu", "ou_virtual_reviewer")["prompt_id"], "virtual-new-prompt")
+
+    def test_picker_retry_keeps_original_body_and_provider_uuid(self):
+        calls = []
+        class Transport:
+            def send(inner, method, url, headers, body, timeout):
+                calls.append(json.loads(body))
+                response = {"code": 0, "data": {"message_id": "om_virtual_reply", "chat_id": "oc_virtual_dm"}}
+                return HttpResponse(503 if len(calls) == 1 else 200, {}, json.dumps(response).encode(), url)
+        channel = SimpleNamespace(_api_base="https://example.invalid", _timeout=1,
+                                  _transport=Transport(), _access_token=lambda **_: "synthetic-token")
+        event = self.feishu_event("virtual-retryable-prompt", "/addgroup")
+        handle_feishu_event(channel, self.controller(), event)
+        self.assertFalse(self.store.load_session("feishu", "ou_virtual_reviewer")["expires_at"])
+        self.clock.advance(10)
+        restarted = self.controller()
+        restarted.group_catalog = lambda: [("oc_virtual_group", "Renamed group")]
+        handle_feishu_event(channel, restarted, event)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertTrue(calls[0]["uuid"])
+        self.assertLessEqual(len(calls[0]["uuid"]), 50)
+        self.assertTrue(self.store.load_session("feishu", "ou_virtual_reviewer")["expires_at"])
+
+    def test_delayed_old_selection_cannot_choose_from_a_newer_prompt(self):
+        controller = self.controller()
+        self.picker(controller)
+        self.clock.advance(10)
+        new = controller.handle(self.inbound("virtual-new-prompt", "/addgroup"))
+        self.assertTrue(controller.prepare_reply(new))
+        controller.confirm_reply(new)
+        # Feishu carries create_time, but the adapter currently discards it.
+        old_event = SimpleNamespace(event=SimpleNamespace(
+            message=SimpleNamespace(message_id="om_virtual_old_selection", chat_id="oc_virtual_dm",
+                                    chat_type="p2p", content=json.dumps({"text": "1"}),
+                                    create_time="1793160000000"),
+            sender=SimpleNamespace(sender_type="user",
+                                   sender_id=SimpleNamespace(open_id="ou_virtual_reviewer"))))
+        with patch("tibo_reset_monitor.channels.feishu_inbox._send_text", return_value=True):
+            handle_feishu_event(object(), controller, old_event)
+        self.assertEqual(self.store.subscriptions("feishu"), [],
+                         {"subscriptions": self.store.subscriptions("feishu"),
+                          "session": self.store.load_session("feishu", "ou_virtual_reviewer")})
+
+    def test_unknown_collaborator_role_is_not_a_group_management_authority(self):
+        response = {"code": 0, "data": {"collaborators": [
+            {"user_id": "ou_virtual_reviewer", "type": "unknown_role"}]}}
+
+        class Transport:
+            def send(inner, *_):
+                return HttpResponse(200, {}, json.dumps(response).encode(), "https://example.invalid/")
+
+        channel = SimpleNamespace(_access_token=lambda **_: "synthetic-token", _app_id="cli_virtual",
+                                  _api_base="https://example.invalid", _timeout=1, _transport=Transport())
+        controller = ChatController(self.store, self.clock, channel="feishu", language="zh", admins=(),
+                                    extra_admins=lambda: collaborator_open_ids(channel),
+                                    group_catalog=lambda: [("oc_virtual_group", "Virtual group")],
+                                    group_membership=lambda *_: True, require_reply_ack=True)
+        reply = controller.handle(self.inbound("virtual-unknown-role-prompt", "/addgroup"))
+        self.assertIsNone(self.store.load_session("feishu", "ou_virtual_reviewer"),
+                          {"reply": reply.text,
+                           "session": self.store.load_session("feishu", "ou_virtual_reviewer")})
+
+    def test_failed_picker_reply_is_recoverable_on_event_replay_after_restart(self):
+        event = self.feishu_event("om_virtual_prompt_reply_failure", "/addgroup")
+        with patch("tibo_reset_monitor.channels.feishu_inbox._send_text", return_value=False) as failed:
+            handle_feishu_event(object(), self.controller(), event)
+            self.assertEqual(failed.call_count, 1)
+        self.clock.advance(10)
+        with patch("tibo_reset_monitor.channels.feishu_inbox._send_text", return_value=True) as recovered:
+            handle_feishu_event(object(), self.controller(), event)
+        session = self.store.load_session("feishu", "ou_virtual_reviewer")
+        self.assertEqual(recovered.call_count, 1,
+                         {"recovered_attempts": recovered.call_count, "session": session})
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -33,6 +35,7 @@ def inbound_from_fields(
     chat_type: str,
     open_id: str,
     text: str,
+    create_time: str | None = None,
 ) -> Inbound:
     """Build an inbound event from the few fields we keep. Tokens are not accepted."""
     scope = "personal" if chat_type in {"p2p", "private"} else "group"
@@ -44,6 +47,7 @@ def inbound_from_fields(
         user_id=open_id,
         text=text,
         chat_title="",
+        created_at=datetime.fromtimestamp(int(create_time) / 1000, timezone.utc) if create_time is not None else None,
     )
 
 
@@ -111,16 +115,16 @@ def collaborator_open_ids(channel: Any) -> set[str]:
         channel._timeout,
     )
     payload = _object(response.body)
-    if response.status != 200 or payload.get("code") not in (0, None):
+    if response.status != 200 or type(payload.get("code")) is not int or payload["code"] != 0:
         log.warning("Feishu collaborator list is unavailable; set channels.feishu.admins to open_ids")
         return set()
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     found: set[str] = set()
     for item in data.get("collaborators") or data.get("items") or []:
-        if not isinstance(item, dict):
+        if not isinstance(item, dict) or item.get("type") not in {"owner", "administrator", "developer", "operator"}:
             continue
         open_id = item.get("open_id") or item.get("user_id")
-        if isinstance(open_id, str) and open_id:
+        if isinstance(open_id, str) and open_id.startswith("ou_"):
             found.add(open_id)
     return found
 
@@ -194,12 +198,16 @@ def handle_feishu_event(channel: Any, controller: Any, data: Any) -> None:
         sender = data.event.sender.sender_id
         if data.event.sender.sender_type != "user" or not str(sender.open_id or "").startswith("ou_"):
             return
+        create_time = str(getattr(message, "create_time", "") or "")
+        if not create_time.isdecimal() or int(create_time) <= 0 or not message.message_id:
+            raise ValueError("message timestamp or identity is missing")
         inbound = inbound_from_fields(
             message_id=str(message.message_id or ""),
             chat_id=str(message.chat_id or ""),
             chat_type=str(message.chat_type or ""),
             open_id=str(sender.open_id or ""),
             text=text_from_content(str(message.content or "")),
+            create_time=create_time,
         )
     except Exception:
         log.warning("Feishu message could not be read")
@@ -215,7 +223,10 @@ def handle_feishu_event(channel: Any, controller: Any, data: Any) -> None:
         prepare = getattr(controller, "prepare_reply", lambda _reply: True)
         if not prepare(reply):
             return
-        if _send_text(channel, reply.chat_id, reply.text):
+        sent = (_send_text(channel, reply.chat_id, reply.text, idempotency_key=hashlib.sha256(
+                    (reply.picker_user_id + "\x1f" + reply.picker_id + "\x1f" + reply.chat_id).encode()).hexdigest()[:43])
+                if reply.picker_user_id else _send_text(channel, reply.chat_id, reply.text))
+        if sent:
             confirm = getattr(controller, "confirm_reply", lambda _reply: None)
             confirm(reply)
     except Exception as exc:
@@ -228,7 +239,7 @@ def os_secret(channel: Any) -> str:
     return os.environ.get(channel._secret_env, "").strip()
 
 
-def _send_text(channel: Any, chat_id: str, text: str) -> bool:
+def _send_text(channel: Any, chat_id: str, text: str, *, idempotency_key: str | None = None) -> bool:
     from tibo_reset_monitor.core.model import Receipt
 
     token = channel._access_token(force=False)
@@ -240,6 +251,8 @@ def _send_text(channel: Any, chat_id: str, text: str) -> bool:
         "msg_type": "text",
         "content": json.dumps({"text": text}, ensure_ascii=False),
     }
+    if idempotency_key:
+        body["uuid"] = idempotency_key
     response = channel._transport.send(
         "POST",
         f"{channel._api_base}/open-apis/im/v1/messages?receive_id_type=chat_id",
