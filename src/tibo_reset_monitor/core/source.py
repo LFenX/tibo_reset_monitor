@@ -100,8 +100,6 @@ def _record(record: Any, label: str, now: datetime | None) -> None:
 
 
 def _posts(posts: Any, label: str, now: datetime | None) -> None:
-    if posts is None:
-        return
     if not isinstance(posts, list):
         raise SnapshotError(f"{label} must be an array")
     identities: set[str] = set()
@@ -112,9 +110,16 @@ def _posts(posts: Any, label: str, now: datetime | None) -> None:
         if not isinstance(identity, str) or not identity or identity in identities:
             raise SnapshotError(f"{label} ids must be nonempty and unique")
         identities.add(identity)
-        if label == "activities" and post.get("eventIds") is not None:
-            if not isinstance(post["eventIds"], list) or any(not isinstance(item, str) for item in post["eventIds"]):
-                raise SnapshotError("activity eventIds must be an array of strings")
+        if label == "posts":
+            if not isinstance(post.get("stage"), str) or not post["stage"].strip():
+                raise SnapshotError("post stage must be a nonempty string")
+        else:
+            if not isinstance(post.get("kind"), str) or not post["kind"].strip():
+                raise SnapshotError("activity kind must be a nonempty string")
+            if post["kind"] == "event_update" and (not isinstance(post.get("action"), str) or not post["action"].strip()):
+                raise SnapshotError("event update action must be a nonempty string")
+            if not isinstance(post.get("eventIds"), list) or any(not isinstance(item, str) or not item.strip() for item in post["eventIds"]):
+                raise SnapshotError("activity eventIds must be an array of nonempty strings")
 
 
 def automatic_after(body: dict[str, Any], now: datetime, baseline: str, last_success: str | None = None) -> datetime:
@@ -159,16 +164,12 @@ def validate_snapshot(body: Any, now: datetime | None = None) -> dict[str, Any]:
     if body.get("checkedAt") is not None:
         source_time(body["checkedAt"], "checkedAt")
     activities = body.get("activities", [])
-    if activities is None:
-        activities = []
     if not isinstance(activities, list):
         raise SnapshotError("activities must be an array")
     for index, event in enumerate(body["events"]):
         if not isinstance(event, dict) or not event.get("id"):
             raise SnapshotError(f"events[{index}] is missing id")
-        posts = event.get("posts", [])
-        if posts is None:
-            posts = []
+        posts = event.get("posts")
         if not isinstance(posts, list):
             raise SnapshotError(f"events[{index}].posts must be an array")
     for index, activity in enumerate(activities):

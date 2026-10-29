@@ -403,5 +403,111 @@ class PickerDeliveryTest(SafetyFixture):
         self.assertEqual(recovered.call_count, 1,
                          {"recovered_attempts": recovered.call_count, "session": session})
 
+
+class SelectionReplyRegressionTest(SafetyFixture):
+    def test_committed_selection_reply_survives_a_failed_send_and_replay(self):
+        controller = self.controller()
+        self.picker(controller)
+        self.clock.advance(1)
+        event = self.feishu_event('r2-committed-selection', '1', str(int(self.clock.now().timestamp() * 1000)))
+        with patch('tibo_reset_monitor.channels.feishu_inbox._send_text', return_value=False) as first:
+            handle_feishu_event(object(), controller, event)
+        self.assertEqual(first.call_count, 1)
+        self.assertEqual(len(self.store.subscriptions('feishu')), 1)
+        self.clock.advance(10)
+        with patch('tibo_reset_monitor.channels.feishu_inbox._send_text', return_value=True) as replay:
+            handle_feishu_event(object(), self.controller(), event)
+        self.assertEqual(replay.call_count, 1, 'committed response was lost while inbound stayed consumed')
+
+
+class DurableManagementReplyTest(SafetyFixture):
+    def test_result_replay_keeps_uuid_body_and_rechecks_current_access(self):
+        calls = []
+        class Transport:
+            def send(inner, method, url, headers, body, timeout):
+                calls.append(json.loads(body))
+                payload = {"code": 0, "data": {"message_id": "om_virtual_result", "chat_id": "oc_virtual_dm"}}
+                return HttpResponse(503 if len(calls) == 1 else 200, {}, json.dumps(payload).encode(), url)
+        channel = SimpleNamespace(_api_base="https://example.invalid", _timeout=1, _transport=Transport(),
+                                  _access_token=lambda **kwargs: "synthetic-token")
+        controller = self.controller()
+        self.picker(controller)
+        event = self.feishu_event("virtual-result", "1", str(int(self.clock.now().timestamp() * 1000)))
+        handle_feishu_event(channel, controller, event)
+        self.assertEqual(len(calls), 1)
+        revoked = self.controller()
+        revoked.admins = ()
+        handle_feishu_event(channel, revoked, event)
+        self.assertEqual(len(calls), 1)
+        wrong_chat = self.feishu_event("virtual-result", "1")
+        wrong_chat.event.message.chat_id = "oc_another_virtual_dm"
+        handle_feishu_event(channel, self.controller(), wrong_chat)
+        self.assertEqual(len(calls), 1)
+        restored = self.controller()
+        restored.group_catalog = lambda: [("oc_virtual_group", "Renamed virtual group")]
+        handle_feishu_event(channel, restored, event)
+        self.assertEqual(calls[0], calls[1])
+        self.assertTrue(calls[0]["uuid"])
+        handle_feishu_event(channel, self.controller(), event)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(len(self.store.subscriptions("feishu")), 1)
+
+    def test_interrupt_before_result_persistence_rolls_back_claim_and_subscription(self):
+        controller = self.controller()
+        self.picker(controller)
+        event = self.inbound("virtual-interrupted-selection", "1")
+        with patch.object(self.store, "save_inbound_reply", side_effect=KeyboardInterrupt("synthetic interruption")):
+            with self.assertRaises(KeyboardInterrupt):
+                controller.handle(event)
+        self.assertEqual(self.store.subscriptions("feishu"), [])
+        self.assertIsNotNone(self.store.load_session("feishu", event.user_id))
+        self.assertFalse(self.store.has_inbound("feishu", event.event_id))
+        reply = self.controller().handle(event)
+        self.assertEqual(reply.result_id, event.event_id)
+        self.assertEqual(len(self.store.subscriptions("feishu")), 1)
+
+    def test_interrupt_while_saving_prompt_does_not_consume_its_event(self):
+        event = self.inbound("virtual-interrupted-prompt", "/addgroup")
+        with patch.object(self.store, "save_session", side_effect=KeyboardInterrupt("synthetic interruption")):
+            with self.assertRaises(KeyboardInterrupt):
+                self.controller().handle(event)
+        self.assertFalse(self.store.has_inbound("feishu", event.event_id))
+        reply = self.controller().handle(event)
+        self.assertEqual(reply.picker_id, event.event_id)
+        self.assertTrue(self.controller().prepare_reply(reply))
+
+    def test_pending_result_stops_retrying_at_fifty_five_minutes(self):
+        controller = self.controller()
+        self.picker(controller)
+        reply = controller.handle(self.inbound("virtual-expiring-result", "1"))
+        self.assertTrue(controller.prepare_reply(reply))
+        self.clock.advance(3300)
+        self.assertFalse(self.controller().prepare_reply(reply))
+
+    def test_concurrent_same_selection_commits_once_and_returns_same_result(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        controller = self.controller()
+        self.picker(controller)
+        barrier = Barrier(2)
+        def groups():
+            barrier.wait(timeout=5)
+            return [("oc_virtual_group", "Virtual group")]
+        controller.group_catalog = groups
+        event = self.inbound("virtual-concurrent-selection", "1")
+        def handle():
+            try:
+                return controller.handle(event)
+            finally:
+                self.store.close()
+        with patch.object(self.store, "subscribe", wraps=self.store.subscribe) as subscribe:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                replies = [future.result() for future in [pool.submit(handle), pool.submit(handle)]]
+            self.assertEqual(subscribe.call_count, 1)
+        self.assertEqual(replies[0], replies[1])
+        self.assertEqual(replies[0].result_id, event.event_id)
+        self.assertEqual(len(self.store.subscriptions("feishu")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

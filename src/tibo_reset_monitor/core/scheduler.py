@@ -7,7 +7,6 @@ A fetch failure never writes a snapshot. Delivery of one target cannot roll back
 from __future__ import annotations
 
 import logging
-import math
 from datetime import timedelta
 from typing import Any, Protocol, Sequence
 
@@ -21,7 +20,7 @@ from tibo_reset_monitor.core.model import (
     Target,
     utc_now,
 )
-from tibo_reset_monitor.core.outbox import ambiguous_expired, on_receipt, on_recover
+from tibo_reset_monitor.core.outbox import ambiguous_expired, on_receipt, on_recover, send_lease_until, validated_receipt
 from tibo_reset_monitor.core.store import StateStore
 from tibo_reset_monitor.core.source import automatic_after, automatic_eligible, source_time, validate_snapshot
 
@@ -196,9 +195,7 @@ def deliver_due(
                 continue
         with store.delivery_guard(row.id) as owned:
             claimed_at = clock.now()
-            timeout = float(getattr(channel, "_timeout", 20))
-            timeout = timeout if math.isfinite(timeout) and timeout >= 0 else 20
-            lease_until = claimed_at + timedelta(seconds=max(600, timeout * 8 + 60))
+            lease_until = send_lease_until(claimed_at, getattr(channel, "_timeout", 20))
             if not owned or not store.claim(row.id, claimed_at, lease_until=lease_until):
                 continue
             store.conn.commit()
@@ -246,15 +243,7 @@ def _send(channel: ChannelAdapter, target: Target, row: Any) -> Receipt:
         return Receipt("retryable", detail=f"render failed: {type(exc).__name__}")
     try:
         receipt = channel.send(message, target, row.idempotency_key)
-        if not isinstance(receipt, Receipt) or receipt.outcome not in {"sent", "retryable", "ambiguous", "permanent"}:
-            return Receipt("ambiguous", detail="channel returned an invalid receipt")
-        retry = receipt.retry_after_seconds
-        if (not isinstance(receipt.detail, str) or (retry is not None and
-                (isinstance(retry, bool) or not isinstance(retry, (int, float)) or not math.isfinite(retry) or retry < 0))):
-            return Receipt("ambiguous", detail="channel returned invalid receipt fields")
-        if receipt.outcome == "sent" and (not isinstance(receipt.provider_message_id, str) or not receipt.provider_message_id.strip()):
-            return Receipt("ambiguous", detail="channel returned no message id")
-        return receipt
+        return validated_receipt(receipt)
     except TimeoutError as exc:
         return Receipt("ambiguous", detail="send timed out")
     except OSError as exc:

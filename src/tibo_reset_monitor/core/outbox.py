@@ -10,6 +10,7 @@ an hour, so the review cutoff stays inside that window.
 from __future__ import annotations
 
 import hashlib
+import math
 from datetime import datetime, timedelta
 
 from tibo_reset_monitor.core.model import (
@@ -27,6 +28,27 @@ from tibo_reset_monitor.core.model import (
 _CLEAR_BASE_SECONDS = 30
 _AMBIGUOUS_BASE_SECONDS = 120
 _MAX_DELAY_SECONDS = 900
+
+
+def validated_receipt(receipt: object) -> Receipt:
+    if not isinstance(receipt, Receipt) or receipt.outcome not in {"sent", "retryable", "ambiguous", "permanent"}:
+        return Receipt("ambiguous", detail="channel returned an invalid receipt")
+    retry = receipt.retry_after_seconds
+    if (not isinstance(receipt.detail, str) or (retry is not None and
+            (isinstance(retry, bool) or not isinstance(retry, (int, float)) or not math.isfinite(retry) or retry < 0))):
+        return Receipt("ambiguous", detail="channel returned invalid receipt fields")
+    if receipt.outcome == "sent" and (not isinstance(receipt.provider_message_id, str) or not receipt.provider_message_id.strip()):
+        return Receipt("ambiguous", detail="channel returned no message id")
+    return receipt
+
+
+def send_lease_until(now: datetime, timeout: object = 20) -> datetime:
+    try:
+        seconds = float(timeout)
+    except (ValueError, TypeError, OverflowError):
+        seconds = 20
+    seconds = seconds if math.isfinite(seconds) and seconds >= 0 else 20
+    return now + timedelta(seconds=max(600, seconds * 8 + 60))
 
 
 def idempotency_key(dedupe_key: str, channel: str, target_key: str, *, salt: str = "") -> str:

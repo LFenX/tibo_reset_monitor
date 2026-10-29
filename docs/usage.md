@@ -100,6 +100,8 @@ Source failures and interrupted checks block automatic delivery until a valid re
 
 Automatic queue entries retain their original publication time, source URL, time boundary and destination. Active sends retain a durable lease so another poll cannot mistake them for an interrupted send. After a restart, recovery waits for that lease to expire: ten minutes by default, extended for longer configured request timeouts.
 
+An explicit manual delivery keeps the selected notice's content from queue creation, even before its first attempt. Withdrawals cover every associated event. Startup guides use the same acknowledgment, unknown-result cutoff and active-send protection; `/start` does not retry an unknown Telegram guide.
+
 ## Language, time zone, and calendars
 
 Notifications default to Chinese. Set `language` to `en` or `zh` globally, per channel, or per target; the most specific value wins. English notifications use the original post text. `timezone` follows the same order and accepts an IANA name such as `Asia/Shanghai` or `America/Los_Angeles`. Times include the recipient's current UTC offset.

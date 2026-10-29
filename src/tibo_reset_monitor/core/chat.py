@@ -78,6 +78,9 @@ class Reply:
     text: str
     picker_user_id: str = ""
     picker_id: str = ""
+    result_id: str = ""
+    result_user_id: str = ""
+    result_group_id: str = ""
 
 
 @dataclass
@@ -159,7 +162,19 @@ class ChatController:
         if inbound.channel != self.channel:
             return None
         now = self.clock.now()
-        if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, now):
+        command, argument = _split_command(inbound.text)
+        selection = (command is None and inbound.scope == "personal" and bool(inbound.text.strip())
+                     and not inbound.migrate_to and not inbound.membership
+                     and self.store.load_session(self.channel, inbound.user_id) is not None)
+        deferred_claim = selection or (inbound.scope == "personal" and command in {"add_group", "remove_group"})
+        duplicate = False
+        if inbound.event_id:
+            duplicate = (self.store.has_inbound(self.channel, inbound.event_id) if deferred_claim else
+                         not self.store.claim_inbound(self.channel, inbound.event_id, now))
+        if duplicate:
+            result = self._result_reply(inbound)
+            if result is not None:
+                return result
             session = self.store.load_session(self.channel, inbound.user_id)
             if (inbound.scope == "personal" and session and not session["expires_at"]
                     and session["prompt_id"] == inbound.event_id and session["chat_id"] == inbound.chat_id
@@ -175,7 +190,6 @@ class ChatController:
         if not inbound.text.strip():
             return None
         self._extra_loaded = False
-        command, argument = _split_command(inbound.text)
         if command == "cancel":
             session = self.store.load_session(self.channel, inbound.user_id)
             if inbound.scope != "personal" or (session and session["chat_id"] != inbound.chat_id):
@@ -272,7 +286,7 @@ class ChatController:
         removed = self.store.unsubscribe(self.channel, "group", chat_id, now, reason="unsubscribed")
         return Reply(reply_chat, self._t("group_off" if removed else "group_off_none", name=title))
 
-    def _open_picker(self, inbound: Inbound, command: str, now: datetime) -> Reply:
+    def _open_picker(self, inbound: Inbound, command: str, now: datetime) -> Reply | None:
         previous = self.store.load_session(self.channel, inbound.user_id)
         if previous and self._older_than_session(inbound, previous):
             return Reply(inbound.chat_id, self._t("expired"))
@@ -311,9 +325,19 @@ class ChatController:
         for index, item in enumerate(payload, start=1):
             lines.append(self._t("choice", index=str(index), name=item["title"], tail=_tail(item["id"])))
         text = "\n".join(lines)
-        self.store.save_session(self.channel, inbound.user_id, command, payload,
-                                None if self.require_reply_ack else now + timedelta(seconds=SESSION_SECONDS),
-                                chat_id=inbound.chat_id, prompt_id=inbound.event_id, started_at=now, reply_text=text)
+        with self.store.transaction():
+            if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, self.clock.now()):
+                current = self.store.load_session(self.channel, inbound.user_id)
+                if (current and not current["expires_at"] and current["prompt_id"] == inbound.event_id
+                        and current["chat_id"] == inbound.chat_id):
+                    return Reply(inbound.chat_id, current["reply_text"], inbound.user_id, inbound.event_id)
+                return None
+            current = self.store.load_session(self.channel, inbound.user_id)
+            if current and self._older_than_session(inbound, current):
+                return Reply(inbound.chat_id, self._t("expired"))
+            self.store.save_session(self.channel, inbound.user_id, command, payload,
+                                    None if self.require_reply_ack else now + timedelta(seconds=SESSION_SECONDS),
+                                    chat_id=inbound.chat_id, prompt_id=inbound.event_id, started_at=now, reply_text=text)
         return Reply(inbound.chat_id, text, inbound.user_id, inbound.event_id)
 
     @staticmethod
@@ -323,6 +347,22 @@ class ChatController:
 
     def prepare_reply(self, reply: Reply) -> bool:
         """Recheck sensitive picker data immediately before the adapter sends it."""
+        if reply.result_id:
+            payload = self.store.inbound_reply(self.channel, reply.result_id)
+            created = parse_utc(payload.get("created_at")) if payload else None
+            self._extra_loaded = False
+            valid = bool(payload and payload.get("user_id") == reply.result_user_id
+                         and payload.get("chat_id") == reply.chat_id and payload.get("text") == reply.text
+                         and payload.get("group_id") == reply.result_group_id and created
+                         and 0 <= (self.clock.now() - created).total_seconds() < 55 * 60
+                         and self._is_admin(reply.result_user_id))
+            if valid and self.group_membership is not None:
+                try:
+                    valid = self.group_membership(reply.result_user_id, reply.result_group_id)
+                except Exception:
+                    valid = False
+            self._extra_loaded = False
+            return bool(valid and self._is_admin(reply.result_user_id))
         if not reply.picker_user_id:
             return True
         self._extra_loaded = False
@@ -347,11 +387,21 @@ class ChatController:
         return valid
 
     def confirm_reply(self, reply: Reply) -> None:
+        if reply.result_id:
+            self.store.confirm_inbound_reply(self.channel, reply.result_id, reply.result_user_id, reply.chat_id)
         if reply.picker_user_id:
             self.store.confirm_session(self.channel, reply.picker_user_id, reply.picker_id,
                                        self.clock.now() + timedelta(seconds=SESSION_SECONDS))
 
-    def _select(self, inbound: Inbound, text: str, now: datetime) -> Reply:
+    def _result_reply(self, inbound: Inbound) -> Reply | None:
+        payload = self.store.inbound_reply(self.channel, inbound.event_id)
+        if (payload and inbound.scope == "personal" and payload.get("user_id") == inbound.user_id
+                and payload.get("chat_id") == inbound.chat_id):
+            return Reply(inbound.chat_id, payload["text"], result_id=inbound.event_id,
+                         result_user_id=inbound.user_id, result_group_id=payload["group_id"])
+        return None
+
+    def _select(self, inbound: Inbound, text: str, now: datetime) -> Reply | None:
         session = self.store.load_session(self.channel, inbound.user_id)
         if session is None:
             return Reply(inbound.chat_id, self._t("help"))
@@ -388,23 +438,28 @@ class ChatController:
         if groups is None or str(chosen["id"]) not in {identity for identity, _title in groups} or not member or not self._is_admin(inbound.user_id):
             self.store.clear_session(self.channel, inbound.user_id)
             return Reply(inbound.chat_id, self._t("list_failed"))
-        try:
-            with self.store.transaction():
-                current = self.store.load_session(self.channel, inbound.user_id)
-                current_expiry = parse_utc(current["expires_at"]) if current else None
-                at_commit = self.clock.now()
-                if (not current or current["prompt_id"] != session["prompt_id"] or
-                        current["chat_id"] != inbound.chat_id or current_expiry is None or at_commit >= current_expiry):
-                    return Reply(inbound.chat_id, self._t("expired"))
-                if not self.store.clear_session(self.channel, inbound.user_id, prompt_id=session["prompt_id"], commit=False):
-                    return Reply(inbound.chat_id, self._t("expired"))
-                if session["action"] == "add_group":
-                    return self._subscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, at_commit)
-                return self._unsubscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, at_commit)
-        except Exception:
-            if inbound.event_id:
-                self.store.release_inbound(self.channel, inbound.event_id)
-            raise
+        with self.store.transaction():
+            if inbound.event_id and not self.store.claim_inbound(self.channel, inbound.event_id, self.clock.now()):
+                return self._result_reply(inbound)
+            current = self.store.load_session(self.channel, inbound.user_id)
+            current_expiry = parse_utc(current["expires_at"]) if current else None
+            at_commit = self.clock.now()
+            if (not current or current["prompt_id"] != session["prompt_id"] or
+                    current["chat_id"] != inbound.chat_id or current_expiry is None or at_commit >= current_expiry):
+                return Reply(inbound.chat_id, self._t("expired"))
+            if not self.store.clear_session(self.channel, inbound.user_id, prompt_id=session["prompt_id"], commit=False):
+                return Reply(inbound.chat_id, self._t("expired"))
+            if session["action"] == "add_group":
+                result = self._subscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, at_commit)
+            else:
+                result = self._unsubscribe_group(str(chosen["id"]), str(chosen["title"]), inbound.chat_id, at_commit)
+            if self.require_reply_ack and inbound.event_id:
+                self.store.save_inbound_reply(self.channel, inbound.event_id, {
+                    "user_id": inbound.user_id, "chat_id": inbound.chat_id, "group_id": str(chosen["id"]),
+                    "text": result.text, "created_at": at_commit.isoformat(),
+                })
+                return self._result_reply(inbound)
+            return result
 
     def _status(self) -> str:
         rows = self.store.subscriptions(self.channel)

@@ -153,6 +153,7 @@ def _notice_from_activity(
         event=event,
         source_event_id=event_id,
         contexts=_contexts(activity.get("context")),
+        source_event_ids=tuple(activity.get("eventIds") or ()),
     )
 
 
@@ -168,6 +169,7 @@ def _build_notice(
     event: dict[str, Any] | None,
     source_event_id: str | None,
     contexts: tuple[dict[str, str], ...] = (),
+    source_event_ids: tuple[str, ...] = (),
 ) -> Notice:
     presentation = event.get("presentation") if event else None
     if not isinstance(presentation, dict):
@@ -220,6 +222,7 @@ def _build_notice(
         qualified_scope=qualified_scope,
         tag_label=_event_tag(event),
         contexts=contexts,
+        source_event_ids=source_event_ids,
     )
 
 
@@ -256,6 +259,7 @@ def _merge(existing: Notice, incoming: Notice) -> Notice:
         qualified_scope=existing.qualified_scope or incoming.qualified_scope,
         tag_label=existing.tag_label or incoming.tag_label,
         contexts=existing.contexts or incoming.contexts,
+        source_event_ids=tuple(dict.fromkeys((*existing.event_ids, *incoming.event_ids))),
     )
 
 

@@ -223,9 +223,10 @@ def handle_feishu_event(channel: Any, controller: Any, data: Any) -> None:
         prepare = getattr(controller, "prepare_reply", lambda _reply: True)
         if not prepare(reply):
             return
+        identity = (reply.picker_user_id, reply.picker_id) if reply.picker_user_id else (reply.result_user_id, reply.result_id)
         sent = (_send_text(channel, reply.chat_id, reply.text, idempotency_key=hashlib.sha256(
-                    (reply.picker_user_id + "\x1f" + reply.picker_id + "\x1f" + reply.chat_id).encode()).hexdigest()[:43])
-                if reply.picker_user_id else _send_text(channel, reply.chat_id, reply.text))
+                    (identity[0] + "\x1f" + identity[1] + "\x1f" + reply.chat_id).encode()).hexdigest()[:43])
+                if identity[0] else _send_text(channel, reply.chat_id, reply.text))
         if sent:
             confirm = getattr(controller, "confirm_reply", lambda _reply: None)
             confirm(reply)

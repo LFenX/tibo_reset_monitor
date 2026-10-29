@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import unittest
+from tibo_reset_monitor.core.scheduler import deliver_due
+from tibo_reset_monitor.core.model import format_utc
 from tests.support import SafetyFixture
 import copy
 from datetime import timedelta
@@ -794,6 +796,157 @@ class AdversarialDeliveryTest(SafetyFixture):
                           "stored_address": actual.target_address,
                           "current_address": self.store.subscription_targets("telegram", "zh", "UTC")[0].address,
                           "report": report.deliveries})
+
+
+class SourceLifecycleRegressionTest(SafetyFixture):
+    def hold_render(self):
+        original = self.channel.render
+        self.channel.render = lambda *_: (_ for _ in ()).throw(ValueError('synthetic render unavailable'))
+        return original
+
+    def test_multi_event_withdrawal_cancels_every_associated_event(self):
+        self.baseline()
+        first = self.body(identity='r2-first')
+        second_event = copy.deepcopy(first['events'][0])
+        second_event['id'] = 'r2-second-event'
+        second_event['posts'][0]['id'] = 'r2-second'
+        second_event['posts'][0]['url'] = 'https://x.com/thsottiaux/status/r2-second'
+        first['events'].append(second_event)
+        first['count'] = 2
+        self.channel._send = lambda *_: Receipt('retryable', detail='synthetic reject')
+        self.cycle(first)
+        self.clock.advance(60)
+        withdrawal = make_activity('r2-withdrawal', 'withdraw', 'virtual-event')
+        withdrawal['eventIds'] = ['virtual-event', 'r2-second-event']
+        withdrawal['publishedAt'] = format_utc(self.clock.now())
+        changed = copy.deepcopy(first)
+        changed['activities'] = [withdrawal]
+        self.channel._send = lambda *_: sent()
+        report = self.cycle(changed)
+        actual = [dict(row) for row in self.store.conn.execute('SELECT n.post_key, o.status FROM outbox o JOIN notices n ON n.id=o.notice_id ORDER BY o.id')]
+        statuses = {row['post_key']: row['status'] for row in actual}
+        self.assertEqual(statuses['r2-first'], 'cancelled', actual)
+        self.assertEqual(statuses['r2-second'], 'cancelled', actual)
+
+    def test_manual_unattempted_delivery_keeps_explicitly_selected_content(self):
+        self.baseline()
+        original_render = self.hold_render()
+        original = self.body()
+        original['events'][0]['posts'][0].update(text='r2-original', fullText='r2-original')
+        self.cycle(original)
+        notice = self.store.get_notice(self.store.list_notices(1)[0]['id'])
+        row = self.store.enqueue_existing(notice, self.channel.targets[0], self.clock.now(), salt='r2-explicit')
+        deliver_due(self.store, [self.channel], self.clock, only_row_id=row.id)
+        self.assertEqual(self.store.read_row(row.id).state.attempts, 0)
+        changed = self.body(stage='确认完成')
+        changed['events'][0]['posts'][0].update(text='r2-source-changed', fullText='r2-source-changed')
+        self.clock.advance(60)
+        self.channel.render = original_render
+        self.cycle(changed)
+        actual = self.channel.sent[-1]
+        self.assertEqual(actual['message']['text'], 'r2-original', actual)
+        self.assertEqual(actual['message']['stage'], 'announcement', actual)
+
+    def test_missing_stage_rejects_without_cancelling_valid_pending(self):
+        self.baseline()
+        original_render = self.hold_render()
+        good = self.body()
+        self.cycle(good)
+        before = self.store.get_snapshot()
+        bad = copy.deepcopy(good)
+        del bad['events'][0]['posts'][0]['stage']
+        self.clock.advance(60)
+        report = self.cycle(bad)
+        after_bad = self.store.outbox_counts()
+        cached_after_bad = self.store.get_snapshot()
+        self.channel.render = original_render
+        self.clock.advance(60)
+        restored = self.cycle(good)
+        self.assertIsNotNone(report.fetch_error, {'error': report.fetch_error, 'counts': after_bad})
+        self.assertEqual(len(self.channel.sent), 1)
+
+    def test_null_posts_rejects_without_cancelling_valid_pending(self):
+        self.baseline()
+        original_render = self.hold_render()
+        good = self.body()
+        self.cycle(good)
+        bad = copy.deepcopy(good)
+        bad['events'][0]['posts'] = None
+        self.clock.advance(60)
+        report = self.cycle(bad)
+        after_bad = self.store.outbox_counts()
+        self.channel.render = original_render
+        self.clock.advance(60)
+        self.cycle(good)
+        self.assertIsNotNone(report.fetch_error, {'error': report.fetch_error, 'counts': after_bad})
+        self.assertEqual(len(self.channel.sent), 1)
+
+
+class SourceIdentityRecoveryTest(SafetyFixture):
+    def test_merged_post_keeps_all_event_links_for_withdrawal(self):
+        self.baseline()
+        body = self.body()
+        other = copy.deepcopy(body["events"][0])
+        other["id"] = "virtual-second-event"
+        body["events"].append(other)
+        body["count"] = 2
+        self.channel._send = lambda *args: Receipt("retryable")
+        self.cycle(body)
+        self.assertEqual(set(self.store.read_row(1).notice.event_ids), {"virtual-event", "virtual-second-event"})
+        withdrawal = make_activity("virtual-linked-withdrawal", "withdraw", "virtual-second-event")
+        body["activities"] = [withdrawal]
+        self.clock.advance(60)
+        self.channel._send = lambda *args: sent()
+        self.cycle(body)
+        self.assertEqual(self.store.read_row(1).state.status, "cancelled")
+
+    def test_manual_notice_snapshot_survives_restart_and_source_changes(self):
+        from tibo_reset_monitor.core.store import StateStore
+        self.baseline()
+        self.cycle(self.body())
+        original = self.store.get_notice(1)
+        manual = self.store.enqueue_existing(original, self.channel.targets[0], self.clock.now(), salt="virtual-manual")
+        self.cycle(self.body(stage="确认完成"))
+        restarted = StateStore(self.store.path)
+        try:
+            current = restarted.read_row(manual.id)
+            self.assertFalse(current.automatic)
+            self.assertEqual(current.notice.to_json(), original.to_json())
+        finally:
+            restarted.close()
+
+    def test_outbox_old_ack_cannot_overwrite_a_newer_claim(self):
+        from tibo_reset_monitor.core.model import DeliveryState
+        self.baseline()
+        self.channel.render = lambda *args: (_ for _ in ()).throw(ValueError("synthetic rendering hold"))
+        self.cycle(self.body())
+        self.clock.advance(60)
+        self.assertTrue(self.store.claim(1, self.clock.now()))
+        self.store.recover_inflight({1: DeliveryState("retryable", 1, None, None, None, None, None)}, self.clock.now())
+        self.assertTrue(self.store.claim(1, self.clock.now()))
+        self.assertFalse(self.store.apply_state(1, DeliveryState("sent", 1, None, None, None, "virtual-late-ack", None), self.clock.now()))
+        current = self.store.read_row(1)
+        self.assertEqual((current.state.status, current.state.attempts), ("inflight", 2))
+
+    def test_incomplete_source_identity_fields_reject_before_reconciliation(self):
+        from tibo_reset_monitor.core.source import SnapshotError, validate_snapshot
+        cases = [("post", "stage", None), ("post", "stage", " "),
+                 ("event", "posts", None), ("event", "posts", "missing"),
+                 ("activity", "kind", None), ("activity", "action", None),
+                 ("activity", "eventIds", None), ("activity", "eventIds", [""])]
+        for level, field, value in cases:
+            with self.subTest(level=level, field=field, value=value):
+                body = self.body()
+                body["activities"] = [make_activity("virtual-activity", "confirm", "virtual-event")]
+                record = {"event": body["events"][0], "post": body["events"][0]["posts"][0],
+                          "activity": body["activities"][0]}[level]
+                if value == "missing":
+                    del record[field]
+                else:
+                    record[field] = value
+                with self.assertRaises(SnapshotError):
+                    validate_snapshot(body, self.clock.now())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS guide_delivery (
 
 class StateStore:
     _active_lock = threading.RLock()
-    _active_deliveries: set[tuple[str, int]] = set()
+    _active_deliveries: set[tuple[str, int | tuple[str, ...]]] = set()
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -163,10 +163,12 @@ class StateStore:
         conn.executescript(_SCHEMA)
         with _Transaction(conn):
             columns = {row[1] for row in conn.execute("PRAGMA table_info(outbox)")}
-            for name, definition in (("automatic", "INTEGER NOT NULL DEFAULT 1"), ("automatic_after", "TEXT"), ("target_address", "TEXT"), ("message_json", "TEXT"), ("lease_until", "TEXT"), ("source_published_at", "TEXT"), ("source_url", "TEXT")):
+            for name, definition in (("automatic", "INTEGER NOT NULL DEFAULT 1"), ("automatic_after", "TEXT"), ("target_address", "TEXT"), ("message_json", "TEXT"), ("lease_until", "TEXT"), ("source_published_at", "TEXT"), ("source_url", "TEXT"), ("manual_notice_json", "TEXT")):
                 if name not in columns:
                     conn.execute(f"ALTER TABLE outbox ADD COLUMN {name} {definition}")
             conn.execute("UPDATE outbox SET automatic = 0 WHERE notice_id IN (SELECT id FROM notices WHERE stage = 'manual')")
+            conn.execute("""UPDATE outbox SET manual_notice_json = (SELECT payload_json FROM notices WHERE id = notice_id)
+                            WHERE automatic = 0 AND manual_notice_json IS NULL""")
             for row in conn.execute("""SELECT o.id, n.payload_json FROM outbox o JOIN notices n ON n.id = o.notice_id
                                       WHERE o.automatic = 1 AND o.source_published_at IS NULL""").fetchall():
                 try:
@@ -180,6 +182,13 @@ class StateStore:
             for name in ("chat_id", "prompt_id", "started_at", "reply_text"):
                 if name not in session_columns:
                     conn.execute(f"ALTER TABLE chat_session ADD COLUMN {name} TEXT")
+            inbound_columns = {row[1] for row in conn.execute("PRAGMA table_info(inbound_seen)")}
+            if "reply_json" not in inbound_columns:
+                conn.execute("ALTER TABLE inbound_seen ADD COLUMN reply_json TEXT")
+            guide_columns = {row[1] for row in conn.execute("PRAGMA table_info(guide_delivery)")}
+            for name in ("lease_until", "message_text"):
+                if name not in guide_columns:
+                    conn.execute(f"ALTER TABLE guide_delivery ADD COLUMN {name} TEXT")
         self._local.conn = conn
 
     def _open(self) -> sqlite3.Connection:
@@ -212,7 +221,7 @@ class StateStore:
         return _Transaction(self.conn)
 
     @contextmanager
-    def delivery_guard(self, row_id: int):
+    def delivery_guard(self, row_id: int | tuple[str, ...]):
         identity = (os.path.normcase(str(self.path.resolve())), row_id)
         with self._active_lock:
             owned = identity not in self._active_deliveries
@@ -225,7 +234,7 @@ class StateStore:
                 with self._active_lock:
                     self._active_deliveries.discard(identity)
 
-    def delivery_active(self, row_id: int) -> bool:
+    def delivery_active(self, row_id: int | tuple[str, ...]) -> bool:
         with self._active_lock:
             return (os.path.normcase(str(self.path.resolve())), row_id) in self._active_deliveries
 
@@ -458,7 +467,7 @@ class StateStore:
             # Each target freezes its own attempted message; unattempted targets
             # must still see the current notice, independently of other targets.
             self.conn.execute("UPDATE notices SET payload_json = ? WHERE id = ?", (json.dumps(notice.to_json(), ensure_ascii=False), identity))
-            self.conn.execute("UPDATE outbox SET message_json = NULL WHERE notice_id = ? AND attempts = 0", (identity,))
+            self.conn.execute("UPDATE outbox SET message_json = NULL WHERE notice_id = ? AND automatic = 1 AND attempts = 0", (identity,))
             # Legacy databases may contain more than one classification of a post.
             conflict = self.conn.execute("SELECT id FROM notices WHERE dedupe_key = ? AND id != ?", (notice.dedupe_key, identity)).fetchone()
             if conflict is None:
@@ -473,45 +482,25 @@ class StateStore:
     def cancel_unsent(self, retraction: Notice, now: datetime) -> int:
         statuses = tuple(CANCELLABLE_STATUSES)
         placeholders = ",".join("?" for _ in statuses)
-        if retraction.source_event_id:
+        event_ids = set(retraction.event_ids)
+        cancelled = 0
+        for row in self.automatic_rows():
+            if row.notice.stage == RETRACTION:
+                continue
+            if row.notice.post_key != retraction.post_key and not event_ids.intersection(row.notice.event_ids):
+                continue
             cursor = self.conn.execute(
-                f"""
-                UPDATE outbox
-                SET status = 'cancelled',
-                    next_attempt_at = NULL,
-                    last_error = 'cancelled because the source event was retracted',
-                    updated_at = ?
-                WHERE automatic = 1 AND status IN ({placeholders})
-                  AND notice_id IN (
-                      SELECT id FROM notices
-                      WHERE stage != ?
-                        AND source_event_id = ?
-                  )
-                """,
-                (format_utc(now), *statuses, RETRACTION, retraction.source_event_id),
+                f"""UPDATE outbox SET status = 'cancelled', next_attempt_at = NULL,
+                    last_error = 'cancelled because the source post or associated event was retracted', updated_at = ?
+                    WHERE id = ? AND automatic = 1 AND status IN ({placeholders})""",
+                (format_utc(now), row.id, *statuses),
             )
-        else:
-            cursor = self.conn.execute(
-                f"""
-                UPDATE outbox
-                SET status = 'cancelled',
-                    next_attempt_at = NULL,
-                    last_error = 'cancelled because the source post was retracted',
-                    updated_at = ?
-                WHERE automatic = 1 AND status IN ({placeholders})
-                  AND notice_id IN (
-                      SELECT id FROM notices
-                      WHERE stage != ?
-                        AND post_key = ?
-                  )
-                """,
-                (format_utc(now), *statuses, RETRACTION, retraction.post_key),
-            )
-        return int(cursor.rowcount)
+            cancelled += int(cursor.rowcount)
+        return cancelled
 
     def recover_inflight(self, states_by_id: dict[int, DeliveryState], now: datetime) -> None:
         for row_id, state in states_by_id.items():
-            self._write_state(row_id, state, now)
+            self._write_state(row_id, state, now, only_status=INFLIGHT)
 
     def inflight_rows(self) -> list[OutboxRow]:
         rows = self.conn.execute("SELECT * FROM outbox WHERE status = ?", (INFLIGHT,)).fetchall()
@@ -725,8 +714,8 @@ class StateStore:
             INSERT OR IGNORE INTO outbox(
                 notice_id, channel, target_key, target_kind, idempotency_key, status,
                 attempts, next_attempt_at, created_at, updated_at, automatic, automatic_after, target_address,
-                source_published_at, source_url
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_published_at, source_url, manual_notice_json
+            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 notice.id,
@@ -743,6 +732,7 @@ class StateStore:
                 target.address,
                 notice.published_at,
                 notice.url,
+                json.dumps(notice.to_json(), ensure_ascii=False) if not automatic else None,
             ),
         )
 
@@ -772,8 +762,8 @@ class StateStore:
             row_id,
         ]
         if only_status is not None:
-            sql += " AND status = ?"
-            params.append(only_status)
+            sql += " AND status = ? AND attempts = ?"
+            params.extend((only_status, state.attempts))
         cursor = self.conn.execute(sql, params)
         return int(cursor.rowcount)
 
@@ -782,7 +772,8 @@ class StateStore:
             "SELECT payload_json FROM notices WHERE id = ?",
             (row["notice_id"],),
         ).fetchone()
-        notice = Notice.from_json(json.loads(payload_row["payload_json"]), notice_id=int(row["notice_id"]))
+        payload = row["manual_notice_json"] if not row["automatic"] and row["manual_notice_json"] else payload_row["payload_json"]
+        notice = Notice.from_json(json.loads(payload), notice_id=int(row["notice_id"]))
         state = DeliveryState(
             status=row["status"],
             attempts=int(row["attempts"]),
@@ -824,6 +815,26 @@ class StateStore:
         except sqlite3.IntegrityError:
             return False
         return True
+
+    def has_inbound(self, channel: str, event_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM inbound_seen WHERE channel = ? AND event_id = ?", (channel, event_id)).fetchone() is not None
+
+    def save_inbound_reply(self, channel: str, event_id: str, payload: dict[str, Any]) -> None:
+        self.conn.execute("UPDATE inbound_seen SET reply_json = ? WHERE channel = ? AND event_id = ?",
+                          (json.dumps(payload, ensure_ascii=False, sort_keys=True), channel, event_id))
+
+    def inbound_reply(self, channel: str, event_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute("SELECT reply_json FROM inbound_seen WHERE channel = ? AND event_id = ?", (channel, event_id)).fetchone()
+        if row is None or not row["reply_json"]:
+            return None
+        payload = json.loads(row["reply_json"])
+        return payload if isinstance(payload, dict) else None
+
+    def confirm_inbound_reply(self, channel: str, event_id: str, user_id: str, chat_id: str) -> None:
+        with self.transaction():
+            payload = self.inbound_reply(channel, event_id)
+            if payload and payload.get("user_id") == user_id and payload.get("chat_id") == chat_id:
+                self.conn.execute("UPDATE inbound_seen SET reply_json = NULL WHERE channel = ? AND event_id = ?", (channel, event_id))
 
     def release_inbound(self, channel: str, event_id: str) -> None:
         """A failed local command may be retried with its original event id."""
@@ -1084,22 +1095,22 @@ class StateStore:
         return True
 
     def save_session(self, channel: str, user_id: str, action: str, candidates: list[dict[str, str]], expires_at: datetime | None, *, chat_id: str = "", prompt_id: str = "", started_at: datetime | None = None, reply_text: str = "") -> None:
-        self.conn.execute(
-            """
-            INSERT INTO chat_session(channel, user_id, action, candidates_json, expires_at, chat_id, prompt_id, started_at, reply_text)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(channel, user_id) DO UPDATE SET
-                action = excluded.action,
-                candidates_json = excluded.candidates_json,
-                expires_at = excluded.expires_at,
-                chat_id = excluded.chat_id,
-                prompt_id = excluded.prompt_id,
-                started_at = excluded.started_at,
-                reply_text = excluded.reply_text
-            """,
-            (channel, user_id, action, json.dumps(candidates, ensure_ascii=False), _session_time(expires_at), chat_id, prompt_id, _session_time(started_at), reply_text),
-        )
-        self.conn.commit()
+        with self.transaction():
+            self.conn.execute(
+                """
+                INSERT INTO chat_session(channel, user_id, action, candidates_json, expires_at, chat_id, prompt_id, started_at, reply_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(channel, user_id) DO UPDATE SET
+                    action = excluded.action,
+                    candidates_json = excluded.candidates_json,
+                    expires_at = excluded.expires_at,
+                    chat_id = excluded.chat_id,
+                    prompt_id = excluded.prompt_id,
+                    started_at = excluded.started_at,
+                    reply_text = excluded.reply_text
+                """,
+                (channel, user_id, action, json.dumps(candidates, ensure_ascii=False), _session_time(expires_at), chat_id, prompt_id, _session_time(started_at), reply_text),
+            )
 
     def load_session(self, channel: str, user_id: str) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -1115,7 +1126,7 @@ class StateStore:
         return {"action": str(row["action"]), "candidates": candidates, "expires_at": str(row["expires_at"]), "chat_id": row["chat_id"], "prompt_id": row["prompt_id"], "started_at": row["started_at"], "reply_text": row["reply_text"]}
 
     def confirm_session(self, channel: str, user_id: str, prompt_id: str, expires_at: datetime) -> None:
-        self.conn.execute("UPDATE chat_session SET expires_at = ? WHERE channel = ? AND user_id = ? AND prompt_id = ?",
+        self.conn.execute("UPDATE chat_session SET expires_at = ? WHERE channel = ? AND user_id = ? AND prompt_id = ? AND (expires_at IS NULL OR expires_at = '')",
                           (_session_time(expires_at), channel, user_id, prompt_id))
         self.conn.commit()
 
@@ -1150,10 +1161,13 @@ class StateStore:
         cursor = self.conn.execute(
             """
             UPDATE guide_delivery
-            SET status = 'pending', language = ?, attempts = 0,
+            SET status = 'pending', language = CASE WHEN message_text IS NULL THEN ? ELSE language END,
+                attempts = CASE WHEN message_text IS NULL AND status IN ('skipped', 'permanent') THEN 0 ELSE attempts END,
                 next_attempt_at = NULL, last_error = NULL, updated_at = ?
             WHERE channel = ? AND recipient = ? AND version = ?
-              AND status NOT IN ('sent', 'inflight')
+              AND status IN ('pending', 'retryable', 'skipped', 'permanent')
+              AND first_ambiguous_at IS NULL
+              AND (message_text IS NOT NULL OR attempts = 0 OR status IN ('skipped', 'permanent'))
             """,
             (language, format_utc(now), channel, recipient, version),
         )
@@ -1182,41 +1196,49 @@ class StateStore:
             ).fetchall()
         )
 
-    def claim_guide(self, channel: str, recipient: str, version: str, now: datetime) -> bool:
+    def save_guide_message(self, channel: str, recipient: str, version: str, text: str) -> None:
+        self.conn.execute("UPDATE guide_delivery SET message_text = ? WHERE channel = ? AND recipient = ? AND version = ? AND message_text IS NULL",
+                          (text, channel, recipient, version))
+        self.conn.commit()
+
+    def claim_guide(self, channel: str, recipient: str, version: str, now: datetime, *, lease_until: datetime | None = None) -> bool:
         cursor = self.conn.execute(
             """
             UPDATE guide_delivery
-            SET status = 'inflight', attempts = attempts + 1, updated_at = ?
+            SET status = 'inflight', attempts = attempts + 1, updated_at = ?, lease_until = ?
             WHERE channel = ? AND recipient = ? AND version = ?
               AND status IN ('pending', 'retryable', 'ambiguous')
               AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
             """,
-            (format_utc(now), channel, recipient, version, format_utc(now)),
+            (format_utc(now), format_utc(lease_until) if lease_until else None, channel, recipient, version, format_utc(now)),
         )
         self.conn.commit()
         return cursor.rowcount > 0
 
-    def write_guide(self, channel: str, recipient: str, version: str, state: DeliveryState, now: datetime) -> None:
-        self.conn.execute(
-            """
+    def write_guide(self, channel: str, recipient: str, version: str, state: DeliveryState, now: datetime, *, only_status: str | None = None) -> bool:
+        sql = """
             UPDATE guide_delivery
             SET status = ?, attempts = ?, next_attempt_at = ?, first_ambiguous_at = ?,
-                last_error = ?, updated_at = ?
+                last_error = ?, updated_at = ?, lease_until = NULL
             WHERE channel = ? AND recipient = ? AND version = ?
-            """,
-            (
-                state.status,
-                state.attempts,
-                format_utc(state.next_attempt_at) if state.next_attempt_at else None,
-                format_utc(state.first_ambiguous_at) if state.first_ambiguous_at else None,
-                (state.last_error or None),
-                format_utc(now),
-                channel,
-                recipient,
-                version,
-            ),
-        )
+            """
+        params = [
+            state.status,
+            state.attempts,
+            format_utc(state.next_attempt_at) if state.next_attempt_at else None,
+            format_utc(state.first_ambiguous_at) if state.first_ambiguous_at else None,
+            (state.last_error or None),
+            format_utc(now),
+            channel,
+            recipient,
+            version,
+        ]
+        if only_status is not None:
+            sql += " AND status = ? AND attempts = ?"
+            params.extend((only_status, state.attempts))
+        cursor = self.conn.execute(sql, params)
         self.conn.commit()
+        return cursor.rowcount > 0
 
     def _move_outbox_target(self, channel: str, old_key: str, dest_key: str, now: datetime, *, address: str) -> None:
         """Point pending deliveries at the destination chat, skipping notices it already has."""

@@ -599,5 +599,25 @@ class PickerTransactionTest(SafetyFixture):
                   "replay_reply": None if replay is None else replay.text}
         self.assertTrue(actual["session"] is not None or actual["subscriptions"], actual)
 
+
+class PickerAcknowledgmentRegressionTest(SafetyFixture):
+    def test_duplicate_ack_does_not_extend_picker_deadline(self):
+        controller = self.controller()
+        inbound = self.inbound('r2-concurrent-prompt', '/addgroup')
+        reply = controller.handle(inbound)
+        duplicate = controller.handle(inbound)
+        self.assertIsNotNone(duplicate)
+        controller.confirm_reply(reply)
+        first_expiry = self.store.load_session('feishu', inbound.user_id)['expires_at']
+        self.clock.advance(30)
+        controller.confirm_reply(duplicate)
+        second_expiry = self.store.load_session('feishu', inbound.user_id)['expires_at']
+        self.clock.advance(40)
+        response = controller.handle(self.inbound('r2-select-at-seventy', '1'))
+        actual = self.store.subscriptions('feishu')
+        self.assertEqual(second_expiry, first_expiry, {'first': first_expiry, 'second': second_expiry})
+        self.assertEqual(actual, [])
+
+
 if __name__ == "__main__":
     unittest.main()
